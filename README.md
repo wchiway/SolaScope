@@ -136,3 +136,7 @@ cargo test -p solascope-engine --test quality -- --nocapture   # 打印检索质
 ```
 
 代码结构和关键设计决策见 [docs/architecture.md](docs/architecture.md)。
+
+## 许可证
+
+本项目以 [Apache License 2.0](LICENSE) 发布。
