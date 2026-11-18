@@ -1,0 +1,20 @@
+[
+  { "category": "symbol", "query": "authenticate_user", "path": "users.rs", "symbol": "authenticate_user", "start_line": 6, "end_line": 12 },
+  { "category": "symbol", "query": "find_user", "path": "repository.py", "symbol": "find_user", "start_line": 5, "end_line": 9 },
+  { "category": "symbol", "query": "readSession", "path": "cache.ts", "symbol": "readSession", "start_line": 8, "end_line": 15 },
+  { "category": "symbol", "query": "applyDiscount", "path": "pricing.js", "symbol": "applyDiscount", "start_line": 1, "end_line": 7 },
+  { "category": "symbol", "query": "Reserve", "path": "inventory.go", "symbol": "Reserve", "start_line": 13, "end_line": 20 },
+  { "category": "error", "query": "SESSION_EXPIRED", "path": "users.rs", "symbol": "validate_session" },
+  { "category": "error", "query": "USER_NOT_FOUND", "path": "repository.py", "symbol": "find_user" },
+  { "category": "error", "query": "TOKEN_CACHE_MISS", "path": "cache.ts", "symbol": "readSession" },
+  { "category": "error", "query": "INVALID_DISCOUNT", "path": "pricing.js", "symbol": "applyDiscount" },
+  { "category": "error", "query": "INSUFFICIENT_STOCK", "path": "inventory.go", "symbol": "Reserve" },
+  { "category": "natural", "query": "create a login session from user credentials", "path": "users.rs", "symbol": "authenticate_user" },
+  { "category": "natural", "query": "look up a user by unique identifier", "path": "repository.py", "symbol": "find_user" },
+  { "category": "natural", "query": "reject expired tokens from the cached session", "path": "cache.ts", "symbol": "readSession" },
+  { "category": "natural", "query": "apply a discount without a negative total", "path": "pricing.js", "symbol": "applyDiscount" },
+  { "category": "natural", "query": "reserve stock for an order", "path": "inventory.go", "symbol": "Reserve" },
+  { "category": "natural", "query": "persist a user profile in the repository", "path": "repository.py", "symbol": "save_user" },
+  { "category": "distractor", "query": "calculateShipping", "path": "pricing.js", "symbol": "calculateShipping" },
+  { "category": "distractor", "query": "calculate_invoice_total", "path": "users.rs", "symbol": "calculate_invoice_total" }
+]
