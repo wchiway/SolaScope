@@ -1,0 +1,39 @@
+[package]
+name = "solascope-cli"
+version.workspace = true
+edition.workspace = true
+default-run = "solascope"
+
+[lib]
+name = "solascope_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solascope"
+path = "src/main.rs"
+
+[[bin]]
+name = "sas"
+path = "src/bin/sas.rs"
+
+[features]
+default = []
+local-rerank = ["solascope-engine/local-rerank"]
+
+[dependencies]
+solascope-core.workspace = true
+solascope-config.workspace = true
+solascope-engine.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
