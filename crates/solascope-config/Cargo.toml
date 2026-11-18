@@ -1,0 +1,15 @@
+[package]
+name = "solascope-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solascope-core.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+globset.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

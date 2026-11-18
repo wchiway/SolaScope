@@ -1,0 +1,744 @@
+//! Configuration precedence: CLI root > `SOLASCOPE__GROUP__FIELD` > project
+//! `.solascope.toml` > user `solascope/config.toml` > defaults.
+//!
+//! Every declared field supports that environment spelling (uppercase group and
+//! field, e.g. `SOLASCOPE__EMBEDDING__PROVIDER=ollama`). Strings and paths are
+//! literal values; booleans/numbers/arrays use TOML syntax, for example
+//! `SOLASCOPE__PROJECT__EXCLUDE='["generated/**"]'`. Unknown variables in this
+//! namespace are errors. Only API-key *environment variable names* are stored.
+//! Relative file paths resolve beside their declaring TOML file; environment
+//! paths and CLI paths resolve against the process working directory.
+use serde::{Deserialize, Serialize};
+use solascope_core::{Error, Result, SearchMode};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+macro_rules! section {
+    ($name:ident { $($field:ident : $ty:ty = $value:expr),* $(,)? }) => {
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct $name { $(pub $field: $ty),* }
+        impl Default for $name {
+            fn default() -> Self { Self { $($field: $value),* } }
+        }
+    };
+}
+
+section!(ProjectConfig {
+    root: PathBuf = PathBuf::from("."),
+    index_dir: PathBuf = PathBuf::from(".solascope"),
+    include: Vec<String> = vec![],
+    exclude: Vec<String> = vec![],
+    max_file_size: u64 = 1_048_576,
+});
+section!(ParserConfig {
+    enabled_languages: Vec<String> = ["rust", "python", "typescript", "javascript", "go"].map(str::to_string).to_vec(),
+    fallback_policy: String = "text".into(),
+    max_chunk_tokens: usize = 512,
+    overlap_lines: usize = 5,
+});
+section!(EmbeddingConfig {
+    provider: String = "disabled".into(),
+    model: String = "nomic-embed-text".into(),
+    endpoint: String = "http://127.0.0.1:11434".into(),
+    dimensions: usize = 768,
+    api_key_env: String = "OPENAI_API_KEY".into(),
+    batch_size: usize = 32,
+    concurrency: usize = 2,
+    timeout_secs: u64 = 30,
+    retries: usize = 2,
+});
+section!(RerankConfig {
+    provider: String = "disabled".into(),
+    model: String = String::new(),
+    endpoint: String = String::new(),
+    api_key_env: String = "RERANK_API_KEY".into(),
+    top_n: usize = 20,
+    timeout_secs: u64 = 30,
+    fail_open: bool = true,
+    max_input_chars: usize = 16_000,
+    cache_dir: Option<PathBuf> = None,
+    allow_model_download: bool = false,
+});
+section!(SearchConfig {
+    mode: SearchMode = SearchMode::Hybrid,
+    lexical_top_k: usize = 40,
+    vector_top_k: usize = 40,
+    symbol_top_k: usize = 20,
+    fusion_k: f64 = 60.0,
+    rerank_candidates: usize = 30,
+    limit: usize = 10,
+    semantic_fail_open: bool = true,
+});
+section!(IndexConfig {
+    debounce_ms: u64 = 300,
+    max_concurrent_jobs: usize = 4,
+    snapshot_retention: usize = 2,
+});
+section!(PrivacyConfig {
+    remote_opt_in: bool = false,
+    sensitive_path_patterns: Vec<String> = vec![],
+    symlink_policy: String = "skip".into(),
+    allow_external_paths: bool = false,
+});
+section!(LogConfig {
+    level: String = "info".into()
+});
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub project: ProjectConfig,
+    pub parser: ParserConfig,
+    pub embedding: EmbeddingConfig,
+    pub rerank: RerankConfig,
+    pub search: SearchConfig,
+    pub index: IndexConfig,
+    pub privacy: PrivacyConfig,
+    pub log: LogConfig,
+}
+
+impl Config {
+    pub fn default_for_root(root: &Path) -> Result<Self> {
+        let root = fs::canonicalize(root)?;
+        if !root.is_dir() {
+            return Err(invalid("project.root must be a directory"));
+        }
+        let mut config = Self::default();
+        config.project.index_dir = root.join(".solascope");
+        config.project.root = root;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Discover the nearest project configuration or repository from the current
+    /// directory, unless a CLI root or explicit configuration selects a project.
+    pub fn load(root: Option<&Path>, config_path: Option<&Path>) -> Result<Self> {
+        let cwd = std::env::current_dir()?;
+        let env = std::env::vars_os()
+            .filter(|(key, _)| key.to_string_lossy().starts_with("SOLASCOPE__"))
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string()
+                        .map_err(|_| invalid("invalid environment variable name"))?,
+                    value
+                        .into_string()
+                        .map_err(|_| invalid("configuration environment values must be UTF-8"))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let global = dirs::config_dir().map(|dir| dir.join("solascope/config.toml"));
+        load_with_sources(root, config_path, &cwd, global.as_deref(), &env)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.project.root.is_absolute() || !self.project.root.is_dir() {
+            return Err(invalid(
+                "project.root must be an absolute existing directory",
+            ));
+        }
+        if !self.project.index_dir.is_absolute() {
+            return Err(invalid("project.index_dir must be absolute"));
+        }
+        if self.project.root.starts_with(&self.project.index_dir) {
+            return Err(invalid(
+                "project.index_dir must not contain the project root",
+            ));
+        }
+        if self.privacy.allow_external_paths {
+            return Err(Error::Privacy(
+                "allow_external_paths is unsupported in v0.1".into(),
+            ));
+        }
+        one_of(
+            &self.privacy.symlink_policy,
+            &["skip", "within_root"],
+            "privacy.symlink_policy",
+        )?;
+        one_of(
+            &self.parser.fallback_policy,
+            &["text", "skip"],
+            "parser.fallback_policy",
+        )?;
+        one_of(
+            &self.embedding.provider,
+            &["disabled", "ollama", "openai"],
+            "embedding.provider",
+        )?;
+        one_of(
+            &self.rerank.provider,
+            &["disabled", "remote", "fastembed"],
+            "rerank.provider",
+        )?;
+        one_of(
+            &self.log.level,
+            &["off", "error", "warn", "info", "debug", "trace"],
+            "log.level",
+        )?;
+        for (name, count) in [
+            ("project.max_file_size", self.project.max_file_size),
+            (
+                "parser.max_chunk_tokens",
+                self.parser.max_chunk_tokens as u64,
+            ),
+            ("embedding.dimensions", self.embedding.dimensions as u64),
+            ("embedding.batch_size", self.embedding.batch_size as u64),
+            ("embedding.concurrency", self.embedding.concurrency as u64),
+            ("embedding.timeout_secs", self.embedding.timeout_secs),
+            ("rerank.top_n", self.rerank.top_n as u64),
+            ("rerank.timeout_secs", self.rerank.timeout_secs),
+            ("rerank.max_input_chars", self.rerank.max_input_chars as u64),
+            ("search.lexical_top_k", self.search.lexical_top_k as u64),
+            ("search.vector_top_k", self.search.vector_top_k as u64),
+            ("search.symbol_top_k", self.search.symbol_top_k as u64),
+            (
+                "search.rerank_candidates",
+                self.search.rerank_candidates as u64,
+            ),
+            ("search.limit", self.search.limit as u64),
+            (
+                "index.max_concurrent_jobs",
+                self.index.max_concurrent_jobs as u64,
+            ),
+            (
+                "index.snapshot_retention",
+                self.index.snapshot_retention as u64,
+            ),
+        ] {
+            if count == 0 {
+                return Err(invalid(&format!("{name} must be positive")));
+            }
+        }
+        if !self.search.fusion_k.is_finite() || self.search.fusion_k <= 0.0 {
+            return Err(invalid("search.fusion_k must be finite and positive"));
+        }
+        if self.search.limit > solascope_core::MAX_RESULTS {
+            return Err(invalid("search.limit exceeds the supported result limit"));
+        }
+        for patterns in [
+            &self.project.include,
+            &self.project.exclude,
+            &self.privacy.sensitive_path_patterns,
+        ] {
+            for pattern in patterns {
+                globset::Glob::new(pattern).map_err(|_| invalid("invalid path glob"))?;
+            }
+        }
+        validate_key_name(&self.embedding.api_key_env)?;
+        validate_key_name(&self.rerank.api_key_env)?;
+        let embedding_url = endpoint(&self.embedding.endpoint)?;
+        let _ = endpoint(&self.rerank.endpoint)?;
+        if self.embedding.provider != "disabled" && self.embedding.model.trim().is_empty() {
+            return Err(invalid("embedding.model is required when enabled"));
+        }
+        if self.rerank.provider != "disabled" && self.rerank.model.trim().is_empty() {
+            return Err(invalid("rerank.model is required when enabled"));
+        }
+        if self.embedding.provider != "disabled" && embedding_url.is_none() {
+            return Err(invalid("embedding.endpoint is required when enabled"));
+        }
+        if self.rerank.provider == "remote" && self.rerank.endpoint.is_empty() {
+            return Err(invalid("rerank.endpoint is required for remote reranking"));
+        }
+        let remote_ollama =
+            self.embedding.provider == "ollama" && !embedding_url.as_ref().is_some_and(is_loopback);
+        if !self.privacy.remote_opt_in
+            && (self.embedding.provider == "openai"
+                || self.rerank.provider == "remote"
+                || remote_ollama)
+        {
+            return Err(Error::Privacy(
+                "remote model endpoints require privacy.remote_opt_in = true".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn invalid(message: &str) -> Error {
+    Error::Config(message.into())
+}
+
+fn one_of(value: &str, allowed: &[&str], field: &str) -> Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid(&format!("unsupported {field}")))
+    }
+}
+
+fn validate_key_name(value: &str) -> Result<()> {
+    let mut chars = value.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(invalid(
+            "API credentials must be referenced by environment variable name",
+        ));
+    }
+    Ok(())
+}
+
+/// Never propagate parser errors: URL error messages can contain credentials.
+fn endpoint(value: &str) -> Result<Option<url::Url>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let url = url::Url::parse(value).map_err(|_| invalid("invalid model endpoint URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid(
+            "model endpoints require HTTP(S), a host, and no credentials, query or fragment",
+        ));
+    }
+    Ok(Some(url))
+}
+
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn absolute(path: &Path, base: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let mut result = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+fn discover(start: &Path) -> PathBuf {
+    for directory in start.ancestors() {
+        if directory.join(".solascope.toml").is_file() || directory.join(".git").exists() {
+            return directory.to_path_buf();
+        }
+    }
+    start.to_path_buf()
+}
+
+fn merge(target: &mut toml::Value, overlay: toml::Value) {
+    match (target, overlay) {
+        (toml::Value::Table(target), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = target.get_mut(&key) {
+                    merge(existing, value);
+                } else {
+                    target.insert(key, value);
+                }
+            }
+        }
+        (target, overlay) => *target = overlay,
+    }
+}
+
+fn resolve_paths(value: &mut toml::Value, base: &Path) -> Result<()> {
+    for (group, field) in [
+        ("project", "root"),
+        ("project", "index_dir"),
+        ("rerank", "cache_dir"),
+    ] {
+        if let Some(path) = value.get_mut(group).and_then(|group| group.get_mut(field)) {
+            let raw = path
+                .as_str()
+                .ok_or_else(|| invalid("configuration paths must be strings"))?;
+            *path = toml::Value::String(
+                absolute(Path::new(raw), base)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_layer(path: &Path) -> Result<toml::Value> {
+    let text = fs::read_to_string(path)?;
+    let mut value: toml::Value = toml::from_str(&text)
+        .map_err(|_| invalid("invalid TOML configuration (values redacted)"))?;
+    resolve_paths(&mut value, path.parent().unwrap_or(Path::new(".")))?;
+    Ok(value)
+}
+
+fn environment_layer(
+    defaults: &toml::Value,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<toml::Value> {
+    let mut overlay = toml::Value::Table(toml::map::Map::new());
+    for (key, raw) in env {
+        let Some(suffix) = key.strip_prefix("SOLASCOPE__") else {
+            continue;
+        };
+        let parts: Vec<_> = suffix.split("__").map(str::to_ascii_lowercase).collect();
+        if parts.len() != 2 {
+            return Err(invalid("expected SOLASCOPE__GROUP__FIELD"));
+        }
+        let field_default = defaults
+            .get(&parts[0])
+            .and_then(|group| group.get(&parts[1]));
+        // Optional values are omitted by TOML serialization; cache_dir is the
+        // only nullable field, and an environment value sets a concrete path.
+        let is_path = parts[0] == "rerank" && parts[1] == "cache_dir";
+        let value = match field_default {
+            Some(toml::Value::String(_)) => toml::Value::String(raw.clone()),
+            None if is_path => toml::Value::String(raw.clone()),
+            Some(_) => {
+                let wrapped: toml::Value = toml::from_str(&format!("value = {raw}"))
+                    .map_err(|_| invalid("invalid TOML environment override (values redacted)"))?;
+                wrapped
+                    .get("value")
+                    .cloned()
+                    .ok_or_else(|| invalid("missing environment value"))?
+            }
+            None => return Err(invalid("unknown SOLASCOPE configuration field")),
+        };
+        let mut fields = toml::map::Map::new();
+        fields.insert(parts[1].clone(), value);
+        let mut group = toml::map::Map::new();
+        group.insert(parts[0].clone(), toml::Value::Table(fields));
+        merge(&mut overlay, toml::Value::Table(group));
+    }
+    resolve_paths(&mut overlay, cwd)?;
+    Ok(overlay)
+}
+
+// Source injection keeps tests independent of process-global environment state.
+fn load_with_sources(
+    root: Option<&Path>,
+    config_path: Option<&Path>,
+    cwd: &Path,
+    global: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Result<Config> {
+    let selected = root
+        .map(|path| absolute(path, cwd))
+        .or_else(|| {
+            config_path.map(|path| absolute(path, cwd).parent().unwrap_or(cwd).to_path_buf())
+        })
+        .or_else(|| {
+            env.get("SOLASCOPE__PROJECT__ROOT")
+                .map(|path| absolute(Path::new(path), cwd))
+        })
+        .unwrap_or_else(|| discover(cwd));
+    let mut base = Config::default_for_root(&selected)?;
+    let mut value =
+        toml::Value::try_from(&base).map_err(|_| invalid("cannot serialize defaults"))?;
+    let defaults = value.clone();
+    let mut explicit_index = false;
+    let project = config_path
+        .map(|path| absolute(path, cwd))
+        .unwrap_or_else(|| selected.join(".solascope.toml"));
+    if let Some(global) = global {
+        match fs::metadata(global) {
+            Ok(_) => {
+                let layer = load_layer(global)?;
+                explicit_index |= layer
+                    .get("project")
+                    .and_then(|v| v.get("index_dir"))
+                    .is_some();
+                merge(&mut value, layer);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::metadata(&project) {
+        Ok(_) => {
+            let layer = load_layer(&project)?;
+            explicit_index |= layer
+                .get("project")
+                .and_then(|v| v.get("index_dir"))
+                .is_some();
+            merge(&mut value, layer);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && config_path.is_none() => {}
+        Err(error) => return Err(error.into()),
+    }
+    let layer = environment_layer(&defaults, env, cwd)?;
+    explicit_index |= layer
+        .get("project")
+        .and_then(|v| v.get("index_dir"))
+        .is_some();
+    merge(&mut value, layer);
+    if let Some(root) = root {
+        value["project"]["root"] =
+            toml::Value::String(absolute(root, cwd).to_string_lossy().into_owned());
+    }
+    base = value.try_into().map_err(|_| {
+        invalid("configuration has unknown fields or invalid field types (values redacted)")
+    })?;
+    base.project.root = fs::canonicalize(&base.project.root)?;
+    if !explicit_index {
+        base.project.index_dir = base.project.root.join(".solascope");
+    }
+    base.validate()?;
+    Ok(base)
+}
+
+/// Atomically reserve `.solascope.toml` with create_new; an existing file is
+/// never truncated. Providers stay disabled; no model installation is implied.
+pub fn write_default_config(root: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)?;
+    let _ = Config::default_for_root(&root)?;
+    let mut template = Config::default();
+    template.project.root = PathBuf::from(".");
+    template.project.index_dir = PathBuf::from(".solascope");
+    let body = toml::to_string_pretty(&template)
+        .map_err(|_| invalid("cannot render default configuration"))?;
+    let path = root.join(".solascope.toml");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(
+        b"# Models are disabled. Ollama nomic-embed-text/768 requires separate installation.\n",
+    )?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn load(root: &Path, global: Option<&Path>, env: &[(&str, &str)]) -> Result<Config> {
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        load_with_sources(None, None, root, global, &env)
+    }
+
+    #[test]
+    fn defaults_and_atomic_init_preserve_existing_file() {
+        let root = tempdir().unwrap();
+        let config = Config::default_for_root(root.path()).unwrap();
+        assert!(!config.privacy.remote_opt_in);
+        assert!(!config.privacy.allow_external_paths);
+        assert!(!config.rerank.allow_model_download);
+        assert_eq!(config.embedding.provider, "disabled");
+        assert_eq!(config.rerank.provider, "disabled");
+        assert_eq!(config.project.index_dir, root.path().join(".solascope"));
+        let path = write_default_config(root.path()).unwrap();
+        let first = fs::read(&path).unwrap();
+        assert!(write_default_config(root.path()).is_err());
+        assert_eq!(first, fs::read(&path).unwrap());
+        assert_eq!(
+            load(root.path(), None, &[]).unwrap().embedding.provider,
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn merges_all_layers_and_resolves_paths_at_declaration() {
+        let root = tempdir().unwrap();
+        let global_dir = tempdir().unwrap();
+        let global = global_dir.path().join("config.toml");
+        fs::write(
+            &global,
+            "[search]\nlimit=3\nlexical_top_k=8\n[rerank]\ncache_dir='cache'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[search]\nlimit=4\n[project]\nindex_dir='local-index'\n",
+        )
+        .unwrap();
+        let config = load(
+            root.path(),
+            Some(&global),
+            &[("SOLASCOPE__SEARCH__LIMIT", "7")],
+        )
+        .unwrap();
+        assert_eq!(config.search.limit, 7);
+        assert_eq!(config.search.lexical_top_k, 8);
+        assert_eq!(config.project.index_dir, root.path().join("local-index"));
+        assert_eq!(
+            config.rerank.cache_dir,
+            Some(global_dir.path().join("cache"))
+        );
+        assert_eq!(config.embedding.dimensions, 768);
+    }
+
+    #[test]
+    fn cli_root_beats_environment_and_root_moves_default_index() {
+        let cwd = tempdir().unwrap();
+        let cli = tempdir().unwrap();
+        let env_root = tempdir().unwrap();
+        let env = BTreeMap::from([(
+            "SOLASCOPE__PROJECT__ROOT".into(),
+            env_root.path().to_string_lossy().into(),
+        )]);
+        let config = load_with_sources(Some(cli.path()), None, cwd.path(), None, &env).unwrap();
+        assert_eq!(config.project.root, cli.path());
+        assert_eq!(config.project.index_dir, cli.path().join(".solascope"));
+        let config = load_with_sources(None, None, cwd.path(), None, &env).unwrap();
+        assert_eq!(config.project.root, env_root.path());
+        assert_eq!(config.project.index_dir, env_root.path().join(".solascope"));
+    }
+
+    #[test]
+    fn discovers_project_and_git_root_from_subdirectory() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src/deep")).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let config = load(&root.path().join("src/deep"), None, &[]).unwrap();
+        assert_eq!(config.project.root, root.path());
+        fs::write(root.path().join(".solascope.toml"), "[search]\nlimit=6").unwrap();
+        assert_eq!(
+            load(&root.path().join("src"), None, &[])
+                .unwrap()
+                .search
+                .limit,
+            6
+        );
+    }
+
+    #[test]
+    fn unknown_fields_and_invalid_parameters_are_rejected() {
+        let root = tempdir().unwrap();
+        for body in [
+            "[project]\nunknown=1",
+            "[unknown]\nx=1",
+            "[search]\nlimit=0",
+            "[search]\nfusion_k=nan",
+            "[parser]\nfallback_policy='bad'",
+            "[privacy]\nallow_external_paths=true",
+        ] {
+            fs::write(root.path().join(".solascope.toml"), body).unwrap();
+            assert!(load(root.path(), None, &[]).is_err(), "{body}");
+        }
+        fs::remove_file(root.path().join(".solascope.toml")).unwrap();
+        assert!(load(root.path(), None, &[("SOLASCOPE__PROJECT__TYPO", "1")]).is_err());
+        assert!(load(
+            root.path(),
+            None,
+            &[("SOLASCOPE__SEARCH__LIMIT", "invalid")]
+        )
+        .is_err());
+        assert!(load(
+            root.path(),
+            None,
+            &[("SOLASCOPE__PROJECT__EXCLUDE", "['secret/**']")]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn remote_providers_and_non_loopback_ollama_require_opt_in() {
+        let root = tempdir().unwrap();
+        let mut config = Config::default_for_root(root.path()).unwrap();
+        config.embedding.provider = "ollama".into();
+        for address in [
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434",
+            "http://localhost:11434",
+        ] {
+            config.embedding.endpoint = address.into();
+            config.validate().unwrap();
+        }
+        for address in [
+            "https://example.com",
+            "http://localhost.example.com",
+            "http://192.168.1.2:11434",
+        ] {
+            config.embedding.endpoint = address.into();
+            assert!(matches!(config.validate(), Err(Error::Privacy(_))));
+        }
+        config.privacy.remote_opt_in = true;
+        config.validate().unwrap();
+        config.embedding.provider = "openai".into();
+        config.privacy.remote_opt_in = false;
+        assert!(matches!(config.validate(), Err(Error::Privacy(_))));
+        config.embedding.provider = "disabled".into();
+        config.rerank.provider = "remote".into();
+        config.rerank.model = "example".into();
+        config.rerank.endpoint = "https://example.com".into();
+        assert!(matches!(config.validate(), Err(Error::Privacy(_))));
+    }
+
+    #[test]
+    fn explicit_config_paths_and_environment_root_select_the_project() {
+        let cwd = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        fs::create_dir(project.path().join("source")).unwrap();
+        fs::write(
+            project.path().join("custom.toml"),
+            "[project]\nroot='source'\nindex_dir='index'\n",
+        )
+        .unwrap();
+        let config = load_with_sources(
+            None,
+            Some(&project.path().join("custom.toml")),
+            cwd.path(),
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.project.root, project.path().join("source"));
+        assert_eq!(config.project.index_dir, project.path().join("index"));
+        assert!(load_with_sources(
+            None,
+            Some(Path::new("missing.toml")),
+            cwd.path(),
+            None,
+            &BTreeMap::new()
+        )
+        .is_err());
+        fs::write(
+            project.path().join(".solascope.toml"),
+            "[search]\nlimit=9\n",
+        )
+        .unwrap();
+        let env = BTreeMap::from([(
+            "SOLASCOPE__PROJECT__ROOT".into(),
+            project.path().to_string_lossy().into_owned(),
+        )]);
+        let config = load_with_sources(None, None, cwd.path(), None, &env).unwrap();
+        assert_eq!(config.project.root, project.path());
+        assert_eq!(config.search.limit, 9);
+    }
+
+    #[test]
+    fn credential_urls_are_rejected_without_echoing_secrets() {
+        let root = tempdir().unwrap();
+        let mut config = Config::default_for_root(root.path()).unwrap();
+        for endpoint in [
+            "https://user:secret@example.com",
+            "https://example.com?api_key=secret",
+            "https://example.com#secret",
+        ] {
+            config.embedding.endpoint = endpoint.into();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(!error.contains("secret"));
+        }
+    }
+}
