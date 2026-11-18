@@ -1,0 +1,14 @@
+[package]
+name = "solascope-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solascope-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+fs2.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
