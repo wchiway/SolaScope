@@ -1,0 +1,16 @@
+[package]
+name = "solascope-scanner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solascope-core.workspace = true
+solascope-config.workspace = true
+globset.workspace = true
+ignore.workspace = true
+notify.workspace = true
+tokio.workspace = true
+cap-std = "3"
+
+[dev-dependencies]
+tempfile.workspace = true
