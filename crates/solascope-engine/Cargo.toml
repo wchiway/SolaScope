@@ -1,0 +1,25 @@
+[package]
+name = "solascope-engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+local-rerank = ["solascope-models/local-rerank"]
+
+[dependencies]
+solascope-core.workspace = true
+solascope-config.workspace = true
+solascope-scanner.workspace = true
+solascope-parser.workspace = true
+solascope-models.workspace = true
+solascope-storage.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+serde_json.workspace = true
