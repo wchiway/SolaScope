@@ -3,17 +3,24 @@
 //! This provides syntax-level symbols, not name resolution or a call graph.
 //! Any syntax error makes the whole file use the explicitly marked text policy.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ops::Range;
 
 use solascope_core::{hash_text, validate_relative_path, Chunk, Error, Result};
 use tree_sitter::{Language, Node, Parser};
 
+/// Bump whenever the chunks produced for an unchanged input change.
+pub const CHUNKER_VERSION: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct ParserOptions {
     pub enabled_languages: Vec<String>,
     pub fallback: bool,
     pub max_chunk_tokens: usize,
+    /// Lines repeated at the start of the next chunk when a `text` chunk, or a
+    /// definition that offers no syntax boundary, is cut at a line boundary.
+    /// Chunks that end at a syntax boundary do not overlap.
     pub overlap_lines: usize,
 }
 
@@ -33,8 +40,19 @@ impl Default for ParserOptions {
 
 /// Parse one UTF-8 file. Byte ends are exclusive and lines are 1-based inclusive.
 ///
+/// A definition's chunk starts at the comments, attributes and decorators that
+/// directly precede it and covers its whole declaration. A container (`impl`,
+/// `trait`, `class`, `interface`, `module`) becomes a header chunk, its member
+/// definitions, and further parts of the container for everything else in its
+/// body, so every alphanumeric character of a parsed file is in some chunk.
+///
 /// `max_chunk_tokens * 4` is a byte heuristic, not a tokenizer guarantee. Zero
-/// tokens is invalid. Overlap is reduced as needed to preserve forward progress.
+/// tokens is invalid. A definition over that budget is cut where a syntax node
+/// begins a line: of those in the second half of the budget the outermost wins,
+/// then the last. Such parts do not overlap. Where no node qualifies the cut
+/// falls on a line boundary, and inside a single over-long line on a UTF-8
+/// boundary. `overlap_lines` applies to line-boundary cuts and to `text` chunks
+/// only, and is reduced as needed to preserve forward progress.
 /// Disabled/unknown languages and damaged syntax return `Error::Parse` when
 /// fallback is disabled; with fallback enabled their chunks have `fallback=true`.
 pub fn parse_file(
@@ -73,31 +91,23 @@ pub fn parse_file(
     let Some(tree) = parser.parse(source, None) else {
         return output.fallback("Tree-sitter did not produce a syntax tree");
     };
-    if tree.root_node().has_error() {
+    let root = tree.root_node();
+    if root.has_error() {
         return output.fallback("Tree-sitter reported damaged syntax");
     }
+    output.root = Some(root);
     let mut covered = Vec::new();
-    walk(
-        tree.root_node(),
-        source,
-        language,
-        "",
-        "",
-        &mut output,
-        &mut covered,
-    );
+    let top = [root];
+    let place = Place {
+        siblings: &top,
+        index: 0,
+        parent: None,
+    };
+    walk(place, source, language, "", "", &mut output, &mut covered);
     // Include imports, comments, constants and executable top-level code without
     // duplicating the full bodies of classes, impl blocks or functions.
-    covered.sort_by_key(|range| range.start);
-    let mut position = 0;
-    for range in covered {
-        if position < range.start {
-            output.emit_text(position..range.start, false);
-        }
-        position = position.max(range.end);
-    }
-    if position < source.len() {
-        output.emit_text(position..source.len(), false);
+    for gap in uncovered(0..source.len(), covered) {
+        output.emit_text(gap, false);
     }
     output
         .chunks
@@ -300,8 +310,58 @@ fn qualified(parent: &str, name: &str, language: &str) -> String {
     }
 }
 
+/// A node together with its siblings and ancestors. Tree-sitter finds a parent
+/// or a previous sibling by searching down from the root, so the walk carries
+/// this context along instead of asking the tree again for every definition.
+#[derive(Clone, Copy)]
+struct Place<'a, 'tree> {
+    /// Every child of the parent, anonymous tokens and comments included.
+    siblings: &'a [Node<'tree>],
+    index: usize,
+    parent: Option<&'a Place<'a, 'tree>>,
+}
+
+impl<'tree> Place<'_, 'tree> {
+    fn node(&self) -> Node<'tree> {
+        self.siblings[self.index]
+    }
+
+    /// The node that ends right before this one starts: the previous sibling,
+    /// or that of the nearest ancestor that does not start at the same byte.
+    fn previous(self) -> Option<Self> {
+        let mut place = self;
+        while place.index == 0 {
+            let parent = *place.parent?;
+            if parent.node().start_byte() != place.node().start_byte() {
+                return None;
+            }
+            place = parent;
+        }
+        Some(Self {
+            index: place.index - 1,
+            ..place
+        })
+    }
+}
+
+/// A definition whose children are being walked.
+struct Open {
+    symbol: String,
+    kind: &'static str,
+    container: Option<Container>,
+}
+
+/// What a container's parts share once its header chunk is out.
+struct Container {
+    body: Range<usize>,
+    /// The closing brace of the body, which belongs to no part.
+    close: Option<Range<usize>>,
+    signature: String,
+    parent: Option<String>,
+}
+
 fn walk(
-    node: Node<'_>,
+    place: Place<'_, '_>,
     source: &str,
     language: &str,
     scope: &str,
@@ -309,62 +369,264 @@ fn walk(
     output: &mut Output<'_>,
     covered: &mut Vec<Range<usize>>,
 ) {
-    if let Some(def) = definition(node, source, language, parent_kind) {
-        let parent = def.parent_override.as_deref().unwrap_or(scope);
-        let symbol = qualified(parent, &def.name, language);
-        let mut range = def.node.byte_range();
-        if language == "python" {
-            if let Some(wrapper) = node
-                .parent()
-                .filter(|parent| parent.kind() == "decorated_definition")
-            {
-                range.start = wrapper.start_byte();
-            }
+    let open = open(place, source, language, scope, parent_kind, output, covered);
+    // What a definition contains is scoped by it. A container collects its
+    // members; any other definition's chunk already holds all of its children.
+    let mut members = Vec::new();
+    let (scope, parent_kind, covered) = match &open {
+        Some(open) => (open.symbol.as_str(), open.kind, &mut members),
+        None => (scope, parent_kind, covered),
+    };
+    let children = children(place.node());
+    for index in 0..children.len() {
+        if children[index].is_named() {
+            let child = Place {
+                siblings: &children,
+                index,
+                parent: Some(&place),
+            };
+            // An assigned function/class's value is anonymous; its children
+            // inherit the binding's symbol rather than creating a second entity.
+            walk(child, source, language, scope, parent_kind, output, covered);
         }
-        if scope.is_empty() {
-            covered.push(range.clone());
+    }
+    let Some(Open {
+        symbol,
+        kind,
+        container: Some(container),
+    }) = open
+    else {
+        return;
+    };
+    // Fields, constants, member comments and whatever else is no definition
+    // of its own stay searchable as further parts of the container.
+    members.extend(container.close);
+    for part in uncovered(container.body, members) {
+        if source[part.clone()].chars().any(char::is_alphanumeric) {
+            output.emit(
+                part,
+                Some(&symbol),
+                kind,
+                Some(&container.signature),
+                container.parent.as_deref(),
+                false,
+            );
         }
-        let header_end = def
-            .body
-            .map(|body| {
-                if language == "go" && matches!(body.kind(), "struct_type" | "interface_type") {
-                    let mut cursor = body.walk();
-                    let brace = body.children(&mut cursor).find(|child| child.kind() == "{");
-                    brace
-                        .map(|child| child.start_byte())
-                        .unwrap_or(body.start_byte())
-                } else {
-                    body.start_byte()
-                }
-            })
-            .unwrap_or(range.end);
-        let signature = normalize_code(source[def.node.start_byte()..header_end].trim());
-        if def.container {
-            // A real source slice containing the declaration header, not a
-            // synthesized class body or a duplicate of all its methods.
-            range.end = header_end;
-            if source.as_bytes().get(header_end) == Some(&b'{') {
-                range.end += 1;
-            }
-        }
+    }
+}
+
+/// Emit the chunk of the definition at `place`, or the header chunk if it is a
+/// container, and claim the definition's range in `covered`.
+fn open(
+    place: Place<'_, '_>,
+    source: &str,
+    language: &str,
+    scope: &str,
+    parent_kind: &str,
+    output: &mut Output<'_>,
+    covered: &mut Vec<Range<usize>>,
+) -> Option<Open> {
+    let def = definition(place.node(), source, language, parent_kind)?;
+    let parent = def.parent_override.as_deref().unwrap_or(scope);
+    let symbol = qualified(parent, &def.name, language);
+    let outer = declaration(place, language);
+    let range = leading_start(outer, source, language)..outer.node().end_byte();
+    // The separator behind a member or declarator is not worth a part of its own.
+    let separator = outer
+        .siblings
+        .get(outer.index + 1)
+        .filter(|next| !next.is_named() && matches!(next.kind(), ";" | ","));
+    covered.push(range.start..separator.map_or(range.end, |token| token.end_byte()));
+    let header_end = def.body.map(|body| header_end(def.node, body, language));
+    let signature = normalize_code(
+        source[def.node.start_byte()..header_end.unwrap_or(def.node.end_byte())].trim(),
+    );
+    let parent = nonempty(parent);
+    if !def.container {
         output.emit(
             range,
             Some(&symbol),
             def.kind,
             Some(&signature),
-            nonempty(parent),
+            parent,
             false,
         );
-        for child in named_children(node) {
-            // An assigned function/class's value is anonymous; its children
-            // inherit the binding's symbol rather than creating a second entity.
-            walk(child, source, language, &symbol, def.kind, output, covered);
-        }
-    } else {
-        for child in named_children(node) {
-            walk(child, source, language, scope, parent_kind, output, covered);
-        }
+        return Some(Open {
+            symbol,
+            kind: def.kind,
+            container: None,
+        });
     }
+    // A real source slice containing the declaration header, not a
+    // synthesized class body or a duplicate of all its methods.
+    let mut header = range.clone();
+    if let Some(end) = header_end {
+        header.end = end + usize::from(source.as_bytes().get(end) == Some(&b'{'));
+    }
+    output.emit(
+        header.clone(),
+        Some(&symbol),
+        def.kind,
+        Some(&signature),
+        parent,
+        false,
+    );
+    let close = def
+        .body
+        .and_then(|body| body.child(body.child_count().checked_sub(1)?))
+        .filter(|last| !last.is_named() && last.kind() == "}");
+    let container = Container {
+        body: header.end..range.end,
+        close: close.map(|brace| brace.byte_range()),
+        signature,
+        parent: parent.map(str::to_owned),
+    };
+    Some(Open {
+        symbol,
+        kind: def.kind,
+        container: Some(container),
+    })
+}
+
+fn children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).collect()
+}
+
+/// Where a declaration's header ends and its body begins.
+fn header_end(node: Node<'_>, body: Node<'_>, language: &str) -> usize {
+    match language {
+        "go" if matches!(body.kind(), "struct_type" | "interface_type") => {
+            let mut cursor = body.walk();
+            let brace = body.children(&mut cursor).find(|child| child.kind() == "{");
+            brace.map_or(body.start_byte(), |child| child.start_byte())
+        }
+        // A Python block has no opening token: it starts at its first
+        // statement, behind any comment that follows the colon.
+        "python" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .take_while(|child| child.end_byte() <= body.start_byte())
+                .filter(|child| !child.is_extra())
+                .last()
+                .map_or(body.start_byte(), |child| child.end_byte())
+        }
+        _ => body.start_byte(),
+    }
+}
+
+/// The outermost node that declares nothing but this definition. The chunk is
+/// then a complete declaration (`export const f = () => {};`, `@decorator` plus
+/// `def`, `type T struct {}`) and its leading comments are found in front of it.
+fn declaration<'a, 'tree>(place: Place<'a, 'tree>, language: &str) -> Place<'a, 'tree> {
+    let mut outer = place;
+    while let Some(parent) = outer.parent {
+        let node = outer.node();
+        let wrapper = parent.node();
+        let only = |kinds: &[&str]| {
+            let declared = outer.siblings.iter();
+            declared.filter(|node| kinds.contains(&node.kind())).count() == 1
+        };
+        let wraps = match (language, wrapper.kind()) {
+            ("python", "decorated_definition") => true,
+            ("javascript" | "typescript", "lexical_declaration" | "variable_declaration") => {
+                only(&["variable_declarator"])
+            }
+            ("javascript" | "typescript", "export_statement") => ["declaration", "value"]
+                .iter()
+                .any(|field| wrapper.child_by_field_name(field) == Some(node)),
+            ("typescript", "ambient_declaration") => true,
+            // A namespace that is not exported parses as an expression statement.
+            ("typescript", "expression_statement") => node.kind() == "internal_module",
+            ("go", "type_declaration") => only(&["type_spec", "type_alias"]),
+            _ => false,
+        };
+        if !wraps {
+            break;
+        }
+        outer = *parent;
+    }
+    outer
+}
+
+/// Where the comments, attributes and decorators that belong to a declaration
+/// begin. They must directly precede it: a blank line ends the run, and so
+/// does a comment that merely trails other code on its line.
+fn leading_start(outer: Place<'_, '_>, source: &str, language: &str) -> usize {
+    let mut first = outer;
+    while let Some(previous) = first.previous() {
+        let node = previous.node();
+        if !attaches(node, language) {
+            break;
+        }
+        let Some(gap) = source.get(text_end(node, source)..first.node().start_byte()) else {
+            break;
+        };
+        let line_breaks = gap.matches('\n').count();
+        if !gap.trim().is_empty() || line_breaks > 1 {
+            break;
+        }
+        let comment = matches!(node.kind(), "comment" | "line_comment" | "block_comment");
+        if comment && line_breaks == 1 && trails_code(previous, source, language) {
+            break;
+        }
+        first = previous;
+    }
+    first.node().start_byte()
+}
+
+/// Whether a node in front of a declaration can belong to it.
+fn attaches(node: Node<'_>, language: &str) -> bool {
+    match (language, node.kind()) {
+        // `//!` and `/*! */` document the enclosing item, not the next one.
+        ("rust", "line_comment" | "block_comment") => node.child_by_field_name("inner").is_none(),
+        ("rust", "attribute_item") => true,
+        ("javascript" | "typescript", "decorator") => true,
+        ("python" | "javascript" | "typescript" | "go", "comment") => true,
+        _ => false,
+    }
+}
+
+/// Whether a comment shares its line with code in front of it, as in
+/// `let x = 1; // why`. Attributes and comments before it do not count.
+fn trails_code(comment: Place<'_, '_>, source: &str, language: &str) -> bool {
+    let mut first = comment;
+    while let Some(previous) = first.previous() {
+        let node = previous.node();
+        let gap = source.get(text_end(node, source)..first.node().start_byte());
+        if gap.is_none_or(|gap| gap.contains('\n')) {
+            return false;
+        }
+        if !attaches(node, language) {
+            return true;
+        }
+        first = previous;
+    }
+    false
+}
+
+/// A node's end without the line break some grammars include in it (a Rust
+/// doc comment ends behind its newline).
+fn text_end(node: Node<'_>, source: &str) -> usize {
+    node.start_byte() + text(node, source).trim_end().len()
+}
+
+/// The parts of `within` that no range in `covered` claims, in source order.
+fn uncovered(within: Range<usize>, mut covered: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    covered.sort_by_key(|range| range.start);
+    let mut gaps = Vec::new();
+    let mut position = within.start;
+    for range in covered {
+        let end = range.start.min(within.end);
+        if position < end {
+            gaps.push(position..end);
+        }
+        position = position.max(range.end);
+    }
+    if position < within.end {
+        gaps.push(position..within.end);
+    }
+    gaps
 }
 
 fn nonempty(value: &str) -> Option<&str> {
@@ -401,6 +663,10 @@ struct Output<'a> {
     // Separate declarations may share a qualified symbol (e.g. overloads).
     // All parts of the same entity still get distinct deterministic chunk IDs.
     parts: HashMap<String, usize>,
+    /// The root of a clean syntax tree; none while only text can be emitted.
+    root: Option<Node<'a>>,
+    /// Where a definition may be cut, found when the first one is over budget.
+    boundaries: Option<Vec<Boundary>>,
 }
 
 impl<'a> Output<'a> {
@@ -422,6 +688,8 @@ impl<'a> Output<'a> {
             line_starts,
             chunks: Vec::new(),
             parts: HashMap::new(),
+            root: None,
+            boundaries: None,
         }
     }
 
@@ -459,7 +727,23 @@ impl<'a> Output<'a> {
         }
         let entity_id = identity(&[self.project_id, self.path, symbol.unwrap_or("<file>"), kind]);
         let budget = self.options.max_chunk_tokens.saturating_mul(4);
-        for span in windows(self.source, range, budget, self.options.overlap_lines) {
+        // Only definitions are cut at syntax boundaries; `text` has none.
+        let mut boundaries: &[Boundary] = &[];
+        if symbol.is_some() && range.len() > budget {
+            if let Some(root) = self.root {
+                boundaries = self.boundaries.get_or_insert_with(|| {
+                    line_boundaries(root, self.language, self.source, &self.line_starts)
+                });
+            }
+        }
+        let spans = windows(
+            self.source,
+            range,
+            budget,
+            self.options.overlap_lines,
+            boundaries,
+        );
+        for span in spans {
             let content = self.source[span.clone()].to_owned();
             let normalized = normalize_code(&content);
             let embedding_text = format!(
@@ -497,13 +781,93 @@ impl<'a> Output<'a> {
     }
 }
 
-/// Prefer whole lines (and therefore statement boundaries in common layouts).
+/// A line that begins with a syntax node.
+struct Boundary {
+    line_start: usize,
+    token_start: usize,
+    /// How deeply the node is nested; statements of one block share a depth.
+    depth: usize,
+}
+
+/// Every line whose first token starts a named syntax node, in source order.
+/// Where several nodes start at that token the outermost one counts.
+fn line_boundaries(
+    root: Node<'_>,
+    language: &str,
+    source: &str,
+    line_starts: &[usize],
+) -> Vec<Boundary> {
+    let first_token = |row: usize| {
+        let start = *line_starts.get(row)?;
+        let end = line_starts.get(row + 1).copied().unwrap_or(source.len());
+        let line = &source[start..end];
+        Some((start, start + line.len() - line.trim_start().len()))
+    };
+    let mut boundaries: Vec<Boundary> = Vec::new();
+    let mut cursor = root.walk();
+    let mut depth = 0;
+    loop {
+        let node = cursor.node();
+        let row = node.start_position().row;
+        let mut descend = node.end_position().row > row;
+        if let Some((line_start, token)) = first_token(row) {
+            let seen = |boundaries: &[Boundary]| {
+                boundaries
+                    .last()
+                    .is_some_and(|last| last.line_start == line_start)
+            };
+            // A statement sequence without an opening token starts at its first
+            // statement, which must not look shallower than the ones after it.
+            let sequence = matches!(
+                (language, node.kind()),
+                ("python", "block") | ("go", "statement_list")
+            );
+            if node.start_byte() == token && !seen(&boundaries) {
+                if node.is_named() && !sequence {
+                    boundaries.push(Boundary {
+                        line_start,
+                        token_start: token,
+                        depth,
+                    });
+                } else {
+                    descend = true;
+                }
+            }
+        }
+        // A node within one line holds nothing that begins another line.
+        if descend && cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return boundaries;
+            }
+            depth -= 1;
+        }
+    }
+}
+
+fn syntax_boundary(boundaries: &[Boundary], from: usize, to: usize) -> Option<usize> {
+    let first = boundaries.partition_point(|boundary| boundary.token_start < from);
+    boundaries[first..]
+        .iter()
+        .take_while(|boundary| boundary.token_start <= to)
+        .min_by_key(|boundary| (boundary.depth, Reverse(boundary.token_start)))
+        .map(|boundary| boundary.token_start)
+}
+
+/// Cut a range into spans of at most `budget` bytes. A span preferably ends at
+/// one of `boundaries` in the second half of the budget, without overlap.
+/// Otherwise it ends after a whole line (and therefore at a statement boundary
+/// in common layouts) and the next span repeats `overlap_lines` of it.
 /// A single line exceeding the budget is split only at valid UTF-8 boundaries.
 fn windows(
     source: &str,
     range: Range<usize>,
     budget: usize,
     overlap_lines: usize,
+    boundaries: &[Boundary],
 ) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
     let mut start = range.start;
@@ -511,6 +875,14 @@ fn windows(
         let mut limit = start.saturating_add(budget).min(range.end);
         while !source.is_char_boundary(limit) {
             limit -= 1;
+        }
+        if limit < range.end {
+            let half = start.saturating_add(budget / 2);
+            if let Some(end) = syntax_boundary(boundaries, half, limit) {
+                spans.push(start..end);
+                start = end;
+                continue;
+            }
         }
         // With a positive token budget (at least four bytes), one UTF-8 scalar
         // always fits. Avoid splitting a short last line unnecessarily.

@@ -104,7 +104,8 @@ fn python_async_decorators_classes_and_nested_functions() {
     let chunks = parse("worker.py", source);
     assert!(symbol(&chunks, "Outer")
         .content
-        .starts_with("@decorate\r\nclass Outer:"));
+        .starts_with("# 中文\r\n@decorate\r\nclass Outer:"));
+    assert_eq!(symbol(&chunks, "Outer").start_line, 1);
     let run = symbol(&chunks, "Outer.run");
     assert!(run.content.starts_with("@cached\r\n    async def run"));
     assert_eq!(run.start_line, 4);
@@ -199,7 +200,7 @@ fn go_struct_interface_alias_function_and_receiver_method() {
 }
 
 #[test]
-fn long_functions_are_bounded_and_overlap_without_losing_code() {
+fn long_functions_are_bounded_and_syntax_aligned_without_losing_code() {
     let mut source = "fn long() {\n".to_owned();
     for n in 0..100 {
         source.push_str(&format!("    let value_{n} = {n};\n"));
@@ -219,10 +220,15 @@ fn long_functions_are_bounded_and_overlap_without_losing_code() {
     assert!(parts.iter().all(|c| c.entity_id == parts[0].entity_id));
     assert!(parts
         .windows(2)
-        .any(|pair| pair[1].start_byte < pair[0].end_byte));
+        .all(|pair| pair[0].end_byte <= pair[1].start_byte));
+    for part in parts.iter().skip(1) {
+        assert!(source[part.start_byte..].starts_with("let value_"));
+    }
     let mut covered_end = parts[0].start_byte;
     for part in &parts {
-        assert!(part.start_byte <= covered_end);
+        if part.start_byte > covered_end {
+            assert!(source[covered_end..part.start_byte].trim().is_empty());
+        }
         covered_end = covered_end.max(part.end_byte);
     }
     assert_eq!(covered_end, source.trim_end().len());
@@ -307,7 +313,10 @@ fn comments_and_top_level_code_remain_searchable_without_definitions() {
     }
     let source = "// before\nfn one() {}\n// after\nconst VALUE: i32 = 1;";
     let chunks = parse("lib.rs", source);
-    assert!(chunks
+    assert!(symbol(&chunks, "one")
+        .content
+        .starts_with("// before\nfn one"));
+    assert!(!chunks
         .iter()
         .any(|c| c.kind == "text" && c.content.contains("// before")));
     assert!(chunks
