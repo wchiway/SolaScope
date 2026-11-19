@@ -1,0 +1,32 @@
+[package]
+name = "solascope-bench"
+description = "Reproducible retrieval-quality and performance harness for SolaScope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "solascope_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solascope-bench"
+path = "src/main.rs"
+# The library carries the documentation; this also avoids a rustdoc name clash.
+doc = false
+
+[features]
+default = []
+# Needed to measure `hybrid+rerank` with `rerank.provider = "fastembed"`.
+local-rerank = ["solascope-engine/local-rerank"]
+
+[dependencies]
+solascope-core.workspace = true
+solascope-config.workspace = true
+solascope-engine.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tempfile.workspace = true

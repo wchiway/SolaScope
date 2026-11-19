@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/solascope",
+    "benchmarks",
     "crates/solascope-core",
     "crates/solascope-config",
     "crates/solascope-scanner",

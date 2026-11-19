@@ -2509,6 +2509,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solascope-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "solascope-config",
+ "solascope-core",
+ "solascope-engine",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "solascope-cli"
 version = "0.1.0"
 dependencies = [
