@@ -1,0 +1,83 @@
+name: Test and package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test default features
+        run: cargo test --workspace --all-targets --locked
+      - name: Test optional local reranker
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --all-targets --locked --features local-rerank
+      - name: Build CLI release binaries
+        run: cargo build --release --locked -p solascope-cli --bins
+      - name: Verify both entry points and package
+        run: |
+          python -I - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import platform
+          import subprocess
+          import zipfile
+
+          root = pathlib.Path.cwd()
+          suffix = ".exe" if os.name == "nt" else ""
+          binaries = [root / "target" / "release" / (name + suffix)
+                      for name in ("solascope", "sas")]
+          versions = [subprocess.check_output([str(binary), "--version"])
+                      for binary in binaries]
+          if versions[0] != versions[1]:
+              raise SystemExit("CLI aliases return different versions")
+          version = versions[0].decode("utf-8").strip().split()[-1]
+          destination = root / "dist"
+          destination.mkdir(exist_ok=True)
+          archive = destination / (
+              f"solascope-{version}-{platform.system().lower()}-{platform.machine().lower()}.zip")
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+              for binary in binaries:
+                  package.write(binary, binary.name)
+              for name in ("LICENSE", "README.md", "docs/configuration.md",
+                           "docs/mcp.md", "docs/architecture.md", "docs/benchmarks.md",
+                           "docs/implementation-status.md", "benchmarks/README.md"):
+                  package.write(root / name, name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (destination / "SHA256SUMS").write_text(
+              f"{digest}  {archive.name}\n", encoding="utf-8")
+          print(archive.name)
+          PY
+      - name: Upload platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: solascope-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error

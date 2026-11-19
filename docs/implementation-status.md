@@ -28,7 +28,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-尚未实测真实模型服务、本地 ONNX 推理、macOS/Windows 和商业 MCP 客户端。跨平台构建和发行包仍需验证。
+尚未实测真实模型服务、本地 ONNX 推理、macOS/Windows 和商业 MCP 客户端。三平台 CI 与打包工作流已配置，远程 runner 和发行包仍需验证。
 
 ## 现有限制
 
