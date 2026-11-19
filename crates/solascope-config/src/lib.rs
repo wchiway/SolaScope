@@ -46,11 +46,13 @@ section!(EmbeddingConfig {
     model: String = "nomic-embed-text".into(),
     endpoint: String = "http://127.0.0.1:11434".into(),
     dimensions: usize = 768,
+    request_dimensions: bool = true,
     api_key_env: String = "OPENAI_API_KEY".into(),
     batch_size: usize = 32,
     concurrency: usize = 2,
     timeout_secs: u64 = 30,
     retries: usize = 2,
+    fingerprint_policy: String = "strict".into(),
 });
 section!(RerankConfig {
     provider: String = "disabled".into(),
@@ -75,7 +77,9 @@ section!(SearchConfig {
     semantic_fail_open: bool = true,
 });
 section!(IndexConfig {
+    watch: bool = false,
     debounce_ms: u64 = 300,
+    hash_algorithm: String = "sha256".into(),
     max_concurrent_jobs: usize = 4,
     snapshot_retention: usize = 2,
 });
@@ -86,7 +90,9 @@ section!(PrivacyConfig {
     allow_external_paths: bool = false,
 });
 section!(LogConfig {
-    level: String = "info".into()
+    level: String = "info".into(),
+    output: String = "stderr".into(),
+    redact_secrets: bool = true,
 });
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -166,12 +172,26 @@ impl Config {
         )?;
         one_of(
             &self.embedding.provider,
-            &["disabled", "ollama", "openai"],
+            &[
+                "disabled",
+                "ollama",
+                "openai",
+                "remote",
+                "dashscope",
+                "siliconflow",
+            ],
             "embedding.provider",
         )?;
         one_of(
             &self.rerank.provider,
-            &["disabled", "remote", "fastembed"],
+            &[
+                "disabled",
+                "remote",
+                "openai",
+                "dashscope",
+                "siliconflow",
+                "fastembed",
+            ],
             "rerank.provider",
         )?;
         one_of(
@@ -179,6 +199,21 @@ impl Config {
             &["off", "error", "warn", "info", "debug", "trace"],
             "log.level",
         )?;
+        one_of(
+            &self.embedding.fingerprint_policy,
+            &["strict", "rebuild"],
+            "embedding.fingerprint_policy",
+        )?;
+        // The field names the revision hash so another algorithm can be added
+        // without silently mixing hashes in one index.
+        one_of(
+            &self.index.hash_algorithm,
+            &["sha256"],
+            "index.hash_algorithm",
+        )?;
+        if self.log.output != "stderr" && !Path::new(&self.log.output).is_absolute() {
+            return Err(invalid("log.output must be \"stderr\" or a file path"));
+        }
         for (name, count) in [
             ("project.max_file_size", self.project.max_file_size),
             (
@@ -241,14 +276,16 @@ impl Config {
         if self.embedding.provider != "disabled" && embedding_url.is_none() {
             return Err(invalid("embedding.endpoint is required when enabled"));
         }
-        if self.rerank.provider == "remote" && self.rerank.endpoint.is_empty() {
+        if !matches!(self.rerank.provider.as_str(), "disabled" | "fastembed")
+            && self.rerank.endpoint.is_empty()
+        {
             return Err(invalid("rerank.endpoint is required for remote reranking"));
         }
         let remote_ollama =
             self.embedding.provider == "ollama" && !embedding_url.as_ref().is_some_and(is_loopback);
         if !self.privacy.remote_opt_in
-            && (self.embedding.provider == "openai"
-                || self.rerank.provider == "remote"
+            && (!matches!(self.embedding.provider.as_str(), "disabled" | "ollama")
+                || !matches!(self.rerank.provider.as_str(), "disabled" | "fastembed")
                 || remote_ollama)
         {
             return Err(Error::Privacy(
@@ -362,11 +399,16 @@ fn resolve_paths(value: &mut toml::Value, base: &Path) -> Result<()> {
         ("project", "root"),
         ("project", "index_dir"),
         ("rerank", "cache_dir"),
+        ("log", "output"),
     ] {
         if let Some(path) = value.get_mut(group).and_then(|group| group.get_mut(field)) {
             let raw = path
                 .as_str()
                 .ok_or_else(|| invalid("configuration paths must be strings"))?;
+            // `stderr` names the stream, not a file.
+            if (group, field) == ("log", "output") && raw == "stderr" {
+                continue;
+            }
             *path = toml::Value::String(
                 absolute(Path::new(raw), base)
                     .to_string_lossy()
@@ -739,6 +781,84 @@ mod tests {
             config.embedding.endpoint = endpoint.into();
             let error = config.validate().unwrap_err().to_string();
             assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn cloud_provider_names_are_valid_but_never_bypass_remote_consent() {
+        let root = tempdir().unwrap();
+        for provider in ["openai", "remote", "dashscope", "siliconflow"] {
+            let mut config = Config::default_for_root(root.path()).unwrap();
+            config.embedding.provider = provider.into();
+            config.embedding.model = "configured-model".into();
+            config.embedding.endpoint = "http://127.0.0.1:9000/v1".into();
+            assert!(matches!(config.validate(), Err(Error::Privacy(_))));
+            config.privacy.remote_opt_in = true;
+            config.validate().unwrap();
+            config.embedding.endpoint.clear();
+            assert!(matches!(config.validate(), Err(Error::Config(_))));
+
+            let mut config = Config::default_for_root(root.path()).unwrap();
+            config.rerank.provider = provider.into();
+            config.rerank.model = "configured-reranker".into();
+            config.rerank.endpoint = "http://127.0.0.1:9000/rerank".into();
+            assert!(matches!(config.validate(), Err(Error::Privacy(_))));
+            config.privacy.remote_opt_in = true;
+            config.validate().unwrap();
+            config.rerank.endpoint.clear();
+            assert!(matches!(config.validate(), Err(Error::Config(_))));
+        }
+    }
+
+    #[test]
+    fn watch_log_and_embedding_request_fields_obey_layer_precedence() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(".solascope.toml"),
+            "[log]\nlevel='debug'\noutput='logs/diagnostics.txt'\nredact_secrets=false\n[index]\nwatch=true\nhash_algorithm='sha256'\n[embedding]\nrequest_dimensions=false\nfingerprint_policy='rebuild'\n").unwrap();
+        let config = load(root.path(), None, &[]).unwrap();
+        assert_eq!(
+            config.log.output,
+            root.path().join("logs/diagnostics.txt").to_string_lossy()
+        );
+        assert!(!config.log.redact_secrets);
+        assert!(config.index.watch);
+        assert!(!config.embedding.request_dimensions);
+        assert_eq!(config.embedding.fingerprint_policy, "rebuild");
+        let config = load(
+            root.path(),
+            None,
+            &[
+                ("SOLASCOPE__LOG__OUTPUT", "run.log"),
+                ("SOLASCOPE__LOG__REDACT_SECRETS", "true"),
+                ("SOLASCOPE__INDEX__WATCH", "false"),
+                ("SOLASCOPE__EMBEDDING__REQUEST_DIMENSIONS", "true"),
+                ("SOLASCOPE__EMBEDDING__FINGERPRINT_POLICY", "strict"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            config.log.output,
+            root.path().join("run.log").to_string_lossy()
+        );
+        assert!(config.log.redact_secrets);
+        assert!(!config.index.watch);
+        assert!(config.embedding.request_dimensions);
+        assert_eq!(config.embedding.fingerprint_policy, "strict");
+    }
+
+    #[test]
+    fn unsupported_revision_hash_policy_and_mistyped_flags_are_rejected() {
+        let root = tempdir().unwrap();
+        for body in [
+            "[index]\nhash_algorithm='blake3'",
+            "[index]\nwatch='true'",
+            "[embedding]\nfingerprint_policy='ignore'",
+            "[embedding]\nrequest_dimensions='false'",
+            "[log]\nlevel='verbose'",
+            "[log]\nredact_secrets='false'",
+        ] {
+            fs::write(root.path().join(".solascope.toml"), body).unwrap();
+            assert!(load(root.path(), None, &[]).is_err(), "{body}");
         }
     }
 }

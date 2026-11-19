@@ -20,8 +20,7 @@ pub(crate) struct HttpTransport {
 }
 
 /// Accept only HTTP(S) URLs with credentials kept in environment variables.
-/// Query strings are rejected: they commonly carry tokens and are not needed
-/// by the supported protocols. The normalized URL is safe for fingerprints.
+/// Query strings are rejected because they commonly carry tokens.
 pub(crate) fn endpoint(base: &str, suffix: &str) -> Result<(Url, bool)> {
     let mut url =
         Url::parse(base).map_err(|_| Error::Config("invalid model endpoint URL".into()))?;
@@ -41,20 +40,134 @@ pub(crate) fn endpoint(base: &str, suffix: &str) -> Result<(Url, bool)> {
             .parse::<IpAddr>()
             .is_ok_and(|ip| ip.is_loopback());
     if host == "localhost" {
-        // Avoid DNS resolution of a supposedly local destination.
         url.set_host(Some("127.0.0.1"))
             .map_err(|_| Error::Config("invalid local endpoint".into()))?;
     }
     let path = url.path().trim_end_matches('/');
-    let path = if path.ends_with(suffix) {
+    // An explicit rerank URL may be singular (most compatible providers) or
+    // plural (Bailian compatible-api). Preserve it instead of appending again.
+    let explicit_rerank =
+        suffix.ends_with("/rerank") && (path.ends_with("/rerank") || path.ends_with("/reranks"));
+    let path = if path.ends_with(suffix) || explicit_rerank {
         path.to_owned()
-    } else if suffix == "/v1/embeddings" && path.ends_with("/v1") {
-        format!("{path}/embeddings")
     } else {
-        format!("{path}{suffix}")
+        let base_parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let suffix_parts: Vec<&str> = suffix.split('/').filter(|part| !part.is_empty()).collect();
+        let overlap = (0..=base_parts.len().min(suffix_parts.len()))
+            .rev()
+            .find(|count| base_parts[base_parts.len() - count..] == suffix_parts[..*count])
+            .unwrap_or(0);
+        format!(
+            "/{}",
+            base_parts
+                .iter()
+                .chain(&suffix_parts[overlap..])
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/")
+        )
     };
     url.set_path(&path);
     Ok((url, !loopback))
+}
+
+// Error payloads can arrive with HTTP 200 on compatible gateways. Classify
+// only known codes and never expose response messages, URLs or credentials.
+fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, bool)> {
+    let codes: Vec<String> = body
+        .into_iter()
+        .flat_map(|value| {
+            ["/error/code", "/error/type", "/code", "/type"]
+                .into_iter()
+                .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        })
+        .map(|code| {
+            code.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .collect();
+    let error_payload = body.is_some_and(|value| {
+        value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("code").is_some_and(|code| {
+                !code.is_null()
+                    && !matches!(code.as_str(), Some("" | "0" | "200" | "OK" | "Success"))
+                    && code.as_i64() != Some(0)
+                    && code.as_i64() != Some(200)
+            })
+    });
+    if status.is_success() && !error_payload {
+        return None;
+    }
+    let is_code = |names: &[&str]| codes.iter().any(|code| names.contains(&code.as_str()));
+    if matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED
+    ) || is_code(&[
+        "invalidapikey",
+        "invalidaccesskeyid",
+        "accessdenied",
+        "forbidden",
+        "permissiondenied",
+        "insufficientquota",
+        "quotaexceeded",
+        "quotaexhausted",
+        "billinghardlimitreached",
+        "billingnotactive",
+        "arrearage",
+        "prepaidbilloverdue",
+        "postpaidbilloverdue",
+    ]) {
+        return Some((
+            Error::Authentication("model service rejected authentication or quota".into()),
+            false,
+        ));
+    }
+    if status == StatusCode::NOT_FOUND
+        || is_code(&[
+            "modelnotfound",
+            "invalidmodel",
+            "unsupportedmodel",
+            "invaliddimensions",
+            "invaliddimension",
+        ])
+    {
+        return Some((
+            Error::ModelIncompatible("model or model API is unavailable/incompatible".into()),
+            false,
+        ));
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || is_code(&[
+            "ratelimitexceeded",
+            "ratelimiterror",
+            "serviceunavailable",
+            "internalerror",
+            "timeout",
+        ])
+        || codes.iter().any(|code| code.starts_with("throttling"))
+    {
+        let message = if status.is_success() {
+            "model service temporarily unavailable".into()
+        } else {
+            format!(
+                "model service temporarily unavailable (HTTP {})",
+                status.as_u16()
+            )
+        };
+        return Some((Error::ModelUnavailable(message), true));
+    }
+    let message = if status.is_success() {
+        "model service returned an error; check endpoint and model configuration".into()
+    } else {
+        format!(
+            "model service rejected request (HTTP {}); check endpoint and model configuration",
+            status.as_u16()
+        )
+    };
+    Some((Error::Config(message), false))
 }
 
 impl HttpTransport {
@@ -122,8 +235,7 @@ impl HttpTransport {
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
-                    let retry = temporary_network(&error);
-                    if retry && attempt < self.retries {
+                    if temporary_network(&error) && attempt < self.retries {
                         backoff(attempt).await;
                         continue;
                     }
@@ -134,71 +246,15 @@ impl HttpTransport {
                 }
             };
             let status = response.status();
-            if !status.is_success() {
-                // The body is inspected only for known error codes, never echoed.
-                let bytes = read_bounded(response, MAX_ERROR_BYTES)
-                    .await
-                    .unwrap_or_default();
-                let error_body = serde_json::from_slice::<Value>(&bytes).ok();
-                let codes: Vec<&str> = error_body
-                    .as_ref()
-                    .map(|value| {
-                        ["/error/code", "/error/type", "/code", "/type"]
-                            .into_iter()
-                            .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let quota = codes.iter().any(|code| {
-                    matches!(
-                        *code,
-                        "insufficient_quota"
-                            | "quota_exceeded"
-                            | "billing_hard_limit_reached"
-                            | "billing_not_active"
-                    )
-                });
-                if quota
-                    || matches!(
-                        status,
-                        StatusCode::UNAUTHORIZED
-                            | StatusCode::FORBIDDEN
-                            | StatusCode::PAYMENT_REQUIRED
-                    )
-                {
-                    return Err(Error::Authentication(
-                        "model service rejected authentication or quota".into(),
-                    ));
-                }
-                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    if attempt < self.retries {
-                        backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(Error::ModelUnavailable(format!(
-                        "model service temporarily unavailable (HTTP {})",
-                        status.as_u16()
-                    )));
-                }
-                if status == StatusCode::NOT_FOUND
-                    || codes.iter().any(|code| {
-                        matches!(
-                            *code,
-                            "model_not_found"
-                                | "invalid_model"
-                                | "unsupported_model"
-                                | "invalid_dimensions"
-                        )
-                    })
-                {
-                    return Err(Error::ModelIncompatible(
-                        "model or model API is unavailable/incompatible".into(),
-                    ));
-                }
-                return Err(Error::Config(format!("model service rejected request (HTTP {}); check endpoint and model configuration", status.as_u16())));
-            }
-            let bytes = match read_bounded(response, MAX_RESPONSE_BYTES).await {
+            let budget = if status.is_success() {
+                MAX_RESPONSE_BYTES
+            } else {
+                MAX_ERROR_BYTES
+            };
+            let bytes = match read_bounded(response, budget).await {
                 Ok(bytes) => bytes,
+                // HTTP status alone is sufficient to classify failed responses.
+                Err(_) if !status.is_success() => Vec::new(),
                 Err(ReadError::Network(error))
                     if temporary_network(&error) && attempt < self.retries =>
                 {
@@ -216,7 +272,18 @@ impl HttpTransport {
                     ))
                 }
             };
-            return serde_json::from_slice(&bytes).map_err(|_| {
+            let payload = serde_json::from_slice::<Value>(&bytes).ok();
+            if let Some((error, retry)) = service_failure(status, payload.as_ref()) {
+                if retry && attempt < self.retries {
+                    backoff(attempt).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            let payload = payload.ok_or_else(|| {
+                Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
+            })?;
+            return serde_json::from_value(payload).map_err(|_| {
                 Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
             });
         }

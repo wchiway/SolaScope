@@ -1,13 +1,14 @@
 use solascope_config::Config;
 use solascope_core::{
-    project_id, truncate_text, ContextLine, ContextRequest, ContextResponse, DiagnosticCheck,
-    DoctorReport, Error, IndexReport, IndexStatus, LexicalIndex, MetadataStore, RankedChunk,
-    RerankDocument, Result, SearchMode, SearchRequest, SearchResponse, SearchResult, SymbolRequest,
-    VectorIndex, MAX_CONTEXT_BYTES, MAX_CONTEXT_LINES, MAX_RESULTS,
+    project_id, truncate_text, Chunk, ContextLine, ContextRequest, ContextResponse,
+    DiagnosticCheck, DoctorReport, Error, IndexReport, IndexStatus, LexicalIndex, MetadataStore,
+    RankedChunk, RerankDocument, RerankScore, Result, SearchMode, SearchRequest, SearchResponse,
+    SearchResult, SearchTimings, SourceFile, SymbolRequest, VectorIndex, MAX_CONTEXT_BYTES,
+    MAX_CONTEXT_LINES, MAX_RESULTS,
 };
 use solascope_models::{build_embedding, build_reranker};
 use solascope_parser::ParserOptions;
-use solascope_storage::{CachedEmbedding, FileUpdate, Store, WriterLock};
+use solascope_storage::{CachedEmbedding, FileUpdate, IndexCommit, Store, WriterLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -94,7 +95,17 @@ impl Engine {
 
     pub fn status(&self) -> Result<IndexStatus> {
         let store = self.store(false)?;
-        store.snapshot(Store::status)
+        store.snapshot(|store| self.checked_status(store))
+    }
+
+    fn checked_status(&self, store: &Store) -> Result<IndexStatus> {
+        let status = store.status()?;
+        if store.meta("chunking")?.as_deref() != Some(self.chunking_signature().as_str()) {
+            return Err(Error::IndexOutdated(
+                "stored chunks use different chunker rules or parser settings".into(),
+            ));
+        }
+        Ok(status)
     }
 
     pub async fn index(&self, rebuild: bool) -> Result<IndexReport> {
@@ -145,15 +156,40 @@ impl Engine {
         let mut store = self.store(true)?;
         let recovered = store.recover_jobs(lock)?;
         let previous = store.current_generation()?;
+        let mut warnings = Vec::new();
+        let mut rebuild = rebuild;
         if !rebuild
             && previous
                 .as_ref()
                 .is_some_and(|generation| generation.fingerprint != fingerprint)
         {
-            return Err(Error::ModelIncompatible(
-                "the embedding configuration changed".into(),
+            if self.config.embedding.fingerprint_policy != "rebuild" {
+                return Err(Error::ModelIncompatible(
+                    "the embedding configuration changed".into(),
+                ));
+            }
+            warnings.push(
+                "the embedding configuration changed; rebuilding because \
+                 embedding.fingerprint_policy is \"rebuild\""
+                    .into(),
+            );
+            rebuild = true;
+        }
+        // Chunks produced under other chunking rules are never mixed with new ones.
+        let chunking = self.chunking_signature();
+        let rechunk =
+            previous.is_some() && store.meta("chunking")?.as_deref() != Some(chunking.as_str());
+        if rechunk && !rebuild {
+            warnings.push(
+                "chunking rules or parser settings changed; every file was re-chunked".into(),
+            );
+        }
+        if recovered > 0 {
+            warnings.push(format!(
+                "recovered {recovered} interrupted indexing job(s); previous snapshot was preserved"
             ));
         }
+        let reparse_all = rebuild || rechunk;
         let job = store.begin_job(lock)?;
         let started = Instant::now();
         let work = async {
@@ -164,77 +200,141 @@ impl Engine {
                     result.map_err(|error| Error::Storage(format!("scan worker: {error}")))??
                 }
             };
-            let mut warnings = scan.warnings;
-            if recovered > 0 { warnings.push(format!("recovered {recovered} interrupted indexing job(s); previous snapshot was preserved")); }
+            warnings.extend(scan.warnings);
             let files_total = scan.files.len();
             let old_hashes = store.file_hashes()?;
-            let paths: HashSet<&str> = scan.files.iter().map(|file| file.relative_path.as_str()).collect();
-            let removed: Vec<String> = old_hashes.keys().filter(|path| !paths.contains(path.as_str())).cloned().collect();
-            let changed: Vec<_> = scan.files.into_iter().filter(|file| {
-                rebuild || old_hashes.get(&file.relative_path) != Some(&file.hash)
-            }).collect();
+            let paths: HashSet<&str> = scan
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect();
+            let removed: Vec<String> = old_hashes
+                .keys()
+                .filter(|path| !paths.contains(path.as_str()))
+                .cloned()
+                .collect();
+            let changed: Vec<_> = scan
+                .files
+                .into_iter()
+                .filter(|file| reparse_all || old_hashes.get(&file.relative_path) != Some(&file.hash))
+                .collect();
             let files_updated = changed.len();
             let files_unchanged = files_total - files_updated;
+            tracing::info!(
+                files = files_total,
+                changed = files_updated,
+                deleted = removed.len(),
+                "scan complete"
+            );
             let id = project_id(&self.config.project.root);
-            let options = ParserOptions {
-                enabled_languages: self.config.parser.enabled_languages.clone(),
-                fallback: self.config.parser.fallback_policy == "text",
-                max_chunk_tokens: self.config.parser.max_chunk_tokens,
-                overlap_lines: self.config.parser.overlap_lines,
-            };
+            let options = self.parser_options();
             let jobs = self.config.index.max_concurrent_jobs;
             let updates: Vec<FileUpdate> = tokio::select! {
                 _ = cancel.cancelled() => return Err(Error::Cancelled),
-                result = tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()
-                        .map_err(|error| Error::Parse(format!("parser pool: {error}")))?;
-                    pool.install(|| changed.into_par_iter().map(|source| {
-                        let chunks = solascope_parser::parse_file(&id, &source.relative_path, &source.content, &options)?;
-                        Ok(FileUpdate { source, chunks })
-                    }).collect::<Result<Vec<_>>>())
-                }) => result.map_err(|error| Error::Parse(format!("parser worker: {error}")))??
+                result = tokio::task::spawn_blocking(move || parse_files(changed, &id, &options, jobs)) => {
+                    result.map_err(|error| Error::Parse(format!("parser worker: {error}")))??
+                }
             };
+            let skipped_ast = if self.config.parser.fallback_policy == "skip" {
+                updates.iter().filter(|update| update.chunks.is_empty()
+                    && !update.source.content.trim().is_empty()).count()
+            } else { 0 };
+            if skipped_ast > 0 {
+                warnings.push(format!("skipped chunks for {skipped_ast} file(s) without a usable AST (fallback_policy=skip); file hashes retained for incremental checks"));
+            }
             let mut vectors = Vec::new();
-            let mut cache_hits = 0;
+            let (mut cache_hits, mut relocated, mut embedded) = (0, 0, 0);
             if let (Some(provider), Some(fingerprint)) = (&embedding, &fingerprint) {
-                let hashes: Vec<String> = updates.iter().flat_map(|update| &update.chunks).map(|chunk| chunk.embedding_hash.clone()).collect();
-                let cached = store.cached_vectors(fingerprint, &hashes)?;
-                let mut new_inputs = BTreeMap::new();
-                for chunk in updates.iter().flat_map(|update| &update.chunks) {
+                let chunks: Vec<&Chunk> = updates.iter().flat_map(|update| &update.chunks).collect();
+                let hashes: Vec<String> = chunks
+                    .iter()
+                    .map(|chunk| chunk.embedding_hash.clone())
+                    .collect();
+                // A rebuild recomputes vectors that were reused from another path.
+                let cached = store.cached_vectors(fingerprint, &hashes, rebuild)?;
+                let mut missing: BTreeMap<&str, &Chunk> = BTreeMap::new();
+                for chunk in &chunks {
                     if !cached.contains_key(&chunk.embedding_hash) {
-                        new_inputs.entry(chunk.embedding_hash.clone()).or_insert_with(|| chunk.embedding_text.clone());
+                        missing.entry(chunk.embedding_hash.as_str()).or_insert(chunk);
                     }
                 }
-                cache_hits = hashes.len().saturating_sub(new_inputs.len());
-                if !new_inputs.is_empty() {
-                    let texts: Vec<String> = new_inputs.values().cloned().collect();
-                    let group_size = self.config.embedding.batch_size
-                        .saturating_mul(self.config.embedding.concurrency).clamp(1, 128);
+                if !rebuild && !missing.is_empty() {
+                    // Code that only moved keeps the vector from its old path.
+                    let keys: Vec<String> = missing
+                        .values()
+                        .map(|chunk| chunk.relocation_key())
+                        .collect();
+                    let reusable = store.relocated_vectors(fingerprint, &keys)?;
+                    missing.retain(|hash, chunk| {
+                        let relocation_key = chunk.relocation_key();
+                        let Some(vector) = reusable.get(&relocation_key) else {
+                            return true;
+                        };
+                        vectors.push(CachedEmbedding {
+                            input_hash: (*hash).to_owned(),
+                            relocation_key,
+                            vector: vector.clone(),
+                            exact: false,
+                        });
+                        false
+                    });
+                    relocated = vectors.len();
+                }
+                embedded = missing.len();
+                cache_hits = hashes.len() - embedded - relocated;
+                if embedded > 0 {
+                    tracing::info!(
+                        inputs = embedded,
+                        cache_hits,
+                        relocated,
+                        "requesting embeddings"
+                    );
+                    let texts: Vec<String> = missing
+                        .values()
+                        .map(|chunk| chunk.embedding_text.clone())
+                        .collect();
+                    let group_size = self
+                        .config
+                        .embedding
+                        .batch_size
+                        .saturating_mul(self.config.embedding.concurrency)
+                        .clamp(1, 128);
                     let mut generated = Vec::with_capacity(texts.len());
                     for batch in texts.chunks(group_size) {
                         let output = tokio::select! {
                             _ = cancel.cancelled() => return Err(Error::Cancelled),
-                            result = provider.embed(batch) => result?,
+                            result = provider.embed(batch) => result.map_err(indexing_hint)?,
                         };
                         if output.len() != batch.len() {
-                            return Err(Error::ModelIncompatible("embedding batch output count differs from input".into()));
+                            return Err(Error::ModelIncompatible(
+                                "embedding batch output count differs from input".into(),
+                            ));
                         }
                         generated.extend(output);
+                        tracing::info!(
+                            done = generated.len(),
+                            total = embedded,
+                            "embedding progress"
+                        );
                     }
-                    if generated.len() != new_inputs.len() {
-                        return Err(Error::ModelIncompatible("embedding output count differs from input".into()));
-                    }
-                    for ((hash, _), vector) in new_inputs.into_iter().zip(generated) {
+                    for ((hash, chunk), vector) in missing.iter().zip(generated) {
                         solascope_storage::validate_vector(&vector, fingerprint.dimensions)?;
-                        vectors.push(CachedEmbedding { input_hash: hash, vector });
+                        vectors.push(CachedEmbedding {
+                            input_hash: (*hash).to_owned(),
+                            relocation_key: chunk.relocation_key(),
+                            vector,
+                            exact: true,
+                        });
                     }
                 }
             }
-            if cancel.is_cancelled() { return Err(Error::Cancelled); }
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             for update in &updates {
-                let current = solascope_scanner::read_file(&self.config, &update.source.relative_path)
-                    .map_err(|_| Error::SourceChanged(update.source.relative_path.clone()))?;
+                let current =
+                    solascope_scanner::read_file(&self.config, &update.source.relative_path)
+                        .map_err(|_| Error::SourceChanged(update.source.relative_path.clone()))?;
                 if current.hash != update.source.hash {
                     return Err(Error::SourceChanged(update.source.relative_path.clone()));
                 }
@@ -245,16 +345,42 @@ impl Engine {
                 }
             }
             let generation = store.commit_index(
-                lock, &updates, &removed, fingerprint.as_ref(), &vectors, rebuild, job, self.config.index.snapshot_retention,
+                lock,
+                IndexCommit {
+                    updates: &updates,
+                    removed: &removed,
+                    fingerprint: fingerprint.as_ref(),
+                    vectors: &vectors,
+                    force_generation: reparse_all,
+                    chunking: &chunking,
+                    job,
+                    retention: self.config.index.snapshot_retention,
+                },
             )?;
             let status = store.status()?;
+            tracing::info!(
+                version = generation.version,
+                chunks = status.chunks,
+                "index committed"
+            );
             Ok(IndexReport {
-                project_id: status.project_id, index_version: generation.version, files_total,
-                files_updated, files_unchanged, files_deleted: removed.len(), chunks: status.chunks,
-                embedded_chunks: vectors.len(), cache_hits, skipped_files: scan.skipped, warnings,
-                elapsed_ms: started.elapsed().as_millis(), rebuilt: rebuild,
+                project_id: status.project_id,
+                index_version: generation.version,
+                files_total,
+                files_updated,
+                files_unchanged,
+                files_deleted: removed.len(),
+                chunks: status.chunks,
+                embedded_chunks: embedded,
+                cache_hits,
+                relocated_embeddings: relocated,
+                skipped_files: scan.skipped + skipped_ast,
+                warnings: std::mem::take(&mut warnings),
+                elapsed_ms: started.elapsed().as_millis(),
+                rebuilt: rebuild,
             })
-        }.await;
+        }
+        .await;
         if let Err(error) = &work {
             if let Err(record_error) = store.fail_job(lock, job, &error.to_string()) {
                 tracing::warn!("could not record failed index job: {record_error}");
@@ -263,8 +389,35 @@ impl Engine {
         work
     }
 
+    fn parser_options(&self) -> ParserOptions {
+        ParserOptions {
+            enabled_languages: self.config.parser.enabled_languages.clone(),
+            fallback: self.config.parser.fallback_policy == "text",
+            max_chunk_tokens: self.config.parser.max_chunk_tokens,
+            overlap_lines: self.config.parser.overlap_lines,
+        }
+    }
+
+    /// Changes whenever the same source would be chunked differently, either
+    /// by a new chunker or by different parser settings.
+    fn chunking_signature(&self) -> String {
+        let parser = &self.config.parser;
+        let mut languages = parser.enabled_languages.clone();
+        languages.sort();
+        solascope_core::hash_text(&format!(
+            "{}\0{}\0{}\0{}\0{}",
+            solascope_parser::CHUNKER_VERSION,
+            languages.join(","),
+            parser.fallback_policy,
+            parser.max_chunk_tokens,
+            parser.overlap_lines
+        ))
+    }
+
     pub async fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
+        let started = Instant::now();
+        let mut embedding_time = Duration::ZERO;
         let preliminary = self.status()?;
         let mut warnings = Vec::new();
         let mut query_vector = None;
@@ -293,9 +446,11 @@ impl Engine {
                 let vector = if let Some(vector) = cached {
                     Ok(vector)
                 } else {
-                    match provider.embed(std::slice::from_ref(&request.query)).await {
-                        Ok(mut vectors) if vectors.len() == 1 => {
-                            let vector = vectors.remove(0);
+                    let embed_started = Instant::now();
+                    let embedded = provider.embed_query(&request.query).await;
+                    embedding_time = embed_started.elapsed();
+                    match embedded {
+                        Ok(vector) => {
                             solascope_storage::validate_vector(&vector, fingerprint.dimensions)?;
                             let mut cache = self
                                 .query_cache
@@ -308,9 +463,6 @@ impl Engine {
                             cache.insert(cache_key, (Instant::now(), vector.clone()));
                             Ok(vector)
                         }
-                        Ok(_) => Err(Error::ModelIncompatible(
-                            "query embedding count must be one".into(),
-                        )),
                         Err(error) => Err(error),
                     }
                 };
@@ -345,7 +497,7 @@ impl Engine {
         }
         let store = self.store(false)?;
         let (status, channels) = store.snapshot(|store| {
-            let status = store.status()?;
+            let status = self.checked_status(store)?;
             let mut channels = Vec::new();
             if request.mode != SearchMode::Semantic {
                 channels.push((
@@ -356,15 +508,20 @@ impl Engine {
                         request.path_filter.as_deref(),
                     )?,
                 ));
-                channels.push((
-                    "symbol",
-                    store.symbol_search(&SymbolRequest {
-                        name: request.query.clone(),
-                        kind: None,
-                        path_filter: request.path_filter.clone(),
-                        limit: self.config.search.symbol_top_k.min(MAX_RESULTS),
-                    })?,
-                ));
+                if request.mode == SearchMode::Hybrid {
+                    channels.push((
+                        "symbol",
+                        store.symbol_search(
+                            &SymbolRequest {
+                                name: request.query.clone(),
+                                kind: None,
+                                path_filter: request.path_filter.clone(),
+                                limit: self.config.search.symbol_top_k.min(MAX_RESULTS),
+                            },
+                            false,
+                        )?,
+                    ));
+                }
             }
             if let (Some(vector), Some(key)) = (&query_vector, &fingerprint_key) {
                 channels.push((
@@ -382,11 +539,16 @@ impl Engine {
         drop(store);
         let symbol_query = classify_query(&request.query) == QueryKind::Symbol
             && request.mode != SearchMode::Semantic;
+        let supporting_code_wanted = mentions_supporting_code(&request.query)
+            || request
+                .path_filter
+                .as_deref()
+                .is_some_and(mentions_supporting_code);
         let mut candidates = fuse(
             channels,
             self.config.search.fusion_k,
             symbol_query,
-            &request.query,
+            supporting_code_wanted,
         );
         candidates.sort_by(candidate_order);
         // Only candidates that can still be returned or reranked need their
@@ -395,85 +557,47 @@ impl Engine {
             (request.limit * 3).max(self.config.search.rerank_candidates + request.limit),
         );
         self.validate_candidates(&mut candidates, &mut warnings);
+        let mut rerank_time = Duration::ZERO;
         if request.rerank && !candidates.is_empty() && self.config.rerank.provider != "disabled" {
-            let documents: Vec<RerankDocument> = candidates
-                .iter()
-                .filter(|candidate| !candidate.stale)
-                .take(self.config.search.rerank_candidates)
-                .map(|candidate| RerankDocument {
-                    id: candidate.ranked.chunk.id.clone(),
-                    text: truncate_text(
-                        &candidate.ranked.chunk.embedding_text,
-                        self.config.rerank.max_input_chars,
-                    ),
-                })
-                .collect();
-            if !documents.is_empty() {
-                let reranked = async {
-                    let provider = self
-                        .reranker_provider()?
-                        .ok_or_else(|| Error::ModelUnavailable("reranker is disabled".into()))?;
-                    let scores = provider.rerank(&request.query, &documents).await?;
-                    if scores.is_empty() {
-                        return Err(Error::ModelUnavailable(
-                            "reranker returned no scores".into(),
-                        ));
-                    }
-                    let mut seen = HashSet::new();
-                    for score in &scores {
-                        if !score.score.is_finite()
-                            || score.index >= documents.len()
-                            || documents[score.index].id != score.document_id
-                            || !seen.insert(score.index)
-                        {
-                            return Err(Error::ModelIncompatible(
-                                "invalid reranker candidate mapping".into(),
-                            ));
-                        }
-                    }
-                    Ok(scores)
-                }
-                .await;
-                match reranked {
-                    Ok(mut scores) => {
-                        scores.sort_by(|a, b| {
-                            b.score.total_cmp(&a.score).then(a.index.cmp(&b.index))
-                        });
-                        let positions: HashMap<String, (usize, f64)> = scores
-                            .into_iter()
-                            .enumerate()
-                            .map(|(rank, item)| (item.document_id, (rank, item.score)))
-                            .collect();
-                        candidates.sort_by(|a, b| {
-                            b.exact.cmp(&a.exact).then_with(|| {
-                                match (
-                                    positions.get(&a.ranked.chunk.id),
-                                    positions.get(&b.ranked.chunk.id),
-                                ) {
-                                    (Some((a, _)), Some((b, _))) => a.cmp(b),
-                                    (Some(_), None) => std::cmp::Ordering::Less,
-                                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                                    (None, None) => candidate_order(a, b),
-                                }
-                            })
-                        });
-                        for candidate in &mut candidates {
-                            if let Some((_, score)) = positions.get(&candidate.ranked.chunk.id) {
-                                candidate.score = *score;
-                                candidate.sources.insert("rerank".into());
+            let rerank_started = Instant::now();
+            let reranked = self.rerank(&request.query, &candidates).await;
+            rerank_time = rerank_started.elapsed();
+            match reranked {
+                Ok(mut scores) => {
+                    scores.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index)));
+                    let positions: HashMap<String, (usize, f64)> = scores
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, item)| (item.document_id, (rank, item.score)))
+                        .collect();
+                    candidates.sort_by(|a, b| {
+                        b.exact.cmp(&a.exact).then_with(|| {
+                            match (
+                                positions.get(&a.ranked.chunk.id),
+                                positions.get(&b.ranked.chunk.id),
+                            ) {
+                                (Some((a, _)), Some((b, _))) => a.cmp(b),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => candidate_order(a, b),
                             }
+                        })
+                    });
+                    for candidate in &mut candidates {
+                        if let Some((_, score)) = positions.get(&candidate.ranked.chunk.id) {
+                            candidate.score = *score;
+                            candidate.sources.insert("rerank".into());
                         }
                     }
-                    Err(error) if self.config.rerank.fail_open => warnings.push(format!(
-                        "reranker unavailable; preserving fused ranking: {error}"
-                    )),
-                    Err(error) => return Err(error),
                 }
+                Err(error) if self.config.rerank.fail_open => warnings.push(format!(
+                    "reranker unavailable; preserving fused ranking: {error}"
+                )),
+                Err(error) => return Err(error),
             }
-        }
-        if request.rerank && self.config.rerank.provider != "disabled" {
             self.validate_candidates(&mut candidates, &mut warnings);
         }
+        let total = started.elapsed();
         Ok(make_response(
             request.query,
             request.mode,
@@ -481,26 +605,100 @@ impl Engine {
             candidates,
             request.limit,
             warnings,
+            SearchTimings {
+                embedding_ms: milliseconds(embedding_time),
+                retrieval_ms: milliseconds(total.saturating_sub(embedding_time + rerank_time)),
+                rerank_ms: milliseconds(rerank_time),
+                total_ms: milliseconds(total),
+            },
         ))
+    }
+
+    /// Scores the leading candidates that still match their source. Scores come
+    /// back empty when no candidate is eligible.
+    async fn rerank(&self, query: &str, candidates: &[Candidate]) -> Result<Vec<RerankScore>> {
+        let provider = self
+            .reranker_provider()?
+            .ok_or_else(|| Error::ModelUnavailable("reranker is disabled".into()))?;
+        // What the provider can take bounds what the configuration asks for.
+        let limits = provider.limits();
+        let max_chars = self
+            .config
+            .rerank
+            .max_input_chars
+            .min(limits.max_input_chars);
+        let documents: Vec<RerankDocument> = candidates
+            .iter()
+            .filter(|candidate| !candidate.stale)
+            .take(
+                self.config
+                    .search
+                    .rerank_candidates
+                    .min(limits.max_documents),
+            )
+            .map(|candidate| RerankDocument {
+                id: candidate.ranked.chunk.id.clone(),
+                text: candidate
+                    .ranked
+                    .chunk
+                    .embedding_text
+                    .chars()
+                    .take(max_chars)
+                    .collect(),
+            })
+            .collect();
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scores = provider.rerank(query, &documents).await?;
+        if scores.is_empty() {
+            return Err(Error::ModelUnavailable(
+                "reranker returned no scores".into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        for score in &scores {
+            if !score.score.is_finite()
+                || score.index >= documents.len()
+                || documents[score.index].id != score.document_id
+                || !seen.insert(score.index)
+            {
+                return Err(Error::ModelIncompatible(
+                    "invalid reranker candidate mapping".into(),
+                ));
+            }
+        }
+        Ok(scores)
     }
 
     pub fn find_symbol(&self, request: SymbolRequest) -> Result<SearchResponse> {
         request.validate()?;
+        let started = Instant::now();
         let store = self.store(false)?;
-        let (status, ranked) =
-            store.snapshot(|store| Ok((store.status()?, store.symbol_search(&request)?)))?;
+        let (status, ranked) = store.snapshot(|store| {
+            Ok((
+                self.checked_status(store)?,
+                store.symbol_search(&request, true)?,
+            ))
+        })?;
         let mut warnings = Vec::new();
         let mut candidates: Vec<Candidate> = ranked
             .into_iter()
             .map(|ranked| Candidate {
                 score: ranked.score,
+                // Near misses are labelled so a typo correction is visible.
+                sources: BTreeSet::from([if ranked.score < 25.0 {
+                    "fuzzy".into()
+                } else {
+                    "symbol".into()
+                }]),
                 ranked,
-                sources: BTreeSet::from(["symbol".into()]),
                 exact: false,
                 stale: false,
             })
             .collect();
         self.validate_candidates(&mut candidates, &mut warnings);
+        let total = milliseconds(started.elapsed());
         Ok(make_response(
             request.name,
             SearchMode::Lexical,
@@ -508,12 +706,18 @@ impl Engine {
             candidates,
             request.limit,
             warnings,
+            SearchTimings {
+                retrieval_ms: total,
+                total_ms: total,
+                ..Default::default()
+            },
         ))
     }
 
     fn validate_candidates(&self, candidates: &mut Vec<Candidate>, warnings: &mut Vec<String>) {
         enum Visibility {
             Current(String),
+            Changed,
             Missing,
             Blocked,
         }
@@ -527,6 +731,9 @@ impl Engine {
                         &candidate.ranked.chunk.relative_path,
                     ) {
                         Ok(file) => Visibility::Current(file.hash),
+                        // A normal save during reading is not a privacy failure.
+                        // Keep the indexed snapshot and make its staleness explicit.
+                        Err(Error::SourceChanged(_)) => Visibility::Changed,
                         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                             Visibility::Missing
                         }
@@ -539,6 +746,10 @@ impl Engine {
             match visibility.get(&candidate.ranked.chunk.relative_path) {
                 Some(Visibility::Current(hash)) => {
                     candidate.stale = *hash != candidate.ranked.file_hash;
+                    true
+                }
+                Some(Visibility::Changed) => {
+                    candidate.stale = true;
                     true
                 }
                 Some(Visibility::Missing) => {
@@ -642,100 +853,92 @@ impl Engine {
             status: "ok".into(),
             detail: "configuration and privacy boundaries are valid".into(),
         }];
-        match self.store(false) {
-            Ok(store) => match store.integrity_check().and_then(|_| store.status()) {
-                Ok(status) => checks.push(DiagnosticCheck {
-                    name: "database".into(),
-                    status: "ok".into(),
-                    detail: format!(
-                        "SQLite/FTS consistent, generation {}, {} files, {} chunks",
-                        status.index_version, status.files, status.chunks
-                    ),
-                }),
-                Err(error) => checks.push(DiagnosticCheck {
-                    name: "database".into(),
-                    status: "error".into(),
-                    detail: error.to_string(),
-                }),
-            },
-            Err(Error::IndexMissing) => checks.push(DiagnosticCheck {
-                name: "database".into(),
-                status: "warning".into(),
-                detail: "no index yet; run `solascope index`".into(),
-            }),
-            Err(error) => checks.push(DiagnosticCheck {
-                name: "database".into(),
-                status: "error".into(),
-                detail: error.to_string(),
-            }),
-        }
-        for (name, result) in [
-            (
-                "embedding",
-                async {
-                    match self.embedding_provider()? {
-                        Some(provider) => {
-                            if check_models {
-                                provider
-                                    .embed(&["SolaScope capability probe".into()])
-                                    .await?;
-                            }
-                            Ok::<&str, Error>(if check_models {
-                                "provider probe succeeded"
-                            } else {
-                                "configured; use doctor --models to probe"
-                            })
-                        }
-                        None => Ok::<&str, Error>("disabled; no inference service required"),
-                    }
-                }
-                .await,
+        let database = self.store(false).and_then(|store| {
+            store.snapshot(|store| {
+                store.integrity_check()?;
+                self.checked_status(store)
+            })
+        });
+        let (status, detail) = match database {
+            Ok(status) => (
+                "ok",
+                format!(
+                    "SQLite/FTS consistent, schema {}, generation {}, {} files, {} chunks",
+                    solascope_storage::SCHEMA_VERSION,
+                    status.index_version,
+                    status.files,
+                    status.chunks
+                ),
             ),
-            (
-                "reranker",
-                async {
-                    match self.reranker_provider()? {
-                        Some(provider) => {
-                            if check_models {
-                                provider
-                                    .rerank(
-                                        "capability probe",
-                                        &[RerankDocument {
-                                            id: "probe".into(),
-                                            text: "SolaScope capability probe".into(),
-                                        }],
-                                    )
-                                    .await?;
-                            }
-                            Ok::<&str, Error>(if check_models {
-                                "provider probe succeeded"
-                            } else {
-                                "configured; use doctor --models to probe"
-                            })
-                        }
-                        None => Ok::<&str, Error>("disabled; fused ranking remains available"),
-                    }
-                }
-                .await,
-            ),
-        ] {
-            match result {
-                Ok(detail) => checks.push(DiagnosticCheck {
-                    name: name.into(),
-                    status: "ok".into(),
-                    detail: detail.into(),
-                }),
-                Err(error) => checks.push(DiagnosticCheck {
-                    name: name.into(),
-                    status: "error".into(),
-                    detail: error.to_string(),
-                }),
-            }
-        }
+            Err(Error::IndexMissing) => ("warning", "no index yet; run `solascope index`".into()),
+            Err(error @ Error::IndexOutdated(_)) => ("warning", error.to_string()),
+            Err(error) => ("error", error.to_string()),
+        };
+        checks.push(DiagnosticCheck {
+            name: "database".into(),
+            status: status.into(),
+            detail,
+        });
+        checks.extend(self.model_checks(check_models).await);
         Ok(DoctorReport {
             healthy: checks.iter().all(|check| check.status != "error"),
             checks,
         })
+    }
+
+    /// Sends one request to each configured model and reports whether it
+    /// answered. The request carries a fixed sentence, never project source.
+    pub async fn probe_models(&self) -> Vec<DiagnosticCheck> {
+        self.model_checks(true).await
+    }
+
+    async fn model_checks(&self, probe: bool) -> Vec<DiagnosticCheck> {
+        const PROBE: &str = "SolaScope capability probe";
+        const UNPROBED: &str = "configured; use doctor --models to probe";
+        let embedding = async {
+            let Some(provider) = self.embedding_provider()? else {
+                return Ok("disabled; no inference service required".to_owned());
+            };
+            if !probe {
+                return Ok(UNPROBED.to_owned());
+            }
+            let vectors = provider.embed(&[PROBE.into()]).await?;
+            Ok::<_, Error>(format!(
+                "provider answered with {} dimensions",
+                vectors.first().map_or(0, Vec::len)
+            ))
+        }
+        .await;
+        let reranker = async {
+            let Some(provider) = self.reranker_provider()? else {
+                return Ok("disabled; fused ranking remains available".to_owned());
+            };
+            if !probe {
+                return Ok(UNPROBED.to_owned());
+            }
+            let document = RerankDocument {
+                id: "probe".into(),
+                text: PROBE.into(),
+            };
+            provider.rerank("capability probe", &[document]).await?;
+            Ok::<_, Error>(format!("{} answered", provider.name()))
+        }
+        .await;
+        [("embedding", embedding), ("reranker", reranker)]
+            .into_iter()
+            .map(|(name, result)| match result {
+                Ok(detail) => DiagnosticCheck {
+                    name: name.into(),
+                    status: "ok".into(),
+                    detail,
+                },
+                Err(error) => DiagnosticCheck {
+                    name: name.into(),
+                    status: "error".into(),
+                    detail: error.to_string(),
+                },
+            })
+            .collect()
     }
 
     pub async fn watch(&self, cancel: CancellationToken) -> Result<()> {
@@ -799,11 +1002,52 @@ fn candidate_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         .then(a.ranked.chunk.id.cmp(&b.ranked.chunk.id))
 }
 
+/// Weights on the fused score that prefer named definitions in product code.
+/// With the default `fusion_k`, neighbouring ranks differ by under two percent,
+/// so these move a candidate a few positions instead of hiding it.
+const ANONYMOUS_TEXT_WEIGHT: f64 = 0.97;
+const SUPPORTING_PATH_WEIGHT: f64 = 0.94;
+const SUPPORTING_WORDS: [&str; 5] = ["test", "spec", "bench", "example", "fixture"];
+
+/// Whether a query or path filter asks for tests, examples or benchmarks.
+fn mentions_supporting_code(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    SUPPORTING_WORDS.iter().any(|word| text.contains(word))
+}
+
+/// Code that exercises the product rather than being it.
+fn is_supporting_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let mut parts = path.rsplit('/');
+    let name = parts.next().unwrap_or_default();
+    parts.any(|directory| {
+        matches!(
+            directory,
+            "test"
+                | "tests"
+                | "__tests__"
+                | "testdata"
+                | "spec"
+                | "specs"
+                | "bench"
+                | "benches"
+                | "benchmarks"
+                | "example"
+                | "examples"
+                | "fixtures"
+        )
+    }) || name.starts_with("test_")
+        || name == "conftest.py"
+        || ["_test.", "_tests.", ".test.", ".spec.", "_spec."]
+            .iter()
+            .any(|marker| name.contains(marker))
+}
+
 fn fuse(
     channels: Vec<(&str, Vec<RankedChunk>)>,
     fusion_k: f64,
     symbol_query: bool,
-    query: &str,
+    supporting_code_wanted: bool,
 ) -> Vec<Candidate> {
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     for (source, ranked) in channels {
@@ -822,8 +1066,68 @@ fn fuse(
             candidate.exact |= exact;
         }
     }
-    let _ = query;
-    candidates.into_values().collect()
+    candidates
+        .into_values()
+        .map(|mut candidate| {
+            let chunk = &candidate.ranked.chunk;
+            if chunk.symbol.is_none() {
+                candidate.score *= ANONYMOUS_TEXT_WEIGHT;
+            }
+            if !supporting_code_wanted && is_supporting_path(&chunk.relative_path) {
+                candidate.score *= SUPPORTING_PATH_WEIGHT;
+            }
+            candidate
+        })
+        .collect()
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
+/// Tells the user how to proceed when the embedding service fails mid-index.
+fn indexing_hint(error: Error) -> Error {
+    match error {
+        Error::ModelUnavailable(message) => Error::ModelUnavailable(format!(
+            "{message}; the existing index is unchanged. Start the embedding service and retry, \
+             or set embedding.provider = \"disabled\" and run `solascope index --rebuild` to \
+             search by keywords and symbols only"
+        )),
+        other => other,
+    }
+}
+
+fn parse_files(
+    files: Vec<SourceFile>,
+    project_id: &str,
+    options: &ParserOptions,
+    jobs: usize,
+) -> Result<Vec<FileUpdate>> {
+    use rayon::prelude::*;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|error| Error::Parse(format!("parser pool: {error}")))?;
+    pool.install(|| {
+        files
+            .into_par_iter()
+            .map(|source| {
+                let chunks = match solascope_parser::parse_file(
+                    project_id,
+                    &source.relative_path,
+                    &source.content,
+                    options,
+                ) {
+                    Ok(chunks) => chunks,
+                    // Retain the file hash but remove any previous chunks. A
+                    // later valid revision is then parsed incrementally.
+                    Err(Error::Parse(_)) if !options.fallback => Vec::new(),
+                    Err(error) => return Err(error),
+                };
+                Ok(FileUpdate { source, chunks })
+            })
+            .collect()
+    })
 }
 
 fn make_response(
@@ -833,6 +1137,7 @@ fn make_response(
     candidates: Vec<Candidate>,
     limit: usize,
     mut warnings: Vec<String>,
+    timings: SearchTimings,
 ) -> SearchResponse {
     let mut seen_warnings = HashSet::new();
     warnings.retain(|warning| seen_warnings.insert(warning.clone()));
@@ -869,6 +1174,7 @@ fn make_response(
         index_version: version,
         results,
         warnings,
+        timings,
     }
 }
 

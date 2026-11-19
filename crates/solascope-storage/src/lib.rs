@@ -9,8 +9,71 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 1;
 pub const DATABASE_NAME: &str = "index.sqlite3";
+
+struct Migration {
+    sql: &'static str,
+    /// Data changes that need Rust; runs in the migration's transaction.
+    after: Option<fn(&rusqlite::Transaction<'_>) -> Result<()>>,
+}
+
+/// Applied in order; a database's `user_version` is the number already applied.
+/// Released migrations are never edited, only appended to.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        sql: include_str!("migrations/0001_initial.sql"),
+        after: None,
+    },
+    Migration {
+        sql: include_str!("migrations/0002_metadata_and_relocation.sql"),
+        after: Some(backfill_relocation_keys),
+    },
+];
+
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+fn migrate(connection: &mut Connection, from: i64) -> Result<()> {
+    let from = usize::try_from(from).map_err(storage_error)?;
+    for (index, migration) in MIGRATIONS.iter().enumerate().skip(from) {
+        let tx = connection.transaction().map_err(storage_error)?;
+        tx.execute_batch(migration.sql).map_err(storage_error)?;
+        if let Some(after) = migration.after {
+            after(&tx)?;
+        }
+        tx.pragma_update(None, "user_version", sqlite_integer(index + 1)?)
+            .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn backfill_relocation_keys(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut select = tx
+        .prepare(
+            "SELECT ce.fingerprint, ce.input_hash, c.data FROM chunk_embeddings ce \
+             JOIN chunks c ON c.id=ce.chunk_id",
+        )
+        .map_err(storage_error)?;
+    let mut update = tx
+        .prepare(
+            "UPDATE embedding_cache SET relocation_key=?3 \
+             WHERE fingerprint=?1 AND input_hash=?2 AND relocation_key IS NULL",
+        )
+        .map_err(storage_error)?;
+    let mut rows = select.query([]).map_err(storage_error)?;
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let chunk: Chunk = serde_json::from_str(&row.get::<_, String>(2).map_err(storage_error)?)
+            .map_err(storage_error)?;
+        update
+            .execute(params![
+                row.get::<_, String>(0).map_err(storage_error)?,
+                row.get::<_, String>(1).map_err(storage_error)?,
+                chunk.relocation_key()
+            ])
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
 
 fn storage_error(error: impl std::fmt::Display) -> Error {
     Error::Storage(error.to_string())
@@ -54,12 +117,25 @@ impl WriterLock {
             .truncate(false)
             .open(path)?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+            {
                 Error::WriterBusy
             } else {
                 Error::Io(error)
             }
         })?;
+        // The index stores source snippets: keep it out of version control
+        // without touching the project's own ignore files.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(index_dir.join(".gitignore"))
+        {
+            Ok(mut ignore) => std::io::Write::write_all(&mut ignore, b"*\n")?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
         Ok(Self { file, index_dir })
     }
 }
@@ -79,7 +155,25 @@ pub struct FileUpdate {
 #[derive(Debug, Clone)]
 pub struct CachedEmbedding {
     pub input_hash: String,
+    /// See [`Chunk::relocation_key`].
+    pub relocation_key: String,
     pub vector: Vec<f32>,
+    /// False when the vector was computed for the same code at another path.
+    pub exact: bool,
+}
+
+/// Everything one index run publishes atomically.
+pub struct IndexCommit<'a> {
+    pub updates: &'a [FileUpdate],
+    pub removed: &'a [String],
+    pub fingerprint: Option<&'a ModelFingerprint>,
+    pub vectors: &'a [CachedEmbedding],
+    /// Publish a new generation even when no file changed.
+    pub force_generation: bool,
+    /// Signature of the chunking rules the stored chunks were produced with.
+    pub chunking: &'a str,
+    pub job: i64,
+    pub retention: usize,
 }
 
 pub struct Store {
@@ -122,24 +216,53 @@ impl Store {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(storage_error)?;
-        if version == 0 && create {
-            let tables: i64 = connection.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-                [], |row| row.get(0),
-            ).map_err(storage_error)?;
-            if tables != 0 {
-                return Err(Error::Storage(
-                    "refusing to migrate an unrelated database".into(),
-                ));
-            }
-            let tx = connection.transaction().map_err(storage_error)?;
-            tx.execute_batch(include_str!("schema.sql"))
-                .map_err(storage_error)?;
-            tx.commit().map_err(storage_error)?;
-        } else if version != SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
             return Err(Error::Storage(format!(
-                "unsupported schema {version}; this binary requires {SCHEMA_VERSION}"
+                "index schema {version} is newer than this binary supports ({SCHEMA_VERSION}); \
+                 upgrade SolaScope or use a new index directory"
             )));
+        }
+        let id = project_id(&root);
+        let recorded: Option<(String, String)> = if version > 0 {
+            connection
+                .query_row("SELECT id, root FROM projects LIMIT 1", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()
+                .map_err(storage_error)?
+        } else {
+            None
+        };
+        // A rejected root must not upgrade someone else's index or change its
+        // journal mode. Supported migrations keep the projects table stable.
+        if recorded.as_ref().is_some_and(|(existing, existing_root)| {
+            existing != &id || existing_root != &root.to_string_lossy()
+        }) {
+            return Err(Error::Storage(
+                "this index belongs to another project root".into(),
+            ));
+        }
+        if version < SCHEMA_VERSION {
+            if !create {
+                // Read-only commands never modify the index, not even to upgrade it.
+                return Err(if version == 0 {
+                    Error::IndexMissing
+                } else {
+                    Error::IndexOutdated(format!("schema {version}, expected {SCHEMA_VERSION}"))
+                });
+            }
+            if version == 0 {
+                let tables: i64 = connection.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                    [], |row| row.get(0),
+                ).map_err(storage_error)?;
+                if tables != 0 {
+                    return Err(Error::Storage(
+                        "refusing to migrate an unrelated database".into(),
+                    ));
+                }
+            }
+            migrate(&mut connection, version)?;
         }
         if create {
             connection
@@ -149,21 +272,7 @@ impl Store {
                 .pragma_update(None, "synchronous", "NORMAL")
                 .map_err(storage_error)?;
         }
-        let id = project_id(&root);
-        let recorded: Option<(String, String)> = connection
-            .query_row("SELECT id, root FROM projects LIMIT 1", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()
-            .map_err(storage_error)?;
         match recorded {
-            Some((existing, existing_root))
-                if existing != id || existing_root != root.to_string_lossy() =>
-            {
-                return Err(Error::Storage(
-                    "this index belongs to another project root".into(),
-                ));
-            }
             None if create => {
                 connection
                     .execute(
@@ -173,7 +282,7 @@ impl Store {
                     .map_err(storage_error)?;
             }
             None => return Err(Error::IndexMissing),
-            _ => {}
+            Some(_) => {}
         }
         Ok(Self {
             connection,
@@ -232,22 +341,57 @@ impl Store {
             .map_err(storage_error)
     }
 
+    /// Cached vectors for exact embedding inputs. With `exact_only`, vectors
+    /// that were reused from another path are treated as missing.
     pub fn cached_vectors(
         &self,
         fingerprint: &ModelFingerprint,
         hashes: &[String],
+        exact_only: bool,
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        self.lookup_vectors(
+            "SELECT dimensions, vector FROM embedding_cache \
+             WHERE fingerprint=?1 AND input_hash=?2 AND exact>=?3",
+            fingerprint,
+            hashes,
+            i64::from(exact_only),
+        )
+    }
+
+    /// Vectors of the same code at any path, keyed by relocation key.
+    pub fn relocated_vectors(
+        &self,
+        fingerprint: &ModelFingerprint,
+        relocation_keys: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        self.lookup_vectors(
+            "SELECT dimensions, vector FROM embedding_cache \
+             WHERE fingerprint=?1 AND relocation_key=?2 AND exact>=?3 \
+             ORDER BY exact DESC, input_hash LIMIT 1",
+            fingerprint,
+            relocation_keys,
+            0,
+        )
+    }
+
+    fn lookup_vectors(
+        &self,
+        sql: &str,
+        fingerprint: &ModelFingerprint,
+        keys: &[String],
+        minimum_exact: i64,
     ) -> Result<HashMap<String, Vec<f32>>> {
         let mut result = HashMap::new();
-        let mut statement = self.connection.prepare(
-            "SELECT dimensions, vector FROM embedding_cache WHERE fingerprint=?1 AND input_hash=?2"
-        ).map_err(storage_error)?;
-        let key = fingerprint.key();
-        for hash in hashes {
-            if result.contains_key(hash) {
+        let mut statement = self.connection.prepare(sql).map_err(storage_error)?;
+        let fingerprint_key = fingerprint.key();
+        for key in keys {
+            if result.contains_key(key) {
                 continue;
             }
             let value: Option<(i64, Vec<u8>)> = statement
-                .query_row(params![key, hash], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_row(params![fingerprint_key, key, minimum_exact], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
                 .optional()
                 .map_err(storage_error)?;
             if let Some((dimensions, blob)) = value {
@@ -259,10 +403,20 @@ impl Store {
                 }
                 let vector = decode_vector(&blob, dimensions)?;
                 validate_vector(&vector, dimensions)?;
-                result.insert(hash.clone(), vector);
+                result.insert(key.clone(), vector);
             }
         }
         Ok(result)
+    }
+
+    /// A single index-wide value, such as the chunking signature.
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(storage_error)
     }
 
     pub fn recover_jobs(&self, lock: &WriterLock) -> Result<usize> {
@@ -299,19 +453,22 @@ impl Store {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn commit_index(
         &mut self,
         lock: &WriterLock,
-        updates: &[FileUpdate],
-        removed: &[String],
-        fingerprint: Option<&ModelFingerprint>,
-        vectors: &[CachedEmbedding],
-        force_generation: bool,
-        job: i64,
-        retention: usize,
+        commit: IndexCommit<'_>,
     ) -> Result<IndexGeneration> {
         self.verify_lock(lock)?;
+        let IndexCommit {
+            updates,
+            removed,
+            fingerprint,
+            vectors,
+            force_generation,
+            chunking,
+            job,
+            retention,
+        } = commit;
         let previous = self.current_generation()?;
         let changed = force_generation
             || !updates.is_empty()
@@ -335,10 +492,25 @@ impl Store {
             for item in vectors {
                 validate_vector(&item.vector, fingerprint.dimensions)?;
                 let blob = encode_vector(&item.vector);
-                tx.execute(
-                    "INSERT INTO embedding_cache(fingerprint, input_hash, dimensions, vector) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-                    params![key, item.input_hash, sqlite_integer(fingerprint.dimensions)?, blob],
-                ).map_err(storage_error)?;
+                // A vector computed from the exact input replaces one that was
+                // reused from another path, never the other way round.
+                tx.prepare_cached(
+                    "INSERT INTO embedding_cache(fingerprint, input_hash, dimensions, vector, relocation_key, exact) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(fingerprint, input_hash) DO UPDATE SET \
+                     vector=excluded.vector, relocation_key=excluded.relocation_key, exact=1 \
+                     WHERE excluded.exact=1 AND embedding_cache.exact=0",
+                )
+                .map_err(storage_error)?
+                .execute(params![
+                    key,
+                    item.input_hash,
+                    sqlite_integer(fingerprint.dimensions)?,
+                    blob,
+                    item.relocation_key,
+                    item.exact
+                ])
+                .map_err(storage_error)?;
             }
         } else if !vectors.is_empty() {
             return Err(Error::Storage(
@@ -410,6 +582,12 @@ impl Store {
             )
             .map_err(storage_error)?;
         }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('chunking', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [chunking],
+        )
+        .map_err(storage_error)?;
         tx.execute(
             "UPDATE index_jobs SET status='done', finished_at=?1 WHERE id=?2",
             params![sqlite_integer(now)?, job],
@@ -536,6 +714,10 @@ impl MetadataStore for Store {
             chunks: count("chunks")?,
             vectors: count("chunk_embeddings")?,
             cache_entries: count("embedding_cache")?,
+            relocated_vectors: count(
+                "chunk_embeddings ce JOIN embedding_cache e \
+                 ON e.fingerprint=ce.fingerprint AND e.input_hash=ce.input_hash WHERE e.exact=0",
+            )?,
             embedding_fingerprint: generation.fingerprint,
             last_indexed_at: Some(generation.created_at),
             pending_jobs: usize::try_from(pending_jobs).map_err(storage_error)?,
@@ -587,14 +769,76 @@ impl PathFilter {
     }
 }
 
+/// Builds an FTS5 query from free text. Besides every token it adds adjacent
+/// pairs and triples, both as phrases (prose and `snake_case`) and joined
+/// (`camelCase`): "shut down" also reaches `shutdown`, "read session" reaches
+/// `readSession`, and an exact error message outranks scattered words.
 fn fts_expression(query: &str) -> Option<String> {
     let tokens: Vec<String> = query
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|token| !token.is_empty())
         .take(24)
-        .map(|token| format!("\"{}\"", token.chars().take(128).collect::<String>()))
+        .map(|token| token.chars().take(128).collect())
         .collect();
-    (!tokens.is_empty()).then(|| tokens.join(" OR "))
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut terms: Vec<String> = tokens.clone();
+    for width in 2..=3 {
+        for window in tokens.windows(width).take(12) {
+            terms.push(window.join(" "));
+            terms.push(window.concat());
+        }
+    }
+    if tokens.len() > 3 {
+        terms.push(tokens.join(" "));
+    }
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|term| seen.insert(term.to_lowercase()));
+    // Tokens hold only alphanumerics and underscores, so quoting is safe.
+    Some(
+        terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Optimal string alignment distance (insert, delete, substitute, swap of
+/// neighbours), or `None` when it exceeds `max`.
+fn edit_distance_within(left: &[char], right: &[char], max: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > max {
+        return None;
+    }
+    let mut before_previous = vec![0; right.len() + 1];
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for i in 1..=left.len() {
+        current[0] = i;
+        let mut row_minimum = i;
+        for j in 1..=right.len() {
+            let substitution = previous[j - 1] + usize::from(left[i - 1] != right[j - 1]);
+            let mut value = substitution.min(previous[j] + 1).min(current[j - 1] + 1);
+            if i > 1 && j > 1 && left[i - 1] == right[j - 2] && left[i - 2] == right[j - 1] {
+                value = value.min(before_previous[j - 2] + 1);
+            }
+            current[j] = value;
+            row_minimum = row_minimum.min(value);
+        }
+        if row_minimum > max {
+            return None;
+        }
+        std::mem::swap(&mut before_previous, &mut previous);
+        std::mem::swap(&mut previous, &mut current);
+    }
+    Some(previous[right.len()]).filter(|distance| *distance <= max)
+}
+
+/// The last segment of a qualified name such as `Type::method` or `Class.method`.
+fn leaf_name(symbol: &str) -> &str {
+    let leaf = symbol.rsplit("::").next().unwrap_or(symbol);
+    leaf.rsplit('.').next().unwrap_or(leaf)
 }
 
 fn escaped_like(text: &str) -> String {
@@ -638,10 +882,13 @@ impl LexicalIndex for Store {
         self.load_ranked(hits, &filter, limit)
     }
 
-    fn symbol_search(&self, request: &SymbolRequest) -> Result<Vec<RankedChunk>> {
+    fn symbol_search(&self, request: &SymbolRequest, fuzzy: bool) -> Result<Vec<RankedChunk>> {
         request.validate()?;
         let filter = PathFilter::new(request.path_filter.as_deref())?;
         let name = request.name.to_lowercase();
+        let wanted = |path: &str, kind: &str| {
+            filter.matches(path) && request.kind.as_ref().is_none_or(|wanted| wanted == kind)
+        };
         let pattern = format!("%{}%", escaped_like(&name));
         let mut statement = self
             .connection
@@ -655,21 +902,14 @@ impl LexicalIndex for Store {
         while let Some(row) = rows.next().map_err(storage_error)? {
             let path: String = row.get(2).map_err(storage_error)?;
             let kind: String = row.get(3).map_err(storage_error)?;
-            if !filter.matches(&path) || request.kind.as_ref().is_some_and(|wanted| wanted != &kind)
-            {
+            if !wanted(&path, &kind) {
                 continue;
             }
             let symbol = row
                 .get::<_, String>(1)
                 .map_err(storage_error)?
                 .to_lowercase();
-            let leaf = symbol
-                .rsplit("::")
-                .next()
-                .unwrap_or(&symbol)
-                .rsplit('.')
-                .next()
-                .unwrap_or(&symbol);
+            let leaf = leaf_name(&symbol);
             let score = if symbol == name || leaf == name {
                 100.0
             } else if leaf.starts_with(&name) {
@@ -680,6 +920,44 @@ impl LexicalIndex for Store {
                 25.0
             };
             hits.push((row.get::<_, i64>(0).map_err(storage_error)?, score));
+        }
+        drop(rows);
+        // Tolerate a typo in an identifier, but only to fill otherwise empty
+        // slots: near misses always rank below every literal match.
+        let query: Vec<char> = leaf_name(&name).chars().collect();
+        if fuzzy
+            && hits.len() < request.limit
+            && query.len() >= 4
+            && !name.contains(char::is_whitespace)
+        {
+            let tolerance = if query.len() < 8 { 1 } else { 2 };
+            let found: std::collections::HashSet<i64> = hits.iter().map(|hit| hit.0).collect();
+            let mut statement = self
+                .connection
+                .prepare_cached(
+                    "SELECT seq, symbol, path, kind FROM chunks WHERE symbol IS NOT NULL",
+                )
+                .map_err(storage_error)?;
+            let mut rows = statement.query([]).map_err(storage_error)?;
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                let seq: i64 = row.get(0).map_err(storage_error)?;
+                if found.contains(&seq) {
+                    continue;
+                }
+                let symbol = row
+                    .get::<_, String>(1)
+                    .map_err(storage_error)?
+                    .to_lowercase();
+                let leaf: Vec<char> = leaf_name(&symbol).chars().collect();
+                let Some(distance) = edit_distance_within(&query, &leaf, tolerance) else {
+                    continue;
+                };
+                let path: String = row.get(2).map_err(storage_error)?;
+                let kind: String = row.get(3).map_err(storage_error)?;
+                if wanted(&path, &kind) {
+                    hits.push((seq, 20.0 - 5.0 * distance as f64));
+                }
+            }
         }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         hits.truncate(request.limit);
@@ -804,6 +1082,7 @@ mod tests {
 
     fn update(root: &Path, path: &str, name: &str) -> FileUpdate {
         let content = format!("fn {name}() {{ println!(\"hello\"); }}");
+        let embedding_text = format!("path: {path}\n{content}");
         let id = project_id(root);
         let chunk = Chunk {
             id: hash_text(&format!("{path}:{name}")),
@@ -821,8 +1100,8 @@ mod tests {
             end_byte: content.len(),
             content: content.clone(),
             content_hash: hash_text(&content),
-            embedding_text: content.clone(),
-            embedding_hash: hash_text(&content),
+            embedding_hash: hash_text(&embedding_text),
+            embedding_text,
             fallback: false,
         };
         FileUpdate {
@@ -847,25 +1126,52 @@ mod tests {
         }
     }
 
+    fn vector(chunk: &Chunk, values: [f32; 2], exact: bool) -> CachedEmbedding {
+        CachedEmbedding {
+            input_hash: chunk.embedding_hash.clone(),
+            relocation_key: chunk.relocation_key(),
+            vector: values.to_vec(),
+            exact,
+        }
+    }
+
+    fn commit(
+        store: &mut Store,
+        lock: &WriterLock,
+        updates: &[FileUpdate],
+        removed: &[String],
+        fingerprint: Option<&ModelFingerprint>,
+        vectors: &[CachedEmbedding],
+    ) -> Result<IndexGeneration> {
+        let job = store.begin_job(lock)?;
+        store.commit_index(
+            lock,
+            IndexCommit {
+                updates,
+                removed,
+                fingerprint,
+                vectors,
+                force_generation: false,
+                chunking: "test",
+                job,
+                retention: 3,
+            },
+        )
+    }
+
+    fn open(root: &Path) -> (PathBuf, WriterLock, Store) {
+        let directory = root.join(".solascope");
+        let lock = WriterLock::acquire(&directory).unwrap();
+        let store = Store::open(&directory, root, true).unwrap();
+        (directory, lock, store)
+    }
+
     #[test]
     fn transactions_keep_fts_and_deletions_consistent() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(".solascope");
-        let lock = WriterLock::acquire(&directory).unwrap();
-        let mut store = Store::open(&directory, root.path(), true).unwrap();
-        let job = store.begin_job(&lock).unwrap();
-        store
-            .commit_index(
-                &lock,
-                &[update(root.path(), "src/lib.rs", "greet")],
-                &[],
-                None,
-                &[],
-                false,
-                job,
-                3,
-            )
-            .unwrap();
+        let (_, lock, mut store) = open(root.path());
+        let file = update(root.path(), "src/lib.rs", "greet");
+        commit(&mut store, &lock, &[file], &[], None, &[]).unwrap();
         assert_eq!(
             store
                 .lexical_search("greet() OR evil:*", 10, None)
@@ -874,10 +1180,8 @@ mod tests {
             1
         );
         assert_eq!(store.status().unwrap().files, 1);
-        let job = store.begin_job(&lock).unwrap();
-        store
-            .commit_index(&lock, &[], &["src/lib.rs".into()], None, &[], false, job, 3)
-            .unwrap();
+        assert_eq!(store.meta("chunking").unwrap().as_deref(), Some("test"));
+        commit(&mut store, &lock, &[], &["src/lib.rs".into()], None, &[]).unwrap();
         assert!(store.lexical_search("greet", 10, None).unwrap().is_empty());
         store.integrity_check().unwrap();
     }
@@ -885,51 +1189,30 @@ mod tests {
     #[test]
     fn missing_embeddings_roll_back_every_table() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(".solascope");
-        let lock = WriterLock::acquire(&directory).unwrap();
-        let mut store = Store::open(&directory, root.path(), true).unwrap();
-        let job = store.begin_job(&lock).unwrap();
-        assert!(store
-            .commit_index(
-                &lock,
-                &[update(root.path(), "lib.rs", "greet")],
-                &[],
-                Some(&fingerprint()),
-                &[],
-                false,
-                job,
-                3
-            )
-            .is_err());
+        let (_, lock, mut store) = open(root.path());
+        let file = update(root.path(), "lib.rs", "greet");
+        assert!(commit(&mut store, &lock, &[file], &[], Some(&fingerprint()), &[]).is_err());
         assert!(store.file_hashes().unwrap().is_empty());
         assert!(store.current_generation().unwrap().is_none());
         assert!(store.lexical_search("greet", 10, None).unwrap().is_empty());
+        assert!(store.meta("chunking").unwrap().is_none());
     }
 
     #[test]
     fn vectors_are_isolated_by_fingerprint_and_gc_is_safe() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(".solascope");
-        let lock = WriterLock::acquire(&directory).unwrap();
-        let mut store = Store::open(&directory, root.path(), true).unwrap();
+        let (_, lock, mut store) = open(root.path());
         let file = update(root.path(), "lib.rs", "greet");
-        let vector = CachedEmbedding {
-            input_hash: file.chunks[0].embedding_hash.clone(),
-            vector: vec![1.0, 0.0],
-        };
-        let job = store.begin_job(&lock).unwrap();
-        store
-            .commit_index(
-                &lock,
-                &[file],
-                &[],
-                Some(&fingerprint()),
-                &[vector],
-                false,
-                job,
-                3,
-            )
-            .unwrap();
+        let vectors = [vector(&file.chunks[0], [1.0, 0.0], true)];
+        commit(
+            &mut store,
+            &lock,
+            &[file],
+            &[],
+            Some(&fingerprint()),
+            &vectors,
+        )
+        .unwrap();
         assert_eq!(
             store
                 .vector_search(&[1.0, 0.0], &fingerprint().key(), 10, None)
@@ -945,15 +1228,314 @@ mod tests {
     }
 
     #[test]
-    fn writer_lock_rejects_a_second_writer() {
+    fn moved_code_reuses_vectors_until_an_exact_one_replaces_them() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, lock, mut store) = open(root.path());
+        let fingerprint = fingerprint();
+        let original = update(root.path(), "old.rs", "greet");
+        let moved = update(root.path(), "new.rs", "greet");
+        let key = moved.chunks[0].relocation_key();
+        let moved_hash = moved.chunks[0].embedding_hash.clone();
+        assert_eq!(original.chunks[0].relocation_key(), key);
+        assert_ne!(original.chunks[0].embedding_hash, moved_hash);
+        let vectors = [vector(&original.chunks[0], [1.0, 0.0], true)];
+        commit(
+            &mut store,
+            &lock,
+            &[original],
+            &[],
+            Some(&fingerprint),
+            &vectors,
+        )
+        .unwrap();
+
+        let exact = |store: &Store, exact_only| {
+            store
+                .cached_vectors(&fingerprint, std::slice::from_ref(&moved_hash), exact_only)
+                .unwrap()
+        };
+        assert!(exact(&store, false).is_empty());
+        let reused = store
+            .relocated_vectors(&fingerprint, std::slice::from_ref(&key))
+            .unwrap();
+        assert_eq!(reused[&key], vec![1.0, 0.0]);
+
+        let relocated = [vector(&moved.chunks[0], [1.0, 0.0], false)];
+        commit(
+            &mut store,
+            &lock,
+            std::slice::from_ref(&moved),
+            &["old.rs".into()],
+            Some(&fingerprint),
+            &relocated,
+        )
+        .unwrap();
+        assert_eq!(store.status().unwrap().relocated_vectors, 1);
+        assert_eq!(exact(&store, false)[&moved_hash], vec![1.0, 0.0]);
+        // A rebuild asks for exact vectors only, so this one is recomputed.
+        assert!(exact(&store, true).is_empty());
+
+        let recomputed = [vector(&moved.chunks[0], [0.0, 1.0], true)];
+        commit(
+            &mut store,
+            &lock,
+            std::slice::from_ref(&moved),
+            &[],
+            Some(&fingerprint),
+            &recomputed,
+        )
+        .unwrap();
+        assert_eq!(store.status().unwrap().relocated_vectors, 0);
+        assert_eq!(exact(&store, true)[&moved_hash], vec![0.0, 1.0]);
+        // A reused vector never overwrites an exact one.
+        commit(
+            &mut store,
+            &lock,
+            &[moved],
+            &[],
+            Some(&fingerprint),
+            &relocated,
+        )
+        .unwrap();
+        assert_eq!(exact(&store, true)[&moved_hash], vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn version_one_indexes_are_upgraded_in_place_by_a_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(".solascope");
+        fs::create_dir_all(&directory).unwrap();
+        let file = update(root.path(), "lib.rs", "greet");
+        let chunk = &file.chunks[0];
+        let fingerprint = fingerprint();
+        {
+            let connection = Connection::open(directory.join(DATABASE_NAME)).unwrap();
+            connection.execute_batch(MIGRATIONS[0].sql).unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+            let canonical = root.path().canonicalize().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO projects(id, root, created_at) VALUES (?1, ?2, 1)",
+                    params![project_id(&canonical), canonical.to_string_lossy()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO files(path, hash, language) VALUES ('lib.rs', ?1, 'rust')",
+                    [&file.source.hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO chunks(id, path, symbol, kind, data) VALUES (?1, 'lib.rs', 'greet', 'function', ?2)",
+                    params![chunk.id, serde_json::to_string(chunk).unwrap()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO embedding_cache(fingerprint, input_hash, dimensions, vector) VALUES (?1, ?2, 2, ?3)",
+                    params![fingerprint.key(), chunk.embedding_hash, encode_vector(&[1.0, 0.0])],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO chunk_embeddings(chunk_id, fingerprint, input_hash) VALUES (?1, ?2, ?3)",
+                    params![chunk.id, fingerprint.key(), chunk.embedding_hash],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO index_generations(version, fingerprint, created_at) VALUES (7, ?1, 1)",
+                    [serde_json::to_string(&fingerprint).unwrap()],
+                )
+                .unwrap();
+        }
+        // A reader reports the outdated index and leaves the file untouched.
+        assert!(matches!(
+            Store::open(&directory, root.path(), false),
+            Err(Error::IndexOutdated(_))
+        ));
+        let lock = WriterLock::acquire(&directory).unwrap();
+        let store = Store::open(&directory, root.path(), true).unwrap();
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let status = store.status().unwrap();
+        assert_eq!(
+            (
+                status.index_version,
+                status.files,
+                status.vectors,
+                status.relocated_vectors
+            ),
+            (7, 1, 1, 0)
+        );
+        assert_eq!(store.lexical_search("greet", 10, None).unwrap().len(), 1);
+        let key = chunk.relocation_key();
+        assert_eq!(
+            store
+                .relocated_vectors(&fingerprint, std::slice::from_ref(&key))
+                .unwrap()[&key],
+            vec![1.0, 0.0]
+        );
+        store.integrity_check().unwrap();
+        drop(lock);
+        assert!(Store::open(&directory, root.path(), false).is_ok());
+    }
+
+    #[test]
+    fn a_foreign_root_is_rejected_before_its_old_schema_is_modified() {
+        let index = tempfile::tempdir().unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let owner_root = owner.path().canonicalize().unwrap();
+        let path = index.path().join(DATABASE_NAME);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("migrations/0001_initial.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects(id, root, created_at) VALUES (?1, ?2, 0)",
+                params![project_id(&owner_root), owner_root.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+        let error = Store::open(index.path(), other.path(), true).err().unwrap();
+        assert!(error.to_string().contains("another project root"));
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let meta_tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta_tables, 0);
+        let journal: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        drop(connection);
+        let store = Store::open(index.path(), owner.path(), true).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn an_index_from_a_newer_version_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (directory, _lock, store) = open(root.path());
+        store
+            .connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(store);
+        for create in [false, true] {
+            let error = Store::open(&directory, root.path(), create).err().unwrap();
+            assert!(error.to_string().contains("newer"), "{error}");
+        }
+    }
+
+    #[test]
+    fn phrases_and_joined_words_reach_identifiers() {
+        let expression = fts_expression("Shut down the pool").unwrap();
+        for term in ["\"Shut down\"", "\"Shutdown\"", "\"Shut down the pool\""] {
+            assert!(expression.contains(term), "{expression}");
+        }
+        assert!(fts_expression("?? !!").is_none());
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, lock, mut store) = open(root.path());
+        let files = [
+            update(root.path(), "a.rs", "shutdown_now"),
+            update(root.path(), "b.rs", "readSession"),
+            update(root.path(), "c.rs", "unrelated"),
+        ];
+        commit(&mut store, &lock, &files, &[], None, &[]).unwrap();
+        let top = |query: &str| {
+            store.lexical_search(query, 10, None).unwrap()[0]
+                .chunk
+                .symbol
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(top("shut down"), "shutdown_now");
+        assert_eq!(top("read session"), "readSession");
+        assert_eq!(top("shutdown now"), "shutdown_now");
+    }
+
+    #[test]
+    fn typos_match_symbols_only_on_request_and_below_literal_matches() {
+        assert_eq!(edit_distance_within(&['a', 'b'], &['b', 'a'], 1), Some(1));
+        assert_eq!(
+            edit_distance_within(&['a', 'b', 'c'], &['a', 'b', 'c'], 0),
+            Some(0)
+        );
+        assert_eq!(edit_distance_within(&['a'], &['a', 'b', 'c'], 1), None);
+        assert_eq!(leaf_name("Type::method"), "method");
+        assert_eq!(leaf_name("Class.method"), "method");
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, lock, mut store) = open(root.path());
+        let files = [
+            update(root.path(), "a.rs", "authenticate_user"),
+            update(root.path(), "b.rs", "authorize_user"),
+        ];
+        commit(&mut store, &lock, &files, &[], None, &[]).unwrap();
+        let search = |name: &str, fuzzy| {
+            let request = SymbolRequest {
+                name: name.into(),
+                kind: None,
+                path_filter: None,
+                limit: 10,
+            };
+            store
+                .symbol_search(&request, fuzzy)
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.chunk.symbol.unwrap(), hit.score))
+                .collect::<Vec<_>>()
+        };
+        assert!(search("authentcate_user", false).is_empty());
+        assert_eq!(
+            search("authentcate_user", true),
+            vec![("authenticate_user".to_owned(), 15.0)]
+        );
+        // A literal match stays first; the near miss only fills the list.
+        assert_eq!(search("authenticate_user", true)[0].1, 100.0);
+        assert!(search("zzzz", true).is_empty());
+    }
+
+    #[test]
+    fn writer_lock_rejects_a_second_writer_and_hides_the_index_from_git() {
         let root = tempfile::tempdir().unwrap();
         let first = WriterLock::acquire(root.path()).unwrap();
         assert!(matches!(
             WriterLock::acquire(root.path()),
             Err(Error::WriterBusy)
         ));
+        let ignore = root.path().join(".gitignore");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n");
         drop(first);
+        fs::write(&ignore, "custom\n").unwrap();
         assert!(WriterLock::acquire(root.path()).is_ok());
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "custom\n");
     }
 
     #[test]

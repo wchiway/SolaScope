@@ -39,7 +39,9 @@ pub fn build_reranker(
 ) -> Result<Option<Arc<dyn core::RerankProvider>>> {
     match config.provider.as_str() {
         "disabled" => Ok(None),
-        "remote" => Ok(Some(Arc::new(rerank::HttpReranker::new(config, privacy)?))),
+        "remote" | "openai" | "dashscope" | "siliconflow" => {
+            Ok(Some(Arc::new(rerank::HttpReranker::new(config, privacy)?)))
+        }
         "fastembed" => {
             #[cfg(feature = "local-rerank")]
             {

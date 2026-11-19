@@ -528,3 +528,495 @@ async fn watcher_retries_a_source_change_during_its_initial_index() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn moved_files_keep_their_vectors_until_a_rebuild_recomputes_them() {
+    let root = fixture();
+    let server = MockServer::start().await;
+    mock_embedding(&server).await;
+    let engine = Engine::new(with_embedding(root.path(), &server)).unwrap();
+    assert_eq!(engine.index(false).await.unwrap().embedded_chunks, 2);
+    let requests = server.received_requests().await.unwrap().len();
+
+    fs::create_dir(root.path().join("moved")).unwrap();
+    fs::rename(
+        root.path().join("src/lib.rs"),
+        root.path().join("moved/renamed.rs"),
+    )
+    .unwrap();
+    let report = engine.index(false).await.unwrap();
+    assert_eq!(
+        (
+            report.files_deleted,
+            report.embedded_chunks,
+            report.relocated_embeddings
+        ),
+        (1, 0, 2)
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(engine.status().unwrap().relocated_vectors, 2);
+    let response = engine
+        .search(query("greet", SearchMode::Semantic))
+        .await
+        .unwrap();
+    assert_eq!(response.results[0].relative_path, "moved/renamed.rs");
+    assert!(response.results[0]
+        .match_sources
+        .contains(&"vector".to_owned()));
+
+    let rebuilt = engine.index(true).await.unwrap();
+    assert_eq!(
+        (rebuilt.embedded_chunks, rebuilt.relocated_embeddings),
+        (2, 0)
+    );
+    assert_eq!(engine.status().unwrap().relocated_vectors, 0);
+}
+
+#[tokio::test]
+async fn changed_parser_settings_rechunk_every_file_once() {
+    let root = fixture();
+    fs::write(root.path().join("src/other.rs"), "fn other() {}\n").unwrap();
+    let config = Config::default_for_root(root.path()).unwrap();
+    let first = Engine::new(config.clone())
+        .unwrap()
+        .index(false)
+        .await
+        .unwrap();
+    let mut changed = config;
+    changed.parser.max_chunk_tokens = 256;
+    let engine = Engine::new(changed).unwrap();
+    let report = engine.index(false).await.unwrap();
+    assert_eq!(report.files_updated, 2);
+    assert_eq!(report.index_version, first.index_version + 1);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("re-chunked")));
+    let again = engine.index(false).await.unwrap();
+    assert_eq!((again.files_updated, again.warnings.len()), (0, 0));
+}
+
+#[tokio::test]
+async fn fingerprint_policy_rebuild_replaces_the_index_without_a_flag() {
+    let root = fixture();
+    let server = MockServer::start().await;
+    mock_embedding(&server).await;
+    let config = with_embedding(root.path(), &server);
+    Engine::new(config.clone())
+        .unwrap()
+        .index(false)
+        .await
+        .unwrap();
+    let mut changed = config;
+    changed.embedding.model = "different-model".into();
+    changed.embedding.fingerprint_policy = "rebuild".into();
+    let engine = Engine::new(changed).unwrap();
+    let report = engine.index(false).await.unwrap();
+    assert!(report.rebuilt);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("fingerprint_policy")));
+    assert_eq!(
+        engine
+            .status()
+            .unwrap()
+            .embedding_fingerprint
+            .unwrap()
+            .model,
+        "different-model"
+    );
+}
+
+#[tokio::test]
+async fn search_reports_where_the_time_went() {
+    let root = fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let vectors: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| vec![1.0, 0.25])
+                .collect();
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(60))
+                .set_body_json(json!({ "embeddings": vectors }))
+        })
+        .mount(&server)
+        .await;
+    let engine = Engine::new(with_embedding(root.path(), &server)).unwrap();
+    engine.index(false).await.unwrap();
+    let first = engine
+        .search(query("greet", SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .timings;
+    assert!(first.embedding_ms >= 50.0, "{first:?}");
+    assert!(
+        first.retrieval_ms > 0.0 && first.rerank_ms == 0.0,
+        "{first:?}"
+    );
+    assert!(
+        first.total_ms >= first.embedding_ms + first.retrieval_ms - 0.01,
+        "{first:?}"
+    );
+    // The query vector is cached, so no model time is spent the second time.
+    let cached = engine
+        .search(query("greet", SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .timings;
+    assert_eq!(cached.embedding_ms, 0.0);
+    let lexical = engine
+        .search(query("greet", SearchMode::Lexical))
+        .await
+        .unwrap()
+        .timings;
+    assert_eq!((lexical.embedding_ms, lexical.rerank_ms), (0.0, 0.0));
+}
+
+#[tokio::test]
+async fn an_unreachable_embedding_service_fails_the_index_with_a_way_forward() {
+    let root = fixture();
+    let server = MockServer::start().await;
+    mock_embedding(&server).await;
+    let config = with_embedding(root.path(), &server);
+    let engine = Engine::new(config.clone()).unwrap();
+    engine.index(false).await.unwrap();
+    let version = engine.status().unwrap().index_version;
+    fs::write(root.path().join("src/new.rs"), "fn added() {}\n").unwrap();
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let error = engine.index(false).await.unwrap_err();
+    assert!(matches!(error, Error::ModelUnavailable(_)));
+    let message = error.to_string();
+    assert!(message.contains("existing index is unchanged"), "{message}");
+    assert!(message.contains("embedding.provider"), "{message}");
+    assert_eq!(engine.status().unwrap().index_version, version);
+
+    let probes = engine.probe_models().await;
+    assert_eq!(probes[0].name, "embedding");
+    assert_eq!(probes[0].status, "error");
+    server.reset().await;
+    mock_embedding(&server).await;
+    let probes = engine.probe_models().await;
+    assert_eq!(probes[0].status, "ok");
+    assert!(probes[0].detail.contains("2 dimensions"), "{:?}", probes[0]);
+    assert_eq!(probes[1].status, "ok");
+}
+
+#[tokio::test]
+async fn typos_are_corrected_for_symbol_lookup_but_not_mixed_into_search() {
+    let root = fixture();
+    let engine = Engine::new(Config::default_for_root(root.path()).unwrap()).unwrap();
+    engine.index(false).await.unwrap();
+    let request = |name: &str| SymbolRequest {
+        name: name.into(),
+        kind: None,
+        path_filter: None,
+        limit: 10,
+    };
+    let exact = engine.find_symbol(request("greet")).unwrap();
+    assert_eq!(exact.results[0].match_sources, ["symbol"]);
+    let fuzzy = engine.find_symbol(request("gret")).unwrap();
+    assert_eq!(fuzzy.results[0].symbol.as_deref(), Some("greet"));
+    assert_eq!(fuzzy.results[0].match_sources, ["fuzzy"]);
+    assert!(engine
+        .search(query("gret", SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .results
+        .is_empty());
+}
+
+#[tokio::test]
+async fn product_code_ranks_before_identical_test_code_unless_tests_are_asked_for() {
+    let root = tempfile::tempdir().unwrap();
+    // `tests/` sorts first, so without the ranking rule it would win the tie.
+    for directory in ["tests", "zeta"] {
+        fs::create_dir(root.path().join(directory)).unwrap();
+        fs::write(
+            root.path().join(directory).join("alpha.rs"),
+            "fn settle_invoice() { let outstanding_balance = 0; }\n",
+        )
+        .unwrap();
+    }
+    let engine = Engine::new(Config::default_for_root(root.path()).unwrap()).unwrap();
+    engine.index(false).await.unwrap();
+    let paths = |response: solascope_core::SearchResponse| -> Vec<String> {
+        response
+            .results
+            .into_iter()
+            .map(|result| result.relative_path)
+            .collect()
+    };
+    let plain = engine
+        .search(query("outstanding balance", SearchMode::Lexical))
+        .await
+        .unwrap();
+    assert_eq!(paths(plain), ["zeta/alpha.rs", "tests/alpha.rs"]);
+    let filtered = engine
+        .search(SearchRequest {
+            path_filter: Some("tests".into()),
+            ..query("outstanding balance", SearchMode::Lexical)
+        })
+        .await
+        .unwrap();
+    assert_eq!(paths(filtered), ["tests/alpha.rs"]);
+    let asked = engine
+        .search(query("outstanding balance test", SearchMode::Lexical))
+        .await
+        .unwrap();
+    assert_eq!(paths(asked), ["tests/alpha.rs", "zeta/alpha.rs"]);
+}
+
+#[tokio::test]
+async fn the_index_directory_ignores_itself_in_git() {
+    let root = fixture();
+    let engine = Engine::new(Config::default_for_root(root.path()).unwrap()).unwrap();
+    engine.index(false).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(root.path().join(".solascope/.gitignore")).unwrap(),
+        "*\n"
+    );
+    // The ignore file inside the index is not source and is never indexed.
+    assert_eq!(engine.status().unwrap().files, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_readers_only_ever_see_one_complete_generation() {
+    const FILES: usize = 24;
+    const GENERATIONS: usize = 8;
+    let root = tempfile::tempdir().unwrap();
+    let write_generation = |generation: usize| {
+        for file in 0..FILES {
+            fs::write(
+                root.path().join(format!("unit_{file}.rs")),
+                format!("pub fn shared_marker_{file}() -> &'static str {{ \"generation_{generation}\" }}\n"),
+            )
+            .unwrap();
+        }
+    };
+    write_generation(0);
+    let engine = Engine::new(Config::default_for_root(root.path()).unwrap()).unwrap();
+    engine.index(false).await.unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for _ in 0..3 {
+        let engine = engine.clone();
+        let done = done.clone();
+        readers.push(tokio::spawn(async move {
+            let mut observed = std::collections::BTreeSet::new();
+            while !done.load(Ordering::SeqCst) {
+                let response = engine
+                    .search(SearchRequest {
+                        limit: 100,
+                        ..query("shared marker", SearchMode::Lexical)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(response.results.len(), FILES, "partial result set");
+                let generations: std::collections::BTreeSet<&str> = response
+                    .results
+                    .iter()
+                    .map(|result| {
+                        let start = result.snippet.find("generation_").unwrap();
+                        result.snippet[start..].trim_end_matches(['"', ' ', '}', '\n'])
+                    })
+                    .collect();
+                assert_eq!(generations.len(), 1, "mixed generations: {generations:?}");
+                assert!(response
+                    .results
+                    .iter()
+                    .all(|result| result.index_version == response.index_version));
+                observed.insert(response.index_version);
+            }
+            observed
+        }));
+    }
+    for generation in 1..=GENERATIONS {
+        write_generation(generation);
+        let report = engine.index(false).await.unwrap();
+        assert_eq!(report.files_updated, FILES);
+    }
+    done.store(true, Ordering::SeqCst);
+    for reader in readers {
+        assert!(!reader.await.unwrap().is_empty());
+    }
+    assert_eq!(engine.status().unwrap().chunks, FILES);
+}
+
+#[tokio::test]
+async fn dashscope_index_and_semantic_search_use_the_correct_embedding_purposes() {
+    let root = fixture();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/services/embeddings/text-embedding/text-embedding",
+        ))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let inputs = body["input"]["texts"].as_array().unwrap();
+            let entries: Vec<_> = inputs
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, text)| {
+                    let text = text.as_str().unwrap();
+                    let vector = match body["parameters"]["text_type"].as_str().unwrap() {
+                        "document" if text.contains("fn compute_total") => vec![0.0, 2.0],
+                        "document" => vec![2.0, 0.0],
+                        "query" => {
+                            assert_eq!(text, "find the numeric return value");
+                            vec![0.0, 3.0]
+                        }
+                        other => panic!("unexpected embedding purpose {other}"),
+                    };
+                    json!({"text_index": index, "embedding": vector})
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"output": {"embeddings": entries}}))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut config = with_embedding(root.path(), &server);
+    config.embedding.provider = "dashscope".into();
+    config.embedding.model = "text-embedding-v4".into();
+    config.embedding.api_key_env = "SOLASCOPE_ENGINE_TEST_DASHSCOPE_KEY".into();
+    std::env::set_var(&config.embedding.api_key_env, "mock-dashscope-key");
+    config.embedding.batch_size = 4;
+    config.privacy.remote_opt_in = true;
+    let engine = Engine::new(config).unwrap();
+    assert_eq!(engine.index(false).await.unwrap().embedded_chunks, 2);
+    for _ in 0..2 {
+        let response = engine
+            .search(query("find the numeric return value", SearchMode::Semantic))
+            .await
+            .unwrap();
+        assert_eq!(response.results[0].symbol.as_deref(), Some("compute_total"));
+        assert_eq!(response.results[0].match_sources, ["vector"]);
+        assert!(!response.results[0].stale);
+    }
+    assert_eq!(engine.index(false).await.unwrap().files_unchanged, 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let purposes: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            body["parameters"]["text_type"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(purposes, ["document", "query"]);
+}
+
+#[tokio::test]
+async fn structural_only_indexing_skips_bad_files_and_removes_obsolete_definitions() {
+    let root = fixture();
+    fs::write(
+        root.path().join("notes.txt"),
+        "UNSUPPORTED_TOKEN in documentation\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("src/broken.rs"), "fn broken( {\n").unwrap();
+    fs::write(
+        root.path().join("disabled.py"),
+        "def disabled_function():\n    pass\n",
+    )
+    .unwrap();
+    let mut config = Config::default_for_root(root.path()).unwrap();
+    config.parser.enabled_languages = vec!["rust".into()];
+    config.parser.fallback_policy = "skip".into();
+    let engine = Engine::new(config.clone()).unwrap();
+    let first = engine.index(false).await.unwrap();
+    assert_eq!(first.files_total, 4);
+    assert_eq!(first.chunks, 2);
+    assert!(first.skipped_files >= 3);
+    assert!(first
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("fallback_policy=skip")));
+    assert!(engine
+        .search(query("UNSUPPORTED_TOKEN", SearchMode::Lexical))
+        .await
+        .unwrap()
+        .results
+        .is_empty());
+    assert!(engine
+        .find_symbol(SymbolRequest {
+            name: "disabled_function".into(),
+            kind: None,
+            path_filter: None,
+            limit: 10,
+        })
+        .unwrap()
+        .results
+        .is_empty());
+    assert_eq!(engine.index(false).await.unwrap().files_unchanged, 4);
+
+    fs::write(root.path().join("src/lib.rs"), "fn greet( {\n").unwrap();
+    let invalid = engine.index(false).await.unwrap();
+    assert_eq!(invalid.files_updated, 1);
+    assert_eq!(invalid.chunks, 0);
+    assert!(engine
+        .find_symbol(SymbolRequest {
+            name: "greet".into(),
+            kind: None,
+            path_filter: None,
+            limit: 10,
+        })
+        .unwrap()
+        .results
+        .is_empty());
+    fs::write(root.path().join("src/lib.rs"), "fn recovered() {}\n").unwrap();
+    assert_eq!(engine.index(false).await.unwrap().chunks, 1);
+
+    config.parser.fallback_policy = "text".into();
+    let engine = Engine::new(config).unwrap();
+    assert!(matches!(engine.status(), Err(Error::IndexOutdated(_))));
+    assert_eq!(engine.index(false).await.unwrap().files_updated, 4);
+    let found = engine
+        .search(query("UNSUPPORTED_TOKEN", SearchMode::Lexical))
+        .await
+        .unwrap();
+    assert_eq!(found.results[0].relative_path, "notes.txt");
+    assert_eq!(found.results[0].kind, "text");
+}
+
+#[tokio::test]
+async fn lexical_mode_does_not_mix_in_the_hybrid_symbol_channel() {
+    let root = fixture();
+    let engine = Engine::new(Config::default_for_root(root.path()).unwrap()).unwrap();
+    engine.index(false).await.unwrap();
+    let lexical = engine
+        .search(query("greet", SearchMode::Lexical))
+        .await
+        .unwrap();
+    assert_eq!(lexical.results[0].symbol.as_deref(), Some("greet"));
+    assert!(lexical
+        .results
+        .iter()
+        .all(|result| result.match_sources == ["lexical"]));
+    let hybrid = engine
+        .search(query("greet", SearchMode::Hybrid))
+        .await
+        .unwrap();
+    assert_eq!(hybrid.results[0].symbol.as_deref(), Some("greet"));
+    assert!(hybrid.results[0]
+        .match_sources
+        .iter()
+        .any(|source| source == "symbol"));
+    assert!(hybrid.results[0]
+        .match_sources
+        .iter()
+        .any(|source| source == "lexical"));
+}

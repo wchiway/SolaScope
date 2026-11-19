@@ -63,4 +63,3 @@ CREATE TABLE index_jobs (
     status TEXT NOT NULL,
     error TEXT
 );
-PRAGMA user_version = 1;

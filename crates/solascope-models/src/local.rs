@@ -15,10 +15,13 @@ use fastembed::{
     UserDefinedRerankingModel,
 };
 use solascope_config::RerankConfig;
-use solascope_core::{Error, RerankDocument, RerankProvider, RerankScore, Result};
+use solascope_core::{Error, RerankDocument, RerankLimits, RerankProvider, RerankScore, Result};
 use tokio::sync::Semaphore;
 
-use crate::rerank::{map_scores, validate_config, validate_inputs};
+use crate::{
+    rerank::{map_scores, validate_config, validate_inputs},
+    MAX_RERANK_DOCUMENTS,
+};
 
 const LOCAL_FILES: [&str; 5] = [
     "model.onnx",
@@ -119,6 +122,16 @@ impl RerankProvider for LocalReranker {
     }
     fn is_remote(&self) -> bool {
         false
+    }
+    fn limits(&self) -> RerankLimits {
+        // A query/document pair must fit the model's 512 tokens, and source
+        // code can tokenize to one token per two characters. Declaring the
+        // bound lets the caller shorten candidates instead of the whole
+        // request being rejected.
+        RerankLimits {
+            max_documents: MAX_RERANK_DOCUMENTS,
+            max_input_chars: self.max_chars.min(MAX_TOKENS * 2),
+        }
     }
 
     async fn rerank(&self, query: &str, documents: &[RerankDocument]) -> Result<Vec<RerankScore>> {

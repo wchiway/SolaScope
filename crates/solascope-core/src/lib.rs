@@ -19,6 +19,8 @@ pub enum Error {
     Privacy(String),
     #[error("index not found; run `solascope index` first")]
     IndexMissing,
+    #[error("index needs upgrading: {0}; run `solascope index`")]
+    IndexOutdated(String),
     #[error("another index writer is active; stop it or retry")]
     WriterBusy,
     #[error("model unavailable: {0}")]
@@ -43,7 +45,7 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_) | Self::InvalidInput(_) | Self::Privacy(_) => 2,
-            Self::IndexMissing => 3,
+            Self::IndexMissing | Self::IndexOutdated(_) => 3,
             Self::ModelUnavailable(_) | Self::ModelIncompatible(_) | Self::Authentication(_) => 4,
             Self::WriterBusy => 5,
             Self::Cancelled => 130,
@@ -120,6 +122,21 @@ pub struct Chunk {
     pub fallback: bool,
 }
 
+impl Chunk {
+    /// Identifies the embedding input apart from its path. Two chunks with the
+    /// same key differ only in where their file lives, so a moved or renamed
+    /// file can reuse the vectors computed at its previous location.
+    pub fn relocation_key(&self) -> String {
+        hash_text(&format!(
+            "{EMBEDDING_TEMPLATE_VERSION}\0{}\0{}\0{}\0{}",
+            self.language,
+            self.symbol.as_deref().unwrap_or(""),
+            self.signature.as_deref().unwrap_or(""),
+            self.content_hash
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelFingerprint {
     pub provider: String,
@@ -148,7 +165,18 @@ impl ModelFingerprint {
 pub trait EmbeddingProvider: Send + Sync {
     fn fingerprint(&self) -> ModelFingerprint;
     fn is_remote(&self) -> bool;
+    /// Embed index documents, keeping the input order.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// Providers with asymmetric query/document modes override this method.
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        let mut vectors = self.embed(&[query.to_owned()]).await?;
+        if vectors.len() != 1 {
+            return Err(Error::ModelIncompatible(
+                "query embedding count must be one".into(),
+            ));
+        }
+        Ok(vectors.remove(0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,10 +192,18 @@ pub struct RerankScore {
     pub score: f64,
 }
 
+/// The largest request a reranker accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerankLimits {
+    pub max_documents: usize,
+    pub max_input_chars: usize,
+}
+
 #[async_trait]
 pub trait RerankProvider: Send + Sync {
     fn name(&self) -> String;
     fn is_remote(&self) -> bool;
+    fn limits(&self) -> RerankLimits;
     async fn rerank(&self, query: &str, documents: &[RerankDocument]) -> Result<Vec<RerankScore>>;
 }
 
@@ -295,6 +331,16 @@ pub struct SearchResult {
     pub stale: bool,
 }
 
+/// Wall-clock milliseconds per search stage. A model stage is zero when it did
+/// not run or was served from the in-process query cache.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchTimings {
+    pub embedding_ms: f64,
+    pub retrieval_ms: f64,
+    pub rerank_ms: f64,
+    pub total_ms: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub query: String,
@@ -302,6 +348,8 @@ pub struct SearchResponse {
     pub index_version: u64,
     pub results: Vec<SearchResult>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub timings: SearchTimings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +407,9 @@ pub struct IndexStatus {
     pub chunks: usize,
     pub vectors: usize,
     pub cache_entries: usize,
+    /// Vectors reused from a previous path of the same code; `index --rebuild`
+    /// recomputes them from the current path.
+    pub relocated_vectors: usize,
     pub embedding_fingerprint: Option<ModelFingerprint>,
     pub last_indexed_at: Option<u64>,
     pub pending_jobs: usize,
@@ -375,6 +426,7 @@ pub struct IndexReport {
     pub chunks: usize,
     pub embedded_chunks: usize,
     pub cache_hits: usize,
+    pub relocated_embeddings: usize,
     pub skipped_files: usize,
     pub warnings: Vec<String>,
     pub elapsed_ms: u128,
@@ -405,7 +457,7 @@ pub trait LexicalIndex {
         limit: usize,
         path_filter: Option<&str>,
     ) -> Result<Vec<RankedChunk>>;
-    fn symbol_search(&self, request: &SymbolRequest) -> Result<Vec<RankedChunk>>;
+    fn symbol_search(&self, request: &SymbolRequest, fuzzy: bool) -> Result<Vec<RankedChunk>>;
 }
 
 pub trait VectorIndex {

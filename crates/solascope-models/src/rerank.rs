@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use solascope_config::{PrivacyConfig, RerankConfig};
-use solascope_core::{Error, RerankDocument, RerankProvider, RerankScore, Result};
+use solascope_core::{Error, RerankDocument, RerankLimits, RerankProvider, RerankScore, Result};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -12,8 +12,18 @@ use crate::{
     MAX_RERANK_DOCUMENTS, MAX_TOTAL_INPUT_CHARS,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Compatible,
+    DashScope,
+}
+
+const DASHSCOPE_PATH: &str = "/api/v1/services/rerank/text-rerank/text-rerank";
+
 pub(crate) struct HttpReranker {
     transport: HttpTransport,
+    provider: String,
+    protocol: Protocol,
     model: String,
     top_n: usize,
     max_chars: usize,
@@ -28,7 +38,21 @@ impl HttpReranker {
                 "remote rerank requires privacy.remote_opt_in=true".into(),
             ));
         }
-        let (url, remote) = endpoint(&config.endpoint, "/rerank")?;
+        let (protocol, suffix) = match config.provider.as_str() {
+            "remote" => (Protocol::Compatible, "/rerank"),
+            "openai"
+                if config
+                    .endpoint
+                    .trim_end_matches('/')
+                    .ends_with("/compatible-api/v1") =>
+            {
+                (Protocol::Compatible, "/reranks")
+            }
+            "openai" | "siliconflow" => (Protocol::Compatible, "/v1/rerank"),
+            "dashscope" => (Protocol::DashScope, DASHSCOPE_PATH),
+            _ => return Err(Error::Config("unsupported rerank provider".into())),
+        };
+        let (url, remote) = endpoint(&config.endpoint, suffix)?;
         Ok(Self {
             transport: HttpTransport::new(
                 url,
@@ -37,6 +61,8 @@ impl HttpReranker {
                 2,
                 remote,
             )?,
+            provider: config.provider.clone(),
+            protocol,
             model: config.model.clone(),
             top_n: config.top_n,
             max_chars: config.max_input_chars,
@@ -48,10 +74,22 @@ impl HttpReranker {
 #[async_trait]
 impl RerankProvider for HttpReranker {
     fn name(&self) -> String {
-        format!("remote/{}", self.model)
+        format!("{}/{}", self.provider, self.model)
     }
     fn is_remote(&self) -> bool {
         true
+    }
+    fn limits(&self) -> RerankLimits {
+        RerankLimits {
+            max_documents: if self.protocol == Protocol::DashScope
+                && self.model == "qwen3-vl-rerank"
+            {
+                100
+            } else {
+                MAX_RERANK_DOCUMENTS
+            },
+            max_input_chars: self.max_chars,
+        }
     }
 
     async fn rerank(&self, query: &str, documents: &[RerankDocument]) -> Result<Vec<RerankScore>> {
@@ -59,19 +97,35 @@ impl RerankProvider for HttpReranker {
             return Ok(Vec::new());
         }
         validate_inputs(query, documents, self.max_chars)?;
+        if documents.len() > self.limits().max_documents {
+            return Err(Error::InvalidInput(
+                "rerank candidate count exceeds the provider limit".into(),
+            ));
+        }
         let _permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
         let top_n = self.top_n.min(documents.len());
-        let response: RerankResponse = self
-            .transport
-            .post(&json!({
-                "model": self.model, "query": query,
-                "documents": documents.iter().map(|doc| doc.text.as_str()).collect::<Vec<_>>(),
-                "top_n": top_n,
-            }))
-            .await?;
+        let texts: Vec<&str> = documents
+            .iter()
+            .map(|document| document.text.as_str())
+            .collect();
+        let body = if self.protocol == Protocol::DashScope {
+            json!({"model": self.model, "input": {"query": query, "documents": texts},
+                "parameters": {"top_n": top_n, "return_documents": false}})
+        } else {
+            json!({"model": self.model, "query": query, "documents": texts, "top_n": top_n, "return_documents": false})
+        };
+        let response: RerankResponse = self.transport.post(&body).await?;
+        let results = match (self.protocol, response.results, response.output) {
+            (Protocol::Compatible, Some(results), None) => results,
+            (Protocol::DashScope, None, Some(output)) => output.results,
+            _ => {
+                return Err(Error::ModelIncompatible(
+                    "rerank response does not match the configured protocol".into(),
+                ))
+            }
+        };
         map_scores(
-            response
-                .results
+            results
                 .into_iter()
                 .map(|result| (result.index, result.relevance_score)),
             documents,
@@ -169,6 +223,12 @@ pub(crate) fn map_scores(
 
 #[derive(Deserialize)]
 struct RerankResponse {
+    results: Option<Vec<RemoteScore>>,
+    output: Option<DashScopeOutput>,
+}
+
+#[derive(Deserialize)]
+struct DashScopeOutput {
     results: Vec<RemoteScore>,
 }
 #[derive(Deserialize)]

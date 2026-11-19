@@ -33,6 +33,7 @@ fn embedding(server: &MockServer, provider: &str) -> EmbeddingConfig {
         concurrency: 2,
         timeout_secs: 3,
         retries: 2,
+        ..Default::default()
     }
 }
 
@@ -571,5 +572,454 @@ async fn invalid_operational_limits_fail_during_construction() {
             Err(Error::Config(_))
         ));
     }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dashscope_batches_follow_model_limits_and_restore_document_order() {
+    for (model, limit, legacy) in [
+        ("text-embedding-v1", 25, true),
+        ("text-embedding-v2", 25, true),
+        ("text-embedding-v3", 10, false),
+        ("text-embedding-v4", 10, false),
+        ("qwen3.7-text-embedding", 20, false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v1/services/embeddings/text-embedding/text-embedding",
+            ))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                assert_eq!(body["model"], model);
+                assert_eq!(body["parameters"]["text_type"], "document");
+                assert!(body["input"].get("dimensions").is_none());
+                if legacy {
+                    assert!(body["parameters"].get("dimension").is_none());
+                    assert!(body["parameters"].get("output_type").is_none());
+                } else {
+                    assert_eq!(body["parameters"]["dimension"], 2);
+                    assert_eq!(body["parameters"]["output_type"], "dense");
+                }
+                let inputs = body["input"]["texts"].as_array().unwrap();
+                assert!(!inputs.is_empty() && inputs.len() <= limit);
+                let entries: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(index, text)| {
+                        let number: f32 = text.as_str().unwrap().parse().unwrap();
+                        if legacy {
+                            json!({"text_index": index, "embedding": [number + 1.0, 1.0]})
+                        } else {
+                            json!({"index": index, "embedding": [number + 1.0, 1.0]})
+                        }
+                    })
+                    .collect();
+                let response = if model.starts_with("qwen3.7") {
+                    json!({"embeddings": entries})
+                } else {
+                    json!({"output": {"embeddings": entries}})
+                };
+                let delay = if inputs[0] == "0" { 50 } else { 0 };
+                ResponseTemplate::new(200)
+                    .set_body_json(response)
+                    .set_delay(Duration::from_millis(delay))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = embedding(&server, "dashscope");
+        config.model = model.into();
+        config.endpoint = format!("{}/api/v1/", server.uri());
+        config.batch_size = 256;
+        let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+        let inputs: Vec<_> = (0..limit + 2).map(|number| number.to_string()).collect();
+        let vectors = provider.embed(&inputs).await.unwrap();
+        assert_eq!(vectors.len(), inputs.len());
+        for (index, vector) in vectors.iter().enumerate() {
+            let first = index as f32 + 1.0;
+            let norm = first.hypot(1.0);
+            assert!((vector[0] - first / norm).abs() < 1e-6);
+            assert!((vector[1] - 1.0 / norm).abs() < 1e-6);
+        }
+        assert!(provider.is_remote());
+    }
+}
+
+#[tokio::test]
+async fn dashscope_uses_a_query_embedding_instead_of_a_document_embedding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/services/embeddings/text-embedding/text-embedding",
+        ))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let vector = match body["parameters"]["text_type"].as_str().unwrap() {
+                "document" => {
+                    assert_eq!(body["input"]["texts"], json!(["code"]));
+                    vec![2.0, 0.0]
+                }
+                "query" => {
+                    assert_eq!(body["input"]["texts"], json!(["where is code"]));
+                    vec![0.0, 3.0]
+                }
+                other => panic!("unexpected text_type: {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "output": {"embeddings": [{"text_index": 0, "embedding": vector}]}
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(&embedding(&server, "dashscope"), &privacy(true))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        provider.embed(&["code".into()]).await.unwrap(),
+        vec![vec![1.0, 0.0]]
+    );
+    assert_eq!(
+        provider.embed_query("where is code").await.unwrap(),
+        vec![0.0, 1.0]
+    );
+}
+
+#[tokio::test]
+async fn dashscope_rejects_ambiguous_missing_and_corrupt_embedding_results() {
+    let valid = json!([{ "index": 0, "embedding": [1.0, 0.0] }]);
+    for response in [
+        json!({"output": {"embeddings": []}}),
+        json!({"output": {"embeddings": [{"index": 1, "embedding": [1.0, 0.0]}]}}),
+        json!({"output": {"embeddings": [{"embedding": [1.0, 0.0]}]}}),
+        json!({"output": {"embeddings": [{"index": 0, "embedding": [0.0, 0.0]}]}}),
+        json!({"output": {"embeddings": [{"index": 0, "embedding": [1.0]}]}}),
+        json!({"output": {"embeddings": valid}, "embeddings": valid}),
+        json!({"output": {}}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = build_embedding(&embedding(&server, "dashscope"), &privacy(true))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            provider.embed_query("query").await,
+            Err(Error::ModelIncompatible(_))
+        ));
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"output": {"embeddings": [
+                {"text_index": 0, "embedding": [1.0, 0.0]},
+                {"text_index": 0, "embedding": [0.0, 1.0]}
+            ]}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(&embedding(&server, "dashscope"), &privacy(true))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        provider.embed(&["a".into(), "b".into()]).await,
+        Err(Error::ModelIncompatible(_))
+    ));
+}
+
+#[tokio::test]
+async fn compatible_embedding_dimension_requests_follow_the_selected_protocol() {
+    for (provider_name, model, request_dimensions, sends_dimensions) in [
+        ("openai", "test-model", true, true),
+        ("openai", "test-model", false, false),
+        ("remote", "test-model", false, false),
+        ("siliconflow", "BAAI/bge-m3", true, false),
+        ("siliconflow", "Qwen/Qwen3-Embedding-0.6B", true, true),
+        ("siliconflow", "Qwen/Qwen3-Embedding-8B", false, false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                assert_eq!(body["model"], model);
+                assert_eq!(body["input"], json!(["query"]));
+                assert_eq!(body["encoding_format"], "float");
+                assert_eq!(body.get("dimensions").is_some(), sends_dimensions);
+                if sends_dimensions {
+                    assert_eq!(body["dimensions"], 2);
+                }
+                assert!(body.get("parameters").is_none());
+                ResponseTemplate::new(200).set_body_json(json!({"data": [
+                    {"index": 0, "embedding": [3.0, 4.0]}
+                ]}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = embedding(&server, provider_name);
+        config.endpoint = format!("{}/v1/embeddings/", server.uri());
+        config.model = model.into();
+        config.request_dimensions = request_dimensions;
+        let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+        assert_eq!(provider.embed_query("query").await.unwrap(), vec![0.6, 0.8]);
+    }
+}
+
+#[tokio::test]
+async fn fingerprints_track_effective_dimension_parameters_not_unused_flags() {
+    let server = MockServer::start().await;
+    for (provider_name, model, changes) in [
+        ("openai", "test-model", true),
+        ("remote", "test-model", true),
+        ("dashscope", "text-embedding-v4", true),
+        ("dashscope", "text-embedding-v2", false),
+        ("siliconflow", "BAAI/bge-m3", false),
+        ("ollama", "test-model", false),
+    ] {
+        let mut config = embedding(&server, provider_name);
+        config.model = model.into();
+        let first = build_embedding(&config, &privacy(true))
+            .unwrap()
+            .unwrap()
+            .fingerprint();
+        config.request_dimensions = false;
+        let second = build_embedding(&config, &privacy(true))
+            .unwrap()
+            .unwrap()
+            .fingerprint();
+        assert_eq!(first != second, changes, "{provider_name}/{model}");
+    }
+}
+
+#[tokio::test]
+async fn cloud_rerank_protocols_preserve_explicit_paths_and_original_candidate_ids() {
+    for (provider_name, base_path, expected_path, native) in [
+        ("remote", "", "/rerank", false),
+        ("openai", "", "/v1/rerank", false),
+        ("openai", "/v1/", "/v1/rerank", false),
+        (
+            "openai",
+            "/compatible-api/v1",
+            "/compatible-api/v1/reranks",
+            false,
+        ),
+        ("openai", "/custom/reranks/", "/custom/reranks", false),
+        ("siliconflow", "/v1", "/v1/rerank", false),
+        (
+            "dashscope",
+            "/api/v1",
+            "/api/v1/services/rerank/text-rerank/text-rerank",
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(expected_path))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                assert_eq!(body["model"], "test-reranker");
+                if native {
+                    assert_eq!(body["input"]["query"], "find beta");
+                    assert_eq!(
+                        body["input"]["documents"],
+                        json!(["alpha code", "beta code"])
+                    );
+                    assert_eq!(body["parameters"]["top_n"], 2);
+                    assert_eq!(body["parameters"]["return_documents"], false);
+                    assert!(body.get("query").is_none());
+                } else {
+                    assert_eq!(body["query"], "find beta");
+                    assert_eq!(body["documents"], json!(["alpha code", "beta code"]));
+                    assert_eq!(body["top_n"], 2);
+                    assert_eq!(body["return_documents"], false);
+                    assert!(body.get("input").is_none());
+                }
+                let results = json!([
+                    {"index": 1, "relevance_score": 0.9},
+                    {"index": 0, "relevance_score": 0.1}
+                ]);
+                let response = if native {
+                    json!({"output": {"results": results}})
+                } else {
+                    json!({"results": results})
+                };
+                ResponseTemplate::new(200).set_body_json(response)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = rerank(&server);
+        config.provider = provider_name.into();
+        config.endpoint = format!("{}{base_path}", server.uri());
+        let provider = build_reranker(&config, &privacy(true)).unwrap().unwrap();
+        let scores = provider.rerank("find beta", &documents()).await.unwrap();
+        assert_eq!(scores[0].document_id, "source:beta");
+        assert_eq!(scores[0].index, 1);
+        assert_eq!(scores[0].score, 0.9);
+        assert_eq!(scores[1].document_id, "source:alpha");
+        assert_eq!(scores[1].index, 0);
+        assert_eq!(provider.name(), format!("{provider_name}/test-reranker"));
+        assert!(provider.is_remote());
+    }
+}
+
+#[tokio::test]
+async fn cloud_rerank_rejects_a_response_from_another_protocol() {
+    let results =
+        json!([{"index": 0, "relevance_score": 0.2}, {"index": 1, "relevance_score": 0.8}]);
+    for (provider_name, response) in [
+        ("dashscope", json!({"results": results})),
+        ("openai", json!({"output": {"results": results}})),
+        (
+            "siliconflow",
+            json!({"results": results, "output": {"results": results}}),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = rerank(&server);
+        config.provider = provider_name.into();
+        let provider = build_reranker(&config, &privacy(true)).unwrap().unwrap();
+        assert!(matches!(
+            provider.rerank("query", &documents()).await,
+            Err(Error::ModelIncompatible(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn every_cloud_protocol_requires_opt_in_even_for_a_loopback_endpoint() {
+    let server = MockServer::start().await;
+    for provider_name in ["openai", "remote", "dashscope", "siliconflow"] {
+        assert!(matches!(
+            build_embedding(&embedding(&server, provider_name), &privacy(false)),
+            Err(Error::Privacy(_))
+        ));
+        let mut config = rerank(&server);
+        config.provider = provider_name.into();
+        assert!(matches!(
+            build_reranker(&config, &privacy(false)),
+            Err(Error::Privacy(_))
+        ));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dashscope_text_rerank_enforces_its_declared_model_limit_before_network() {
+    let server = MockServer::start().await;
+    let mut config = rerank(&server);
+    config.provider = "dashscope".into();
+    config.model = "qwen3-vl-rerank".into();
+    let provider = build_reranker(&config, &privacy(true)).unwrap().unwrap();
+    assert_eq!(provider.limits().max_documents, 100);
+    let documents: Vec<_> = (0..101)
+        .map(|index| RerankDocument {
+            id: format!("id:{index}"),
+            text: "small document".into(),
+        })
+        .collect();
+    assert!(matches!(
+        provider.rerank("query", &documents).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cloud_error_envelopes_are_classified_without_exposing_provider_messages() {
+    let key_name = "SOLASCOPE_MODELS_TEST_CLOUD_AUTH_KEY";
+    let secret = "cloud-fixture-secret-not-for-diagnostics";
+    std::env::set_var(key_name, secret);
+    for provider_name in ["openai", "remote", "dashscope", "siliconflow"] {
+        for (status, code, kind) in [
+            (200, "InvalidApiKey", 0),
+            (400, "Arrearage", 0),
+            (429, "insufficient_quota", 0),
+            (200, "ModelNotFound", 1),
+            (400, "InvalidParameter", 2),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(move |request: &Request| {
+                    assert_eq!(
+                        request.headers["authorization"].to_str().unwrap(),
+                        format!("Bearer {secret}")
+                    );
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"code": code, "message": secret}))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut config = embedding(&server, provider_name);
+            config.api_key_env = key_name.into();
+            let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+            let error = provider.embed_query("code").await.unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(secret));
+            assert!(!format!("{error:?}").contains(&server.uri()));
+            match kind {
+                0 => assert!(matches!(error, Error::Authentication(_))),
+                1 => assert!(matches!(error, Error::ModelIncompatible(_))),
+                _ => assert!(matches!(error, Error::Config(_))),
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"error": {"code": "InvalidApiKey", "message": secret}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = rerank(&server);
+        config.provider = provider_name.into();
+        config.api_key_env = key_name.into();
+        let provider = build_reranker(&config, &privacy(true)).unwrap().unwrap();
+        let error = provider.rerank("query", &documents()).await.unwrap_err();
+        assert!(matches!(error, Error::Authentication(_)));
+        assert!(!format!("{error:?} {error}").contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn transient_success_status_error_envelopes_retry_with_a_bound() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "Throttling.RateQuota", "message": "sensitive echoed request"
+        })))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(&embedding(&server, "dashscope"), &privacy(true))
+        .unwrap()
+        .unwrap();
+    let error = provider.embed_query("query").await.unwrap_err();
+    assert!(matches!(error, Error::ModelUnavailable(_)));
+    assert!(!error.to_string().contains("sensitive echoed request"));
+}
+
+#[tokio::test]
+async fn legacy_dashscope_embedding_rejects_oversized_text_without_truncation() {
+    let server = MockServer::start().await;
+    let mut config = embedding(&server, "dashscope");
+    config.model = "text-embedding-v2".into();
+    let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+    let error = provider.embed_query(&"字".repeat(2049)).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(error.to_string().contains("2048"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
