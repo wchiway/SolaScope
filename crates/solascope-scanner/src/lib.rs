@@ -186,6 +186,7 @@ struct Policy {
     root: PathBuf,
     directory: Dir,
     index: PathBuf,
+    log: Option<PathBuf>,
     include: GlobSet,
     exclude: GlobSet,
     sensitive: GlobSet,
@@ -215,6 +216,10 @@ impl Policy {
             root,
             directory,
             index,
+            log: (config.log.output != "stderr").then(|| {
+                let path = PathBuf::from(&config.log.output);
+                path.canonicalize().unwrap_or(path)
+            }),
             include: globs(&config.project.include)?,
             exclude: globs(&config.project.exclude)?,
             sensitive: globs(&config.privacy.sensitive_path_patterns)?,
@@ -325,7 +330,8 @@ impl Policy {
                 return true;
             }
         }
-        self.root.join(relative).starts_with(&self.index)
+        let absolute = self.root.join(relative);
+        absolute.starts_with(&self.index) || self.log.as_ref().is_some_and(|log| log == &absolute)
     }
 
     fn filtered(&self, relative: &Path, is_dir: bool) -> Result<bool> {
@@ -743,5 +749,43 @@ mod tests {
         let event = Event::new(EventKind::Access(notify::event::AccessKind::Any))
             .add_path(root.path().join("src.rs"));
         assert!(!event_is_relevant(&config, &event));
+    }
+
+    #[test]
+    fn configured_diagnostic_logs_cannot_be_included_or_read_as_source() {
+        let (root, mut config) = fixture();
+        write(root.path(), "src/lib.rs", "fn read() {}");
+        write(root.path(), "notes.txt", "project documentation");
+        write(root.path(), "diagnostics.txt", "private diagnostic event");
+        config.project.include = vec!["**/*".into()];
+        config.log.output = root
+            .path()
+            .join("diagnostics.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(paths(&scan(&config).unwrap()), ["notes.txt", "src/lib.rs"]);
+        assert!(read_file(&config, "diagnostics.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_of_a_configured_log_are_also_excluded() {
+        use std::os::unix::fs::symlink;
+        let (root, mut config) = fixture();
+        write(
+            root.path(),
+            "logs/diagnostics.txt",
+            "private diagnostic event",
+        );
+        write(root.path(), "source.rs", "fn source() {}");
+        symlink("logs/diagnostics.txt", root.path().join("alias.rs")).unwrap();
+        config.privacy.symlink_policy = "within_root".into();
+        config.log.output = root
+            .path()
+            .join("logs/diagnostics.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(paths(&scan(&config).unwrap()), ["source.rs"]);
+        assert!(read_file(&config, "alias.rs").is_err());
     }
 }

@@ -107,8 +107,13 @@ fn lexical_workflow_runs_without_models_and_aliases_return_identical_data() {
         "--no-rerank",
         "--json",
     ];
-    let long = json_ok(command(SOLASCOPE, root.path()).args(args).output().unwrap());
-    let short = json_ok(command(SAS, root.path()).args(args).output().unwrap());
+    let mut long = json_ok(command(SOLASCOPE, root.path()).args(args).output().unwrap());
+    let mut short = json_ok(command(SAS, root.path()).args(args).output().unwrap());
+    // Everything but the per-run timings must be identical.
+    for response in [&mut long, &mut short] {
+        let timings = response.as_object_mut().unwrap().remove("timings").unwrap();
+        assert!(timings["total_ms"].as_f64().unwrap() >= timings["retrieval_ms"].as_f64().unwrap());
+    }
     assert_eq!(long, short);
     assert!(!long["results"].as_array().unwrap().is_empty());
     assert_eq!(long["results"][0]["relative_path"], "fixture.rs");

@@ -1,6 +1,7 @@
 //! Shared CLI and stdio MCP entry point for both executable names.
 
 mod cli;
+mod logging;
 mod mcp;
 
 use std::io::{self, Write};
@@ -32,14 +33,13 @@ pub fn run() -> i32 {
             return code;
         }
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(if cli.verbose { "info" } else { "warn" })
-    });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(io::stderr)
-        .with_ansi(false)
-        .try_init();
+    let config = match configuration(&cli) {
+        Ok(config) => config,
+        Err(error) => return report_error(error, cli.json),
+    };
+    if let Err(error) = logging::initialize(&config, cli.verbose) {
+        return report_error(error, cli.json);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -48,20 +48,24 @@ pub fn run() -> i32 {
         Err(error) => return report_error(Error::Io(error), cli.json),
     };
     let json_output = cli.json;
-    match runtime.block_on(execute(cli)) {
+    match runtime.block_on(execute(cli, config)) {
         Ok(()) => 0,
         Err(error) => report_error(error, json_output),
     }
 }
 
-async fn execute(cli: Cli) -> Result<()> {
+fn configuration(cli: &Cli) -> Result<Config> {
     let root = cli.command.project_path().or(cli.root.as_deref());
-    // Initialization can explicitly create a new project directory.
     if matches!(cli.command, Command::Init { .. }) {
         if let Some(root) = root {
             std::fs::create_dir_all(root)?;
         }
-        let config = Config::load(root, cli.config.as_deref())?;
+    }
+    Config::load(root, cli.config.as_deref())
+}
+
+async fn execute(cli: Cli, config: Config) -> Result<()> {
+    if let Command::Init { probe, .. } = &cli.command {
         let path =
             solascope_config::write_default_config(&config.project.root).map_err(|error| {
                 match error {
@@ -74,18 +78,43 @@ async fn execute(cli: Cli) -> Result<()> {
                     other => other,
                 }
             })?;
+        let checks = if *probe {
+            let engine = Engine::new(config.clone())?;
+            let (cancel, signal) = interrupt_signal();
+            let checked = probe_checks(&engine, &cancel).await;
+            signal.abort();
+            checked?
+        } else {
+            Vec::new()
+        };
         if cli.json {
-            return emit(&json!({ "config_path": path }), true);
+            if *probe {
+                emit(
+                    &json!({"config_path": path, "checks": checks, "healthy": checks.iter().all(|check| check.status != "error")}),
+                    true,
+                )?;
+            } else {
+                emit(&json!({"config_path": path}), true)?;
+            }
+        } else {
+            writeln!(io::stdout().lock(), "Created {}", path.display())?;
+            for check in &checks {
+                writeln!(
+                    io::stdout().lock(),
+                    "{}: {} — {}",
+                    check.name,
+                    check.status,
+                    check.detail
+                )?;
+            }
         }
-        writeln!(io::stdout().lock(), "Created {}", path.display())?;
         eprintln!(
             "Next: solascope index --root {}",
             config.project.root.display()
         );
-        return Ok(());
+        return require_healthy_probes(&checks);
     }
 
-    let config = Config::load(root, cli.config.as_deref())?;
     let engine = Engine::new(config)?;
     let defaults = mcp::Defaults {
         limit: cli.limit.unwrap_or(engine.config().search.limit),
@@ -98,15 +127,36 @@ async fn execute(cli: Cli) -> Result<()> {
     };
     match cli.command {
         Command::Init { .. } => unreachable!("init handled above"),
-        Command::Index { rebuild, .. } => {
+        Command::Index {
+            rebuild,
+            watch,
+            no_watch,
+            probe,
+            ..
+        } => {
+            let watching = !no_watch && (watch || engine.config().index.watch);
             let (cancel, signal) = interrupt_signal();
-            let result = engine.index_with_cancel(rebuild, cancel).await;
-            signal.abort();
-            let report = result?;
-            for warning in &report.warnings {
-                eprintln!("warning: {warning}");
+            let result = async {
+                if probe {
+                    startup_probe(&engine, &cancel).await?;
+                }
+                let report = engine.index_with_cancel(rebuild, cancel.clone()).await?;
+                for warning in &report.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                emit(&report, cli.json)?;
+                if watching {
+                    match engine.watch(cancel).await {
+                        Ok(()) | Err(Error::Cancelled) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(())
+                }
             }
-            emit(&report, cli.json)
+            .await;
+            signal.abort();
+            result
         }
         Command::Search { query } => {
             let request = SearchRequest {
@@ -144,29 +194,77 @@ async fn execute(cli: Cli) -> Result<()> {
             let report = engine.doctor(models).await?;
             if let Some(count) = pruned {
                 emit(
-                    &json!({ "checks": report.checks, "healthy": report.healthy, "pruned_cache_entries": count }),
+                    &json!({"checks": report.checks, "healthy": report.healthy, "pruned_cache_entries": count}),
                     cli.json,
-                )
+                )?;
             } else {
-                emit(&report, cli.json)
+                emit(&report, cli.json)?;
             }
+            if let Some(check) = report.checks.iter().find(|check| check.status == "error") {
+                if check.name == "database" {
+                    return Err(Error::Storage(
+                        "doctor found database errors; see the diagnostic report".into(),
+                    ));
+                }
+                return Err(Error::ModelUnavailable(
+                    "doctor found provider errors; see the diagnostic report".into(),
+                ));
+            }
+            Ok(())
         }
-        Command::Watch { .. } => {
+        Command::Watch { probe, .. } => {
             let (cancel, signal) = interrupt_signal();
-            let result = engine.watch(cancel).await;
+            let result = async {
+                if probe {
+                    startup_probe(&engine, &cancel).await?;
+                }
+                engine.watch(cancel).await
+            }
+            .await;
             signal.abort();
             match result {
-                Ok(()) | Err(Error::Cancelled) => emit(&json!({ "stopped": true }), cli.json),
+                Ok(()) | Err(Error::Cancelled) => emit(&json!({"stopped": true}), cli.json),
                 Err(error) => Err(error),
             }
         }
-        Command::Mcp => {
+        Command::Mcp { probe } => {
             let (cancel, signal) = interrupt_signal();
-            let result = mcp::serve(engine, defaults, cancel).await;
+            let result = async {
+                if probe {
+                    startup_probe(&engine, &cancel).await?;
+                }
+                mcp::serve(engine, defaults, cancel).await
+            }
+            .await;
             signal.abort();
             result
         }
     }
+}
+
+async fn probe_checks(
+    engine: &Engine,
+    cancel: &CancellationToken,
+) -> Result<Vec<solascope_core::DiagnosticCheck>> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(Error::Cancelled),
+        checks = engine.probe_models() => Ok(checks),
+    }
+}
+
+fn require_healthy_probes(checks: &[solascope_core::DiagnosticCheck]) -> Result<()> {
+    if checks.iter().any(|check| check.status == "error") {
+        return Err(Error::ModelUnavailable("startup probe failed; check provider configuration or omit --probe to use permitted search fallback".into()));
+    }
+    Ok(())
+}
+
+async fn startup_probe(engine: &Engine, cancel: &CancellationToken) -> Result<()> {
+    let checks = probe_checks(engine, cancel).await?;
+    for check in &checks {
+        eprintln!("{}: {} — {}", check.name, check.status, check.detail);
+    }
+    require_healthy_probes(&checks)
 }
 
 fn interrupt_signal() -> (CancellationToken, tokio::task::JoinHandle<()>) {

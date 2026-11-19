@@ -45,12 +45,25 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Write a project configuration without overwriting an existing one.
-    Init { path: Option<PathBuf> },
+    Init {
+        path: Option<PathBuf>,
+        /// Probe models from the supplied configuration using a fixed sentence.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Create or incrementally update the project index.
     Index {
         path: Option<PathBuf>,
         #[arg(long)]
         rebuild: bool,
+        /// Keep watching after indexing (also enabled by index.watch).
+        #[arg(long, conflicts_with = "no_watch")]
+        watch: bool,
+        /// Override index.watch and exit after the initial scan.
+        #[arg(long, conflicts_with = "watch")]
+        no_watch: bool,
+        #[arg(long)]
+        probe: bool,
     },
     /// Search indexed source code.
     Search {
@@ -67,9 +80,16 @@ pub(crate) enum Command {
     /// Show index generation and model status.
     Status,
     /// Serve four read-only MCP tools over stdio.
-    Mcp,
+    Mcp {
+        #[arg(long)]
+        probe: bool,
+    },
     /// Watch source changes until interrupted.
-    Watch { path: Option<PathBuf> },
+    Watch {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        probe: bool,
+    },
     /// Read at most 200 lines / 64 KiB of project source.
     Context(ContextArgs),
     /// Diagnose configuration, storage, and optionally model services.
@@ -84,7 +104,7 @@ pub(crate) enum Command {
 impl Command {
     pub fn project_path(&self) -> Option<&Path> {
         match self {
-            Self::Init { path } | Self::Index { path, .. } | Self::Watch { path } => {
+            Self::Init { path, .. } | Self::Index { path, .. } | Self::Watch { path, .. } => {
                 path.as_deref()
             }
             _ => None,
