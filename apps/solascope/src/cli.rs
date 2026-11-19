@@ -17,7 +17,7 @@ pub(crate) struct Cli {
     /// Explicit configuration file.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
-    /// Project root (positional command paths take precedence).
+    /// Project root (defaults to the current directory; positional paths take precedence).
     #[arg(long, global = true)]
     pub root: Option<PathBuf>,
     /// Emit one JSON result; diagnostics always go to stderr.
@@ -50,8 +50,9 @@ pub(crate) enum Command {
         #[arg(long)]
         probe: bool,
     },
-    /// Create or incrementally update the project index.
+    /// Recursively index the current directory or an explicit path.
     Index {
+        /// Directory to index; defaults to the current directory.
         path: Option<PathBuf>,
         #[arg(long)]
         rebuild: bool,
@@ -83,8 +84,9 @@ pub(crate) enum Command {
         #[arg(long)]
         probe: bool,
     },
-    /// Watch source changes until interrupted.
+    /// Recursively watch source changes until interrupted.
     Watch {
+        /// Directory to watch; defaults to the current directory.
         path: Option<PathBuf>,
         #[arg(long)]
         probe: bool,

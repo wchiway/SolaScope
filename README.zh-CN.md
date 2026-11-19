@@ -50,7 +50,9 @@ sas status
 | Linux / macOS | `~/.solascope/.solascope.toml` |
 | Windows | `$USERPROFILE/.solascope/.solascope.toml` |
 
-它不会创建项目配置，也不会将用户默认值绑定到当前项目。可以直接执行 `index` 使用内置默认值，通过 `--root /path/to/project` 指定项目，或手动创建项目 `.solascope.toml` 覆盖配置。
+它不会创建项目配置，也不会将用户默认值绑定到当前项目。可以直接执行 `index` 使用内置默认值：默认递归扫描**执行命令时的当前目录及所有层级的子目录**，仍遵循忽略规则和隐私过滤。显式目录的优先级为命令位置参数、`--root`、进程环境变量 `SOLASCOPE__PROJECT__ROOT`；均未指定时使用当前目录，不自动扩大到上级 Git 根。
+
+项目 `.solascope.toml` 用于提供设置，也可以从上级目录发现或用 `--config` 指定。配置文件所在位置及 TOML / 同目录 `.env` 中的 `project.root` 都不改变扫描目录。`project.index_dir` 只指定索引数据保存位置。搜索、状态和监听使用相同的目录选择规则。
 
 开发时持续更新索引：
 
@@ -65,7 +67,7 @@ solascope index --watch
 | 命令 | 用途 |
 | --- | --- |
 | `init [--probe]` | 创建用户配置；可选探测已配置的模型 |
-| `index [path] [--rebuild] [--probe]` | 建立或增量更新索引；可选全量重建 |
+| `index [path] [--rebuild] [--probe]` | 递归索引当前目录或显式路径；可选全量重建 |
 | `index [path] --watch` | 首次索引后持续监听；`--no-watch` 覆盖 `index.watch` |
 | `search <query>` | 搜索代码，可使用向量和重排 |
 | `symbol <name> [--kind K]` | 按精确、前缀、包含或有限拼写纠错查找定义 |

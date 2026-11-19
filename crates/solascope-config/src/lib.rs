@@ -7,7 +7,9 @@
 //! `SOLASCOPE__PROJECT__EXCLUDE='["generated/**"]'`. Unknown variables in this
 //! namespace are errors. Only API-key *environment variable names* are stored.
 //! Relative file paths resolve beside their declaring TOML file; environment
-//! paths and CLI paths resolve against the process working directory.
+//! paths and CLI paths resolve against the process working directory. Source-root
+//! selection is separate: CLI root > process environment root > current directory;
+//! TOML and dotenv root settings never redirect the source root.
 use serde::{Deserialize, Serialize};
 use solascope_core::{Error, Result, SearchMode};
 use std::{
@@ -128,8 +130,9 @@ impl Config {
         Ok(config)
     }
 
-    /// Discover the nearest project configuration or repository from the current
-    /// directory, unless a CLI root or explicit configuration selects a project.
+    /// Load settings from the nearest project configuration or an explicit file.
+    /// The source root comes from the CLI, the process environment or the current
+    /// directory, never from configuration-file locations or root settings.
     pub fn load(root: Option<&Path>, config_path: Option<&Path>) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let env = std::env::vars_os()
@@ -377,7 +380,7 @@ fn absolute(path: &Path, base: &Path) -> PathBuf {
     result
 }
 
-fn discover(start: &Path) -> PathBuf {
+fn discover_config_directory(start: &Path) -> PathBuf {
     for directory in start.ancestors() {
         if directory.join(".solascope.toml").is_file() || directory.join(".git").exists() {
             return directory.to_path_buf();
@@ -485,16 +488,11 @@ fn load_with_sources(
     global: Option<&Path>,
     env: &BTreeMap<String, String>,
 ) -> Result<Config> {
-    let selected = root
-        .map(|path| absolute(path, cwd))
-        .or_else(|| {
-            config_path.map(|path| absolute(path, cwd).parent().unwrap_or(cwd).to_path_buf())
-        })
-        .or_else(|| {
-            env.get("SOLASCOPE__PROJECT__ROOT")
-                .map(|path| absolute(Path::new(path), cwd))
-        })
-        .unwrap_or_else(|| discover(cwd));
+    let explicit_root = root.map(|path| absolute(path, cwd)).or_else(|| {
+        env.get("SOLASCOPE__PROJECT__ROOT")
+            .map(|path| absolute(Path::new(path), cwd))
+    });
+    let selected = explicit_root.clone().unwrap_or_else(|| cwd.to_path_buf());
     let mut base = Config::default_for_root(&selected)?;
     let mut value =
         toml::Value::try_from(&base).map_err(|_| invalid("cannot serialize defaults"))?;
@@ -503,7 +501,11 @@ fn load_with_sources(
     let mut environment = Environment::default();
     let project = config_path
         .map(|path| absolute(path, cwd))
-        .unwrap_or_else(|| selected.join(".solascope.toml"));
+        .unwrap_or_else(|| {
+            explicit_root
+                .unwrap_or_else(|| discover_config_directory(cwd))
+                .join(".solascope.toml")
+        });
     let sources = global
         .into_iter()
         .map(|path| (path, false, true))
@@ -555,10 +557,8 @@ fn load_with_sources(
         .and_then(|v| v.get("index_dir"))
         .is_some();
     merge(&mut value, layer);
-    if let Some(root) = root {
-        value["project"]["root"] =
-            toml::Value::String(absolute(root, cwd).to_string_lossy().into_owned());
-    }
+    // Configuration files supply settings, not source-directory selection.
+    value["project"]["root"] = toml::Value::String(selected.to_string_lossy().into_owned());
     base = value.try_into().map_err(|_| {
         invalid("configuration has unknown fields or invalid field types (values redacted)")
     })?;
@@ -693,6 +693,36 @@ mod tests {
     }
 
     #[test]
+    fn configuration_file_roots_do_not_select_sources() {
+        let root = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let global = settings.path().join("config.toml");
+        fs::write(
+            &global,
+            "[project]\nroot='missing-user-source'\n[search]\nlexical_top_k=8\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[project]\nroot='missing-project-source'\n[search]\nlimit=5\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".env"),
+            "SOLASCOPE__PROJECT__ROOT=missing-dotenv-source\nSOLASCOPE__SEARCH__LIMIT=7\n",
+        )
+        .unwrap();
+        let config = load(root.path(), Some(&global), &[]).unwrap();
+        assert_eq!(config.project.root, root.path().canonicalize().unwrap());
+        assert_eq!(
+            config.project.index_dir,
+            config.project.root.join(".solascope")
+        );
+        assert_eq!(config.search.limit, 7);
+        assert_eq!(config.search.lexical_top_k, 8);
+    }
+
+    #[test]
     fn cli_root_beats_environment_and_root_moves_default_index() {
         let cwd = tempdir().unwrap();
         let cli = tempdir().unwrap();
@@ -710,20 +740,55 @@ mod tests {
     }
 
     #[test]
-    fn discovers_project_and_git_root_from_subdirectory() {
+    fn discovers_parent_configuration_without_expanding_the_source_root() {
         let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join("src/deep")).unwrap();
+        let cwd = root.path().join("src/deep");
+        fs::create_dir_all(&cwd).unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
-        let config = load(&root.path().join("src/deep"), None, &[]).unwrap();
-        assert_eq!(config.project.root, root.path());
-        fs::write(root.path().join(".solascope.toml"), "[search]\nlimit=6").unwrap();
+        let config = load(&cwd, None, &[]).unwrap();
+        assert_eq!(config.project.root, cwd.canonicalize().unwrap());
         assert_eq!(
-            load(&root.path().join("src"), None, &[])
-                .unwrap()
-                .search
-                .limit,
-            6
+            config.project.index_dir,
+            config.project.root.join(".solascope")
         );
+        let path = root.path().join(".solascope.toml");
+        fs::write(&path, "[project]\nroot='src'\n[search]\nlimit=6\n").unwrap();
+        for (selected, config_path) in [(None, None), (Some(cwd.as_path()), Some(path.as_path()))] {
+            let config =
+                load_with_sources(selected, config_path, &cwd, None, &BTreeMap::new()).unwrap();
+            assert_eq!(config.project.root, cwd.canonicalize().unwrap());
+            assert_eq!(
+                config.project.index_dir,
+                config.project.root.join(".solascope")
+            );
+            assert_eq!(config.search.limit, 6);
+        }
+    }
+
+    #[test]
+    fn explicit_roots_do_not_inherit_unrelated_parent_configuration() {
+        let root = tempdir().unwrap();
+        let selected = root.path().join("project");
+        fs::create_dir(&selected).unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[project]\nindex_dir='shared-index'\n[search]\nlimit=1\n",
+        )
+        .unwrap();
+        let env = BTreeMap::from([(
+            "SOLASCOPE__PROJECT__ROOT".into(),
+            selected.to_string_lossy().into_owned(),
+        )]);
+        for (cli_root, environment) in [(Some(selected.as_path()), BTreeMap::new()), (None, env)] {
+            let config =
+                load_with_sources(cli_root, None, root.path(), None, &environment).unwrap();
+            assert_eq!(config.project.root, selected.canonicalize().unwrap());
+            assert_eq!(
+                config.project.index_dir,
+                config.project.root.join(".solascope")
+            );
+            assert_eq!(config.search.limit, Config::default().search.limit);
+        }
     }
 
     #[test]
@@ -790,10 +855,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_config_paths_and_environment_root_select_the_project() {
+    fn explicit_config_paths_preserve_cwd_and_environment_roots_remain_explicit() {
         let cwd = tempdir().unwrap();
         let project = tempdir().unwrap();
-        fs::create_dir(project.path().join("source")).unwrap();
+
         fs::write(
             project.path().join("custom.toml"),
             "[project]\nroot='source'\nindex_dir='index'\n",
@@ -807,7 +872,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(config.project.root, project.path().join("source"));
+        assert_eq!(config.project.root, cwd.path().canonicalize().unwrap());
         assert_eq!(config.project.index_dir, project.path().join("index"));
         assert!(load_with_sources(
             None,

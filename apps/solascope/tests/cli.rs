@@ -291,6 +291,139 @@ fn positional_index_path_takes_precedence_over_root() {
 }
 
 #[test]
+fn default_index_recursively_scans_cwd_instead_of_toml_root() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = fixture();
+        std::fs::create_dir(root.path().join("configured")).unwrap();
+        std::fs::create_dir_all(root.path().join("nested/level2")).unwrap();
+        std::fs::write(
+            root.path().join(".solascope.toml"),
+            "[project]\nroot='configured'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("configured/configured.rs"),
+            "pub fn configured_fixture_symbol() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("nested/level2/deep.rs"),
+            "pub fn recursive_nested_symbol() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("nested/notes.txt"),
+            "recursive plain text fixture\n",
+        )
+        .unwrap();
+        let report = json_ok(
+            command(binary, root.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["index", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(report["files_total"], 4);
+        let symbols = json_ok(
+            command(binary, root.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["symbol", "recursive_nested_symbol", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            symbols["results"][0]["relative_path"],
+            "nested/level2/deep.rs"
+        );
+    }
+}
+
+#[test]
+fn default_index_keeps_cwd_while_loading_parent_configuration() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = fixture();
+        let cwd = root.path().join("src/deep");
+        std::fs::create_dir_all(cwd.join("nested/level2")).unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(
+            root.path().join(".solascope.toml"),
+            "[project]\nroot='.'\n[search]\nlimit=1\n",
+        )
+        .unwrap();
+        for path in ["local.rs", "nested/level2/deep.rs"] {
+            std::fs::write(cwd.join(path), "pub fn inherited_config_symbol() {}\n").unwrap();
+        }
+        let report = json_ok(
+            command(binary, &cwd)
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["index", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(report["files_total"], 2);
+        assert!(cwd.join(".solascope").is_dir());
+        assert!(!root.path().join(".solascope").exists());
+        let symbols = json_ok(
+            command(binary, &cwd)
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["symbol", "inherited_config_symbol", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(symbols["results"].as_array().unwrap().len(), 1);
+        let status = json_ok(
+            command(binary, &cwd)
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["status", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            status["root"],
+            cwd.canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+}
+
+#[test]
+fn default_index_uses_external_configuration_without_changing_cwd() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = fixture();
+        let settings = tempfile::tempdir().unwrap();
+        let config = settings.path().join("custom.toml");
+        std::fs::write(
+            &config,
+            "[project]\nroot='missing-source-directory'\n[search]\nlimit=1\n",
+        )
+        .unwrap();
+        let report = json_ok(
+            command(binary, root.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["index", "--config", config.to_str().unwrap(), "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(report["files_total"], 1);
+        assert!(root.path().join(".solascope").is_dir());
+        assert!(!settings.path().join(".solascope").exists());
+        let symbols = json_ok(
+            command(binary, root.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args([
+                    "symbol",
+                    "sparkling_fixture_symbol",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(symbols["results"][0]["relative_path"], "fixture.rs");
+    }
+}
+
+#[test]
 fn invalid_arguments_are_stderr_only_and_use_core_input_exit_code() {
     let root = fixture();
     let excessive = "x".repeat(4097);

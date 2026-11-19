@@ -7,7 +7,7 @@ Configuration sources apply in this order, from highest to lowest priority:
 1. Command-line options and arguments, including the positional path, `--root`, `--config`, `--limit`, and `--mode`.
 2. Existing process environment variables named `SOLASCOPE__<SECTION>__<FIELD>`.
 3. The `.env` file beside the project configuration, or beside the file selected by `--config`.
-4. Project configuration at `<project-root>/.solascope.toml`, or the file selected by `--config`.
+4. Project configuration: `.solascope.toml` in an explicitly selected source directory; otherwise the nearest configuration found from the current directory upward, stopping at a Git root. `--config` selects a specific file.
 5. The `.env` file beside the user configuration.
 6. User configuration: `~/.solascope/.solascope.toml` on Linux/macOS, or `$USERPROFILE/.solascope/.solascope.toml` on Windows.
 7. Built-in defaults.
@@ -17,6 +17,16 @@ Configuration sources apply in this order, from highest to lowest priority:
 If the new user configuration does not exist, SolaScope reads the legacy `<system-config-directory>/solascope/config.toml` for compatibility. It does not move or rewrite that file, or merge the new and legacy user configurations.
 
 Unknown fields and unknown `SOLASCOPE__*` variables are rejected to catch typos. Relative paths declared in TOML and `.env` files are resolved from the directory containing each file. Relative paths in process environment variables and command-line arguments are resolved from the current working directory. `log.output = "stderr"` names a stream and is not resolved as a file path.
+
+### Source directory and configuration location
+
+Directory selection is separate from configuration precedence: the positional path (`index [path]` / `watch [path]`) takes precedence over `--root`, then the process environment variable `SOLASCOPE__PROJECT__ROOT`, then the current working directory. By default, `index` recursively scans the current directory and all levels of subdirectories without expanding to a parent Git root. Ignore rules, file-size limits, and privacy filters still apply.
+
+When no source directory is explicitly selected, a parent configuration can supply settings. A positional path, `--root`, or process environment root limits automatic project configuration loading to that directory; unrelated parent configurations are not inherited. Use `--config` to load settings from another directory.
+
+A `project.root` value in TOML or a sibling `.env` does not change the source directory; the field remains readable for compatibility with existing configurations. `--config /other/settings.toml` loads that file and its sibling `.env` without indexing `/other`. Loading a parent configuration likewise does not expand the scan. Search, status, watch, and MCP use the same directory selection rules; pass `--root` explicitly to access a parent project's index.
+
+Unless `project.index_dir` is explicitly configured, index data is stored in `.solascope/` under the selected source directory. That field controls index storage, not the source directory. Explicit relative paths still resolve beside the TOML or `.env` file that declares them.
 
 ### Environment variable syntax
 
@@ -61,8 +71,8 @@ Each CLI invocation reloads these files. Restart MCP/watch services after changi
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `root` | `.` | Project root directory |
-| `index_dir` | `.solascope` | Index directory; must not be the project root or an ancestor of it |
+| `root` | `.` | Runtime source root; TOML / `.env` values do not select the directory. Use a positional path, `--root`, or a process environment variable |
+| `index_dir` | `.solascope` | Index storage directory, not the scan scope; must not be the project root or an ancestor of it |
 | `include` | `[]` | When nonempty, index only files matching these globs |
 | `exclude` | `[]` | Additional exclusion globs |
 | `max_file_size` | `1048576` | Skip files larger than this number of bytes |

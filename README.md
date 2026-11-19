@@ -50,7 +50,9 @@ sas status
 | Linux / macOS | `~/.solascope/.solascope.toml` |
 | Windows | `$USERPROFILE/.solascope/.solascope.toml` |
 
-It does not create a project configuration or bind the user defaults to the current repository. You can also run `index` directly with the built-in defaults. Use `--root /path/to/project` to select a repository explicitly, or create a project `.solascope.toml` for overrides.
+It does not create a project configuration or bind the user defaults to the current repository. You can run `index` directly with the built-in defaults: it recursively scans the **current working directory and all levels of subdirectories**, subject to ignore rules and privacy filters. An explicit positional path takes precedence over `--root`, followed by the process environment variable `SOLASCOPE__PROJECT__ROOT`; otherwise the current directory is used without expanding to a parent Git root.
+
+A project `.solascope.toml` can supply settings, including one discovered in a parent directory or selected with `--config`. Its location and any `project.root` value in TOML or a sibling `.env` do not select the source directory. `project.index_dir` controls only where index data is stored. Search, status, and watch use the same directory selection rules.
 
 Keep the index up to date while editing:
 
@@ -65,7 +67,7 @@ Results identify a relative path, a 1-based line range, a symbol when available,
 | Command | Purpose |
 | --- | --- |
 | `init [--probe]` | Create user defaults; optionally probe the configured models |
-| `index [path] [--rebuild] [--probe]` | Create or update an index; rebuild all chunks when requested |
+| `index [path] [--rebuild] [--probe]` | Recursively index the current directory or an explicit path; rebuild all chunks when requested |
 | `index [path] --watch` | Index once, then watch for changes; `--no-watch` overrides `index.watch` |
 | `search <query>` | Search code with optional embeddings and reranking |
 | `symbol <name> [--kind K]` | Find definitions by exact, prefix, substring, or limited fuzzy matching |
