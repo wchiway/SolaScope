@@ -14,6 +14,12 @@ SolaScope 无需模型即可运行。默认使用 SQLite FTS5 和符号检索，
 
 当前版本：**0.1.0**。已验证范围见[支持与限制](docs/implementation-status.md)。详细文档使用英文。
 
+## 架构概览
+
+![Hand-drawn overview: CLI and read-only MCP share an Engine that scans repository source, reads and writes a local SQLite index, and optionally calls embedding and reranking models.](docs/assets/solascope-overview.png)
+
+CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模型适配器按需启用。图中标注为英文，索引发布、缓存和一致性细节见[架构文档](docs/architecture.md)。
+
 ## 安装
 
 在本地源码目录安装两个 CLI 入口：
@@ -86,6 +92,12 @@ solascope index --watch
 各检索模式均可独立启用重排。使用 `--json` 时，stdout 只输出一个 JSON 结果；警告和错误写 stderr，进度遵循日志配置。监听模式只将首次索引报告写到 stdout。
 
 退出码：`0` 成功，`1` 内部、存储或 I/O 错误，`2` 参数或配置错误，`3` 索引缺失或过旧，`4` 模型失败或不兼容，`5` 写入者锁冲突，`130` 中断。
+
+## 检索流程
+
+![Hand-drawn query flow: query, mode-specific retrieval, RRF fusion, source checks, optional reranking, another source check, and deduplicated file, symbol, and line results.](docs/assets/solascope-search-flow.png)
+
+检索模式决定启用哪些召回通道。源码检查会过滤被禁止的路径并标记过期代码，在重排后再次执行；重排只使用非过期候选，最终结果按实体去重。图中标注为英文，细节见[检索流水线](docs/architecture.md#search-pipeline)。
 
 ## 模型与配置
 

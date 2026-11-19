@@ -14,6 +14,12 @@ SolaScope works without a model. SQLite FTS5 and symbol lookup provide the defau
 
 Current version: **0.1.0**. See [support and limitations](docs/implementation-status.md) for the tested scope.
 
+## Architecture at a glance
+
+![Hand-drawn overview: CLI and read-only MCP share an Engine that scans repository source, reads and writes a local SQLite index, and optionally calls embedding and reranking models.](docs/assets/solascope-overview.png)
+
+The CLI and MCP server share one engine and index. Indexing scans and parses source locally; model adapters are optional. See the [architecture](docs/architecture.md) for publication, caching, and consistency details.
+
 ## Install
 
 Install both CLI entry points from a local checkout:
@@ -86,6 +92,12 @@ Common options include `--root`, `--config`, `--json`, `--limit` (1–100), `--m
 Reranking can be enabled independently of the retrieval mode. With `--json`, stdout contains one JSON result; warnings and errors go to stderr, and progress follows the log configuration. In watch mode, only the initial indexing report is written to stdout.
 
 Exit codes: `0` success, `1` internal/storage/I/O error, `2` invalid input or configuration, `3` missing or outdated index, `4` model failure or incompatibility, `5` writer lock conflict, and `130` interruption.
+
+## How search works
+
+![Hand-drawn query flow: query, mode-specific retrieval, RRF fusion, source checks, optional reranking, another source check, and deduplicated file, symbol, and line results.](docs/assets/solascope-search-flow.png)
+
+The selected mode determines which retrieval channels run. Source checks filter blocked paths and mark stale code before reranking, then run again afterward. Reranking uses non-stale candidates, and final results are deduplicated by entity. See the [search pipeline](docs/architecture.md#search-pipeline).
 
 ## Models and configuration
 
