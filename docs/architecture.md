@@ -54,7 +54,7 @@ Rust、Python、JavaScript/JSX、TypeScript/TSX、Go 使用 Tree-sitter 定义�
 | 路径无关复用键 | 模板版本、语言、符号、签名和正文哈希；识别只改变文件路径的代码 |
 | 查询缓存键 | 指纹加裁去两端空白的查询哈希；进程内 TTL 5 分钟，容量上限 128 |
 
-函数在同一文件内移动而完整输入不变时精确复用。文件移动/重命名会改变路径和完整输入，但可复用相同代码的旧路径向量。数据库将后者标为 `exact = false`，状态计入 `relocated_vectors`，属于近似复用。
+函数在同一文件内移动而完整输入不变时精确复用。文件移动/重命名会改变路径和完整输入，但可复用相同代码的旧路径向量。数据库将这种近似复用标为 `exact = false`，状态计入 `relocated_vectors`。
 
 `index --rebuild` 只复用精确缓存，重新计算路径近似复用向量；精确结果可以替换近似结果，反向覆盖被禁止。Reranker 更换不影响向量索引。密钥、并发、超时等不进入模型指纹。
 
@@ -113,8 +113,6 @@ SQLite 使用 WAL、外键和单写入者锁。表包括 `projects`、`files`、
 - 配置密钥值始终脱敏，默认也隐藏一般 Bearer token；详细级别默认只开启 SolaScope 模块，避免隐式打印协议正文。显式 `RUST_LOG` 需谨慎使用。
 - `--probe` 和 `doctor --models` 用固定句子探测配置模型，不发送源文件；MCP 探测信息只写 stderr。未显式请求时不进行启动推理探测。
 
-## 当前取舍与验证
+## 测试与限制
 
-当前有可运行的默认无模型 CLI/MCP、模拟协议测试、质量/性能工具和三平台 CI/ZIP 打包配置。模拟响应验证请求契约、映射、错误与降级，不能证明真实语义检索或重排收益。
-
-真实云端/Ollama 服务、本地 ONNX 模型、macOS/Windows 和远程 GitHub runner 尚未实际验证；未发布远程 release。完整里程碑边界见[实施与验证状态](implementation-status.md)，评测方法见[benchmarks/README.md](../benchmarks/README.md)。
+HTTP 协议测试使用本地模拟服务，覆盖请求格式、结果映射、错误处理和降级。真实模型、ONNX 推理与跨平台运行仍待实测，详见[支持范围](implementation-status.md)。评测方法见 [benchmarks/README.md](../benchmarks/README.md)。

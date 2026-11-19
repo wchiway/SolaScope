@@ -69,7 +69,7 @@ solascope mcp --root /abs/path/to/project --probe
 | `path_filter` | string | 项目相对路径前缀或 glob |
 | `limit` | integer | 1–100 |
 
-匹配优先级为精确、前缀、包含、有限拼写纠错。模糊结果的 `match_sources` 为 `fuzzy`；混合搜索不使用这些模糊符号候选。该工具不调用 Embedding 或 Reranker。
+匹配优先级为精确、前缀、包含、有限拼写纠错。拼写纠错结果的 `match_sources` 为 `fuzzy`，仅用于此工具。该工具不调用 Embedding 或 Reranker。
 
 ### get_code_context
 
@@ -152,4 +152,4 @@ solascope mcp --root /abs/path/to/project --probe
 
 参数类型不符或包含未知字段时，同样返回 `isError: true`，错误说明在 `content` 的文本中。API Key 和完整远程错误正文不会作为工具错误回显。
 
-`doctor` 是 CLI 诊断命令，不是写入性 MCP 工具。MCP 没有 `reindex_project`、跨项目根切换或引用/调用图工具；这些不是当前首版接口。实际验证边界见[实施与验证状态](implementation-status.md)。
+索引维护和诊断通过 CLI 的 `index`、`watch`、`doctor` 完成。MCP 每个实例固定服务一个项目，提供上述四个工具。测试与限制见[支持范围](implementation-status.md)。

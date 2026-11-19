@@ -150,7 +150,7 @@ solascope index --rebuild
 | `siliconflow` | `/v1/rerank` | 通用平铺格式和顶层 `results` |
 | `fastembed` | 不使用 HTTP | 进程内 ONNX 交叉编码器，需 `local-rerank` 构建特性 |
 
-`openai` 用于采用上述兼容 HTTP 格式的重排服务，具体协议以供应商文档为准。服务使用复数路径时，直接配置以 `/reranks` 结尾的完整 URL。原生 DashScope 与兼容模式的响应容器不能混用。当前仅支持文本文档，不支持多模态 Rerank 输入。
+`openai` 用于采用上述兼容 HTTP 格式的重排服务，具体协议以供应商文档为准。服务使用复数路径时，直接配置以 `/reranks` 结尾的完整 URL。原生 DashScope 与兼容模式使用不同的响应结构，应选择对应 provider。当前只接受文本文档。
 
 程序保留候选的原始索引和 ID，拒绝重复、越界或非有限评分。候选数和字符数受配置及 provider 上限共同限制；本地模型还在推理前验证完整查询/文档对不超过 512 tokens。字符预算不能保证任意 tokenizer 的 token 上限。超时后正在运行的 ONNX 调用不能被强制抢占，但并发许可持续占用，避免无限排队。
 

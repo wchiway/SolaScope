@@ -141,20 +141,11 @@ cargo run --release -p solascope-bench -- perf \
 
 ## 验证状态
 
-在 Linux x86_64上已验证：
+Linux x86_64 上运行了工作区测试、Clippy、格式检查和 CLI 端到端验证，包括 `local-rerank` 特性。CLI 发布构建和本地安装已验证。
 
-- 全工作区单元与端到端测试通过，覆盖配置优先级、隐私过滤、五语言注释/成员/语法分块、schema 迁移、增量与移动缓存、模型隔离、降级、并发读写、监听、日志、启动探测、CLI 双入口，以及原生 JSON-RPC 和 rmcp 两类 MCP 客户端。
-- `cargo clippy --workspace --all-targets -- -D warnings`、格式检查，以及带 `local-rerank` 特性的测试通过；测试不下载模型或调用真实供应商。
-- 当前调试版 CLI 与基准工具已实际运行：双入口、查询、纠错、上下文、诊断、stale 与增量刷新通过；三种规模的语料完成评测。18 条 fixture 查询的 Top1 / Recall@5 / MRR@10 均为 1.000，不能代表通用语义质量。
-- 三平台 CI 和 ZIP 打包工作流的 YAML、内嵌 Python、shell 检查及文档示例/链接检查通过，但未在远程 GitHub runner 上执行。实测记录见 [docs/benchmarks.md](docs/benchmarks.md)，里程碑边界见 [docs/implementation-status.md](docs/implementation-status.md)。
+模型协议测试使用本地模拟服务。真实模型质量、本地 ONNX 推理、macOS/Windows 和商业 MCP 客户端尚未实测。三平台 CI 与 ZIP 打包工作流已配置，远程 runner 和发行包仍需验证。
 
-尚未验证：
-
-- **CLI 与 ZIP**：CLI 发布构建和本地安装已验证；ZIP 与远程发布仍待验证。
-- **真实模型服务**：Ollama、通用/OpenAI 兼容、DashScope 和硅基流动仅使用本地模拟 HTTP 服务验证协议与错误处理，没有真实服务或语义质量数据。
-- **本地 ONNX 重排**：特性编译及自动化测试通过，没有用真实模型推理。
-- **macOS 与 Windows**：未构建、未运行。
-- **商业 MCP 客户端**：只用测试内的两种客户端验证过协议。
+测试范围见[支持范围](docs/implementation-status.md)，性能测量见[基准数据](docs/benchmarks.md)。
 
 ## 开发
 
