@@ -10,6 +10,8 @@ serde.workspace = true
 toml.workspace = true
 dirs.workspace = true
 globset.workspace = true
+cap-std.workspace = true
+dotenvy = "0.15.7"
 url = "2"
 
 [dev-dependencies]

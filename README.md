@@ -24,7 +24,7 @@ cargo install --path apps/solascope --locked   # 或安装到 ~/.cargo/bin
 
 ```bash
 cd your-project
-solascope init                    # 生成 .solascope.toml（已存在则不覆盖）
+solascope init                    # 创建用户目录 ~/.solascope/.solascope.toml，不覆盖已有文件
 solascope index                   # 首次建立索引，之后再次运行即增量更新
 sas search "reserve stock for an order"
 sas symbol readSession
@@ -39,13 +39,15 @@ inventory.go:13:20  Inventory.Reserve  0.0164
 func (inventory *Inventory) Reserve(sku string, quantity int) error {
 ```
 
-不执行 `init` 也可以直接 `index`，此时使用默认配置。项目根按以下顺序确定：命令的位置参数路径 > `--root` > `SOLASCOPE__PROJECT__ROOT` > 从当前目录向上找到的 `.solascope.toml` 或 `.git`。
+用户配置位置：Linux/macOS 为 `~/.solascope/.solascope.toml`，Windows 为 `$USERPROFILE/.solascope/.solascope.toml`。同目录的 `.env` 可保存 `DASHSCOPE_API_KEY`、`SILICONFLOW_API_KEY` 等凭据，无须单独 export；已有进程环境变量优先。`.env` 不被索引、读取为代码上下文或输出到日志。
+
+`init` 不写项目配置，也不绑定当前项目。项目配置仍可手动创建或用 `--config` 指定。没有任何配置时也可以直接 `index`，使用默认值；项目根由命令位置参数、`--root`、`SOLASCOPE__PROJECT__ROOT` 和当前目录的项目标记确定。
 
 ## 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `init [path] [--probe]` | 写入默认配置，不覆盖已有文件；`--probe` 检查传入配置的模型 |
+| `init [--probe]` | 在用户目录 `.solascope/` 创建 `.solascope.toml`，不覆盖；`--probe` 检查传入配置的模型 |
 | `index [path] [--rebuild] [--probe]` | 建立或增量更新索引；`--rebuild` 全量重建并生成新的索引代际 |
 | `index [path] --watch` | 首次扫描后持续监听；`--no-watch` 可覆盖 `index.watch = true` |
 | `search <query>` | 混合搜索，JSON 结果另含各阶段耗时 |
@@ -148,7 +150,7 @@ cargo run --release -p solascope-bench -- perf \
 
 尚未验证：
 
-- **CLI 与 ZIP**：当前发布构建及 ZIP 运行验证尚未完成。
+- **CLI 与 ZIP**：CLI 发布构建和本地安装已验证；ZIP 与远程发布仍待验证。
 - **真实模型服务**：Ollama、通用/OpenAI 兼容、DashScope 和硅基流动仅使用本地模拟 HTTP 服务验证协议与错误处理，没有真实服务或语义质量数据。
 - **本地 ONNX 重排**：特性编译及自动化测试通过，没有用真实模型推理。
 - **macOS 与 Windows**：未构建、未运行。

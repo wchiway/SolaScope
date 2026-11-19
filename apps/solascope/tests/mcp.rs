@@ -16,7 +16,9 @@ fn command(root: &Path) -> Command {
     let mut command = Command::new(BINARY);
     command
         .current_dir(root)
-        .env("XDG_CONFIG_HOME", root.join("user-config"));
+        .env("XDG_CONFIG_HOME", root.join("user-config"))
+        .env("HOME", root.join("user-home"))
+        .env("USERPROFILE", root.join("user-home"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("SOLASCOPE_") {
             command.env_remove(key);

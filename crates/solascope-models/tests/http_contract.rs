@@ -49,6 +49,7 @@ fn rerank(server: &MockServer) -> RerankConfig {
         max_input_chars: 1024,
         cache_dir: None,
         allow_model_download: false,
+        environment: Default::default(),
     }
 }
 

@@ -24,6 +24,8 @@ fn command(root: &Path) -> Command {
     command
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("user-config"))
+        .env("HOME", root.join("user-home"))
+        .env("USERPROFILE", root.join("user-home"))
         .env_remove("RUST_LOG");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("SOLASCOPE_") {
@@ -131,8 +133,10 @@ async fn startup_probe_checks_supplied_models_and_doctor_reports_failures() {
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["input"], json!(["SolaScope capability probe"]));
     assert!(!requests[0].headers.contains_key("authorization"));
-    // The generated project config still defaults to models disabled.
-    let created = std::fs::read_to_string(root.path().join(".solascope.toml")).unwrap();
+    // The generated user config still defaults to models disabled.
+    assert!(!root.path().join(".solascope.toml").exists());
+    let created =
+        std::fs::read_to_string(root.path().join("user-home/.solascope/.solascope.toml")).unwrap();
     assert!(created.contains("provider = \"disabled\""));
     server.reset().await;
     Mock::given(method("POST"))
@@ -248,4 +252,67 @@ async fn mcp_startup_probe_never_pollutes_stdout() {
     assert!(closed.status.success());
     assert!(closed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&closed.stderr).contains("embedding: ok"));
+}
+
+#[tokio::test]
+async fn cloud_credentials_are_read_from_dotenv_beside_the_explicit_config() {
+    let root = fixture();
+    let settings = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let config = settings.path().join("cloud.toml");
+    let embedding_key = "mock-dotenv-embedding";
+    let rerank_key = "mock-dotenv-rerank";
+    std::fs::write(&config, format!(
+        "[privacy]\nremote_opt_in=true\n[embedding]\nprovider='dashscope'\nmodel='text-embedding-v4'\nendpoint='{}'\ndimensions=2\napi_key_env='SOLASCOPE_DOTENV_EMBED_ONLY_KEY'\n[rerank]\nprovider='siliconflow'\nmodel='BAAI/bge-reranker-v2-m3'\nendpoint='{}'\napi_key_env='SOLASCOPE_DOTENV_RERANK_ONLY_KEY'\ntop_n=2\n",
+        server.uri(), server.uri(),
+    )).unwrap();
+    std::fs::write(settings.path().join(".env"), format!(
+        "SOLASCOPE_DOTENV_EMBED_ONLY_KEY={embedding_key}\nSOLASCOPE_DOTENV_RERANK_ONLY_KEY={rerank_key}\n"
+    )).unwrap();
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/services/embeddings/text-embedding/text-embedding",
+        ))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {embedding_key}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "output": {"embeddings": [{"text_index": 0, "embedding": [1.0, 0.25]}]}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {rerank_key}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [
+            {"index": 0, "relevance_score": 0.8}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut doctor = command(root.path());
+    doctor
+        .args(["doctor", "--models", "--json", "--config"])
+        .arg(&config);
+    let report = output(doctor).await;
+    assert!(
+        report.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    assert_eq!(success(&report)["healthy"], true);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    assert!(!rendered.contains(embedding_key));
+    assert!(!rendered.contains(rerank_key));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

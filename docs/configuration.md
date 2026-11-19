@@ -5,12 +5,18 @@
 从高到低：
 
 1. 命令行：位置参数路径、`--root`、`--config`、`--limit`、`--mode` 等。
-2. 环境变量 `SOLASCOPE__<分组>__<字段>`。
-3. 项目配置 `<项目根>/.solascope.toml`（或 `--config` 指定的文件）。
-4. 用户全局配置 `<系统配置目录>/solascope/config.toml`（Linux 为 `~/.config/solascope/config.toml`）。
-5. 内置默认值。
+2. 已有进程环境变量 `SOLASCOPE__<分组>__<字段>`。
+3. 项目配置（或 `--config` 指定的配置）同目录的 `.env`。
+4. 项目配置 `<项目根>/.solascope.toml`（或 `--config` 指定的文件）。
+5. 用户全局配置同目录的 `.env`。
+6. 用户全局配置：Linux/macOS 为 `~/.solascope/.solascope.toml`，Windows 为 `$USERPROFILE/.solascope/.solascope.toml`。
+7. 内置默认值。
 
-未知字段和未知的 `SOLASCOPE__*` 变量会被拒绝，避免拼写错误被静默忽略。配置文件里的相对路径相对该文件所在目录解析；环境变量和命令行里的相对路径相对当前工作目录解析。`log.output = "stderr"` 是流名称，不按文件路径解析。
+`solascope init` / `sas init` 只创建上述用户配置，不在项目目录写入文件，不覆盖已有配置。生成的用户配置不设置 `project.root` 或 `project.index_dir`，所以索引和搜索仍按当前项目或 `--root` 工作。项目配置是可选的高级覆盖；`init` 不再接受项目路径位置参数。
+
+新用户配置不存在时，兼容读取旧的 `<系统配置目录>/solascope/config.toml`；不会自动移动、改写旧文件，也不会同时叠加新旧两份用户配置。
+
+未知字段和未知的 `SOLASCOPE__*` 变量会被拒绝，避免拼写错误被静默忽略。TOML 和 `.env` 中声明的相对路径相对各自文件所在目录解析；进程环境变量和命令行里的相对路径相对当前工作目录解析。`log.output = "stderr"` 是流名称，不按文件路径解析。
 
 ### 环境变量写法
 
@@ -22,9 +28,34 @@ export SOLASCOPE__SEARCH__LIMIT=20
 export SOLASCOPE__PROJECT__EXCLUDE='["generated/**"]'
 ```
 
+### 同目录 `.env`
+
+用户级配置可采用以下布局：
+
+```text
+~/.solascope/
+├── .solascope.toml
+└── .env
+```
+
+Windows 的基础目录是 `$USERPROFILE/.solascope/`。例如 `.env` 中只写凭据：
+
+```dotenv
+DASHSCOPE_API_KEY=replace-with-your-bailian-key
+SILICONFLOW_API_KEY=replace-with-your-siliconflow-key
+```
+
+TOML 仍使用 `api_key_env = "DASHSCOPE_API_KEY"` 等变量名，不需要再 `export` 同名变量。已有进程变量优先，包括显式设置为空的值；项目配置同目录的凭据可覆盖用户目录的同名凭据。`SOLASCOPE__...` 变量也可以写在 `.env` 中，按上面的优先级覆盖 TOML 字段。
+
+支持空行、注释、`export NAME=VALUE`、单/双引号和多行值；同文件重名变量最后一项生效，不执行 shell 命令。仅加载实际配置对应目录的 `.env`，不会沿父目录搜索，也不会把无项目配置的工作目录 `.env` 当作全局配置。加载采用配置实例隔离，不修改整个进程的环境变量。
+
+`.env` 必须是 UTF-8 普通文件，最多 64 KiB，拒绝符号链接；不存在时不报错，语法错误不会回显密钥内容。文件、密钥值不会进入配置序列化、模型指纹或诊断日志，仍禁止索引和 `context` 读取。Linux/macOS 建议设置 `chmod 600 ~/.solascope/.env`，不要提交或分享该文件。
+
+每次 CLI 启动重新读取；修改 `.env` 后应重启 MCP/watch 服务。只轮换密钥不需要重建索引；改变 Embedding 模型、维度或地址仍需重建。
+
 ## 字段
 
-`solascope init` 生成的 `.solascope.toml` 包含全部字段及默认值。默认 Embedding 和 Reranker 均禁用，不需要模型服务，也不传输源码。
+`solascope init` 生成用户默认配置，省略需要按项目确定的 `project.root` / `project.index_dir`。默认 Embedding 和 Reranker 均禁用，不需要模型服务，也不传输源码。
 
 ### project
 
@@ -308,7 +339,7 @@ cache_dir = "/path/to/reranker-bundle"
 
 `init --probe`、`index --probe`、`watch --probe`、`mcp --probe` 和 `doctor --models` 只使用固定测试句子，不读取源码作为探测输入，但仍会调用已配置模型并可能产生费用。默认启动不隐式探测、下载模型或触发重建。
 
-`init --probe --config FILE` 检查传入配置的模型，但生成的项目配置仍是模型禁用的默认配置。`mcp --probe` 的探测信息只写 stderr。
+`init --probe --config FILE` 检查传入配置的模型，生成的用户配置仍使用模型禁用的默认值。`mcp --probe` 的探测信息只写 stderr。
 
 `doctor` 报告配置、数据库和模型检查；缺失/待升级索引为 warning，检测到数据库错误返回退出码 1，模型错误返回 4。普通只读查询遇到旧 schema 或分块规则返回 3。`doctor --prune-cache` 需要写入者锁，只删除未引用的缓存条目。
 

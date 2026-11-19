@@ -13,7 +13,9 @@ fn command(binary: &str, root: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .current_dir(root)
-        .env("XDG_CONFIG_HOME", root.join("user-config"));
+        .env("XDG_CONFIG_HOME", root.join("user-config"))
+        .env("HOME", root.join("user-home"))
+        .env("USERPROFILE", root.join("user-home"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("SOLASCOPE_") {
             command.env_remove(key);
@@ -79,7 +81,19 @@ fn init_json_reports_path_and_does_not_overwrite() {
             .unwrap(),
     );
     let config = value["config_path"].as_str().unwrap();
+    assert_eq!(
+        Path::new(config),
+        root.path()
+            .join("user-home/.solascope/.solascope.toml")
+            .canonicalize()
+            .unwrap()
+    );
+    assert!(!root.path().join(".solascope.toml").exists());
     let original = std::fs::read(config).unwrap();
+    assert!(!std::str::from_utf8(&original)
+        .unwrap()
+        .lines()
+        .any(|line| line.starts_with("root = ") || line.starts_with("index_dir = ")));
     let second = command(SOLASCOPE, root.path())
         .args(["init", "--json"])
         .output()
@@ -87,6 +101,63 @@ fn init_json_reports_path_and_does_not_overwrite() {
     assert!(!second.status.success());
     assert!(second.stdout.is_empty());
     assert_eq!(std::fs::read(config).unwrap(), original);
+}
+
+#[test]
+fn user_initialization_is_shared_but_index_roots_remain_project_specific() {
+    let home = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for (root, name) in [
+        (first.path(), "first_project"),
+        (second.path(), "second_project"),
+    ] {
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("lib.rs"), format!("fn {name}() {{}}\n")).unwrap();
+    }
+    let initialized = json_ok(
+        command(SAS, first.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .args(["init", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let expected = home
+        .path()
+        .join(".solascope/.solascope.toml")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        Path::new(initialized["config_path"].as_str().unwrap()),
+        expected
+    );
+    for (root, name) in [
+        (first.path(), "first_project"),
+        (second.path(), "second_project"),
+    ] {
+        let indexed = json_ok(
+            command(SOLASCOPE, root)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["index", "--no-watch", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(indexed["files_total"], 1);
+        let found = json_ok(
+            command(SAS, root)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env_remove("SOLASCOPE__PROJECT__ROOT")
+                .args(["symbol", name, "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(found["results"][0]["symbol"], name);
+        assert!(!root.join(".solascope.toml").exists());
+    }
 }
 
 #[test]

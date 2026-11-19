@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cap_std::fs::{Dir, OpenOptions};
-use solascope_config::Config;
+use solascope_config::{Config, Environment};
 use solascope_core::{Error, Result};
 use tracing_subscriber::fmt::writer::MakeWriter;
 
@@ -59,7 +59,7 @@ enum Destination {
 #[derive(Clone)]
 struct LogWriter {
     destination: Destination,
-    key_names: Arc<Vec<String>>,
+    key_sources: Arc<Vec<(String, Environment)>>,
     redact_bearer: bool,
 }
 
@@ -72,11 +72,17 @@ impl LogWriter {
         };
         Ok(Self {
             destination,
-            // Store names, not secrets. Resolve the values for each event so
-            // rotated credentials are not accidentally recorded.
-            key_names: Arc::new(vec![
-                config.embedding.api_key_env.clone(),
-                config.rerank.api_key_env.clone(),
+            // Share isolated file defaults and resolve live process values per
+            // event, so both dotenv credentials and rotated keys are protected.
+            key_sources: Arc::new(vec![
+                (
+                    config.embedding.api_key_env.clone(),
+                    config.embedding.environment.clone(),
+                ),
+                (
+                    config.rerank.api_key_env.clone(),
+                    config.rerank.environment.clone(),
+                ),
             ]),
             redact_bearer: config.log.redact_secrets,
         })
@@ -89,8 +95,8 @@ impl<'a> MakeWriter<'a> for LogWriter {
     fn make_writer(&'a self) -> Self::Writer {
         LogEntry {
             destination: self.destination.clone(),
-            key_names: self.key_names.clone(),
-            known_values: secret_values(&self.key_names),
+            key_sources: self.key_sources.clone(),
+            known_values: secret_values(&self.key_sources),
             redact_bearer: self.redact_bearer,
             bytes: Vec::new(),
         }
@@ -99,7 +105,7 @@ impl<'a> MakeWriter<'a> for LogWriter {
 
 struct LogEntry {
     destination: Destination,
-    key_names: Arc<Vec<String>>,
+    key_sources: Arc<Vec<(String, Environment)>>,
     known_values: Vec<String>,
     redact_bearer: bool,
     bytes: Vec<u8>,
@@ -115,7 +121,7 @@ impl Write for LogEntry {
         if self.bytes.is_empty() {
             return Ok(());
         }
-        self.known_values.extend(secret_values(&self.key_names));
+        self.known_values.extend(secret_values(&self.key_sources));
         let rendered = scrub(
             &String::from_utf8_lossy(&self.bytes),
             &self.known_values,
@@ -143,11 +149,10 @@ impl Drop for LogEntry {
     }
 }
 
-fn secret_values(names: &[String]) -> Vec<String> {
-    names
+fn secret_values(sources: &[(String, Environment)]) -> Vec<String> {
+    sources
         .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .filter(|value| !value.is_empty())
+        .flat_map(|(name, environment)| environment.values_for_redaction(name))
         .collect()
 }
 
@@ -298,6 +303,26 @@ mod tests {
         let content = std::fs::read_to_string(&config.log.output).unwrap();
         assert!(content.contains("[REDACTED]"));
         assert!(!content.contains("split-secret"));
+    }
+
+    #[test]
+    fn dotenv_credentials_are_scrubbed_even_without_bearer_detection() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.toml");
+        std::fs::write(&path,
+            "[embedding]\nprovider='disabled'\nendpoint='http://127.0.0.1:11434'\napi_key_env='SOLASCOPE_LOG_DOTENV_EMBED_KEY'\n[rerank]\nprovider='disabled'\nendpoint=''\napi_key_env='SOLASCOPE_LOG_DOTENV_RERANK_KEY'\n[log]\noutput='diagnostics.log'\nredact_secrets=false\n").unwrap();
+        std::fs::write(root.path().join(".env"),
+            "SOLASCOPE_LOG_DOTENV_EMBED_KEY=file-embedding-secret\nSOLASCOPE_LOG_DOTENV_RERANK_KEY=file-rerank-secret\n").unwrap();
+        let config = Config::load(Some(root.path()), Some(&path)).unwrap();
+        LogWriter::new(&config)
+            .unwrap()
+            .make_writer()
+            .write_all(b"keys=file-embedding-secret file-rerank-secret\n")
+            .unwrap();
+        let rendered = std::fs::read_to_string(&config.log.output).unwrap();
+        assert!(!rendered.contains("file-embedding-secret"));
+        assert!(!rendered.contains("file-rerank-secret"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     #[test]

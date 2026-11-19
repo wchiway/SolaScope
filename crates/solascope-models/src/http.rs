@@ -6,6 +6,7 @@ use reqwest::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use solascope_config::Environment;
 use solascope_core::{Error, Result};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -15,6 +16,7 @@ pub(crate) struct HttpTransport {
     client: Client,
     endpoint: Url,
     key_env: String,
+    environment: Environment,
     retries: usize,
     timeout: Duration,
 }
@@ -177,6 +179,7 @@ impl HttpTransport {
         timeout_secs: u64,
         retries: usize,
         remote: bool,
+        environment: Environment,
     ) -> Result<Self> {
         crate::validate_timeout(timeout_secs)?;
         if retries > 5 {
@@ -197,6 +200,7 @@ impl HttpTransport {
             client,
             endpoint,
             key_env,
+            environment,
             retries,
             timeout,
         })
@@ -213,10 +217,10 @@ impl HttpTransport {
     async fn post_inner<T: DeserializeOwned>(&self, body: &Value) -> Result<T> {
         for attempt in 0..=self.retries {
             let mut request = self.client.post(self.endpoint.clone()).json(body);
-            // Resolve the secret for each attempt; never retain it on an adapter
-            // or include it (or a reqwest error/response body) in diagnostics.
+            // Resolve live process values or this configuration's file defaults;
+            // never expose secrets or HTTP response bodies in diagnostics.
             if !self.key_env.is_empty() {
-                let key = std::env::var(&self.key_env).map_err(|_| {
+                let key = self.environment.var(&self.key_env).map_err(|_| {
                     Error::Authentication(
                         "API key environment variable is missing or invalid".into(),
                     )

@@ -34,7 +34,7 @@ Claude Code：
 claude mcp add solascope -- solascope mcp --root /abs/path/to/project
 ```
 
-`solascope` 不在 `PATH` 中时，把 `command` 换成可执行文件的绝对路径，使用 `sas` 也等价。远程模型密钥通过客户端的 `env` 配置传入对应环境变量；不要把密钥放到参数、URL 或项目 TOML 中。远程模型仍要求 `privacy.remote_opt_in = true`，Embedding 和 Reranker 独立配置，详见[配置](configuration.md)。
+`solascope` 不在 `PATH` 中时，把 `command` 换成可执行文件的绝对路径，使用 `sas` 也等价。远程模型密钥可保存在用户配置同目录的 `.env`（Linux/macOS：`~/.solascope/.env`；Windows：`$USERPROFILE/.solascope/.env`），也可通过客户端 `env` 传入进程变量，后者优先。`--config FILE` 另会读取 FILE 同目录的 `.env`。修改文件后需重启 MCP；不要把密钥放到参数、URL 或 TOML 中。远程模型仍要求 `privacy.remote_opt_in = true`，Embedding 和 Reranker 独立配置，详见[配置](configuration.md)。
 
 客户端接入示例不代表已在所有商业客户端实测。当前端到端验证使用测试内的原生 JSON-RPC 客户端和 rmcp SDK 客户端。
 

@@ -44,9 +44,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Write a project configuration without overwriting an existing one.
+    /// Create the user configuration under ~/.solascope without overwriting it.
     Init {
-        path: Option<PathBuf>,
         /// Probe models from the supplied configuration using a fixed sentence.
         #[arg(long)]
         probe: bool,
@@ -104,9 +103,7 @@ pub(crate) enum Command {
 impl Command {
     pub fn project_path(&self) -> Option<&Path> {
         match self {
-            Self::Init { path, .. } | Self::Index { path, .. } | Self::Watch { path, .. } => {
-                path.as_deref()
-            }
+            Self::Index { path, .. } | Self::Watch { path, .. } => path.as_deref(),
             _ => None,
         }
     }

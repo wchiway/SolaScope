@@ -56,27 +56,24 @@ pub fn run() -> i32 {
 
 fn configuration(cli: &Cli) -> Result<Config> {
     let root = cli.command.project_path().or(cli.root.as_deref());
-    if matches!(cli.command, Command::Init { .. }) {
-        if let Some(root) = root {
-            std::fs::create_dir_all(root)?;
-        }
-    }
     Config::load(root, cli.config.as_deref())
 }
 
 async fn execute(cli: Cli, config: Config) -> Result<()> {
     if let Command::Init { probe, .. } = &cli.command {
+        let destination = solascope_config::user_config_path()?;
+        let directory = destination
+            .parent()
+            .ok_or_else(|| Error::Config("invalid user configuration path".into()))?;
         let path =
-            solascope_config::write_default_config(&config.project.root).map_err(|error| {
-                match error {
-                    Error::Io(io) if io.kind() == io::ErrorKind::AlreadyExists => {
-                        Error::Config(format!(
-                            "{} already exists and was left unchanged",
-                            config.project.root.join(".solascope.toml").display()
-                        ))
-                    }
-                    other => other,
+            solascope_config::write_default_config(directory).map_err(|error| match error {
+                Error::Io(io) if io.kind() == io::ErrorKind::AlreadyExists => {
+                    Error::Config(format!(
+                        "{} already exists and was left unchanged",
+                        destination.display()
+                    ))
                 }
+                other => other,
             })?;
         let checks = if *probe {
             let engine = Engine::new(config.clone())?;

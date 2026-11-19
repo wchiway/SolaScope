@@ -108,6 +108,7 @@ impl HttpEmbedding {
             config.timeout_secs,
             config.retries,
             endpoint_remote,
+            config.environment.clone(),
         )?;
         let batch_size = if protocol == Protocol::DashScope {
             config.batch_size.min(dashscope_batch_limit(&config.model))

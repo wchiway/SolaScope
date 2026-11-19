@@ -46,7 +46,8 @@ impl Sandbox {
         command
             .current_dir(self.scratch.path())
             .env("XDG_CONFIG_HOME", self.scratch.path().join("config"))
-            .env("HOME", self.scratch.path().join("home"));
+            .env("HOME", self.scratch.path().join("home"))
+            .env("USERPROFILE", self.scratch.path().join("home"));
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("SOLASCOPE_") {
                 command.env_remove(key);

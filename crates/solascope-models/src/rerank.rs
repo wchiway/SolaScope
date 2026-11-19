@@ -60,6 +60,7 @@ impl HttpReranker {
                 config.timeout_secs,
                 2,
                 remote,
+                config.environment.clone(),
             )?,
             provider: config.provider.clone(),
             protocol,

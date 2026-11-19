@@ -1,5 +1,5 @@
-//! Configuration precedence: CLI root > `SOLASCOPE__GROUP__FIELD` > project
-//! `.solascope.toml` > user `solascope/config.toml` > defaults.
+//! Configuration precedence: CLI > process environment > project dotenv/TOML
+//! > user dotenv/TOML > defaults. User defaults live in ~/.solascope.
 //!
 //! Every declared field supports that environment spelling (uppercase group and
 //! field, e.g. `SOLASCOPE__EMBEDDING__PROVIDER=ollama`). Strings and paths are
@@ -17,11 +17,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod environment;
+pub use environment::Environment;
+
 macro_rules! section {
-    ($name:ident { $($field:ident : $ty:ty = $value:expr),* $(,)? }) => {
+    ($name:ident { $($(#[$attribute:meta])* $field:ident : $ty:ty = $value:expr),* $(,)? }) => {
         #[derive(Clone, Debug, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attribute])* pub $field: $ty),* }
         impl Default for $name {
             fn default() -> Self { Self { $($field: $value),* } }
         }
@@ -48,6 +51,8 @@ section!(EmbeddingConfig {
     dimensions: usize = 768,
     request_dimensions: bool = true,
     api_key_env: String = "OPENAI_API_KEY".into(),
+    #[serde(skip)]
+    environment: Environment = Environment::default(),
     batch_size: usize = 32,
     concurrency: usize = 2,
     timeout_secs: u64 = 30,
@@ -59,6 +64,8 @@ section!(RerankConfig {
     model: String = String::new(),
     endpoint: String = String::new(),
     api_key_env: String = "RERANK_API_KEY".into(),
+    #[serde(skip)]
+    environment: Environment = Environment::default(),
     top_n: usize = 20,
     timeout_secs: u64 = 30,
     fail_open: bool = true,
@@ -137,8 +144,8 @@ impl Config {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let global = dirs::config_dir().map(|dir| dir.join("solascope/config.toml"));
-        load_with_sources(root, config_path, &cwd, global.as_deref(), &env)
+        let global = global_config_path()?;
+        load_with_sources(root, config_path, &cwd, Some(&global), &env)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -493,34 +500,54 @@ fn load_with_sources(
         toml::Value::try_from(&base).map_err(|_| invalid("cannot serialize defaults"))?;
     let defaults = value.clone();
     let mut explicit_index = false;
+    let mut environment = Environment::default();
     let project = config_path
         .map(|path| absolute(path, cwd))
         .unwrap_or_else(|| selected.join(".solascope.toml"));
-    if let Some(global) = global {
-        match fs::metadata(global) {
-            Ok(_) => {
-                let layer = load_layer(global)?;
-                explicit_index |= layer
-                    .get("project")
-                    .and_then(|v| v.get("index_dir"))
-                    .is_some();
-                merge(&mut value, layer);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    let sources = global
+        .into_iter()
+        .map(|path| (path, false, true))
+        .chain(std::iter::once((
+            project.as_path(),
+            config_path.is_some(),
+            false,
+        )));
+    for (path, required, user_defaults) in sources {
+        let present = match fs::metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => false,
             Err(error) => return Err(error.into()),
-        }
-    }
-    match fs::metadata(&project) {
-        Ok(_) => {
-            let layer = load_layer(&project)?;
+        };
+        if present {
+            let layer = load_layer(path)?;
             explicit_index |= layer
                 .get("project")
                 .and_then(|v| v.get("index_dir"))
                 .is_some();
             merge(&mut value, layer);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && config_path.is_none() => {}
-        Err(error) => return Err(error.into()),
+        if present || user_defaults {
+            let directory = path.parent().unwrap_or(&selected);
+            let file_environment = Environment::load(directory)?;
+            let overrides = file_environment
+                .file_values()
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with("SOLASCOPE__")
+                        && !env
+                            .keys()
+                            .any(|existing| existing.eq_ignore_ascii_case(name))
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let layer = environment_layer(&defaults, &overrides, directory)?;
+            explicit_index |= layer
+                .get("project")
+                .and_then(|v| v.get("index_dir"))
+                .is_some();
+            merge(&mut value, layer);
+            environment = environment.overlay(&file_environment);
+        }
     }
     let layer = environment_layer(&defaults, env, cwd)?;
     explicit_index |= layer
@@ -539,28 +566,63 @@ fn load_with_sources(
     if !explicit_index {
         base.project.index_dir = base.project.root.join(".solascope");
     }
+    base.embedding.environment = environment.clone();
+    base.rerank.environment = environment;
     base.validate()?;
     Ok(base)
 }
 
-/// Atomically reserve `.solascope.toml` with create_new; an existing file is
-/// never truncated. Providers stay disabled; no model installation is implied.
-pub fn write_default_config(root: &Path) -> Result<PathBuf> {
-    let root = fs::canonicalize(root)?;
-    let _ = Config::default_for_root(&root)?;
-    let mut template = Config::default();
-    template.project.root = PathBuf::from(".");
-    template.project.index_dir = PathBuf::from(".solascope");
+/// Shared user configuration, independent of any project root.
+pub fn user_config_path() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir);
+    #[cfg(not(windows))]
+    let home = dirs::home_dir();
+    let home = home.ok_or_else(|| invalid("cannot determine the user home directory"))?;
+    Ok(home.join(".solascope/.solascope.toml"))
+}
+
+fn global_config_path() -> Result<PathBuf> {
+    let path = user_config_path()?;
+    if !path.try_exists()? {
+        if let Some(legacy) =
+            dirs::config_dir().map(|directory| directory.join("solascope/config.toml"))
+        {
+            if legacy.try_exists()? {
+                return Ok(legacy);
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// Create user defaults without binding subsequent commands to this directory.
+/// Existing configurations are never truncated and providers stay disabled.
+pub fn write_default_config(directory: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    let directory = fs::canonicalize(directory)?;
+    let mut template = toml::Value::try_from(Config::default())
+        .map_err(|_| invalid("cannot render default configuration"))?;
+    let project = template["project"]
+        .as_table_mut()
+        .ok_or_else(|| invalid("invalid default project settings"))?;
+    project.remove("root");
+    project.remove("index_dir");
     let body = toml::to_string_pretty(&template)
         .map_err(|_| invalid("cannot render default configuration"))?;
-    let path = root.join(".solascope.toml");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    file.write_all(
-        b"# Models are disabled. Ollama nomic-embed-text/768 requires separate installation.\n",
-    )?;
+    let path = directory.join(".solascope.toml");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(b"# User defaults; project root and index directory are determined per command.\n# Models are disabled. API keys belong in the neighboring .env or process environment.\n")?;
     file.write_all(body.as_bytes())?;
     file.sync_all()?;
     Ok(path)
@@ -860,5 +922,157 @@ mod tests {
             fs::write(root.path().join(".solascope.toml"), body).unwrap();
             assert!(load(root.path(), None, &[]).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn user_defaults_do_not_bind_commands_to_the_configuration_directory() {
+        let settings = tempdir().unwrap();
+        let path = write_default_config(&settings.path().join("home/.solascope")).unwrap();
+        let template: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(template["project"].get("root").is_none());
+        assert!(template["project"].get("index_dir").is_none());
+        for _ in 0..2 {
+            let root = tempdir().unwrap();
+            fs::create_dir(root.path().join(".git")).unwrap();
+            let config =
+                load_with_sources(None, None, root.path(), Some(&path), &BTreeMap::new()).unwrap();
+            assert_eq!(config.project.root, root.path().canonicalize().unwrap());
+            assert_eq!(
+                config.project.index_dir,
+                config.project.root.join(".solascope")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_config_reads_its_own_dotenv_not_the_working_directory() {
+        let root = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let path = settings.path().join("models.toml");
+        let key = "SOLASCOPE_CONFIG_DOTENV_KEY_3D40";
+        let before = std::env::var_os(key);
+        fs::write(&path, format!("[embedding]\napi_key_env='{key}'\n[rerank]\napi_key_env='{key}'\n[search]\nlimit=4\n")).unwrap();
+        fs::write(settings.path().join(".env"), format!(
+            "export {key}='file-secret-value'\nSOLASCOPE__SEARCH__LIMIT=7\nSOLASCOPE__PROJECT__INDEX_DIR=cache\n"
+        )).unwrap();
+        fs::write(
+            cwd.path().join(".env"),
+            format!("{key}=wrong-directory\nSOLASCOPE__SEARCH__LIMIT=99\n"),
+        )
+        .unwrap();
+        let config = load_with_sources(
+            Some(root.path()),
+            Some(&path),
+            cwd.path(),
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(config.search.limit, 7);
+        assert_eq!(config.project.index_dir, settings.path().join("cache"));
+        assert_eq!(
+            config.embedding.environment.file_values()[key],
+            "file-secret-value"
+        );
+        assert_eq!(
+            config.rerank.environment.file_values()[key],
+            "file-secret-value"
+        );
+        assert_eq!(std::env::var_os(key), before);
+        for rendered in [format!("{config:?}"), toml::to_string(&config).unwrap()] {
+            assert!(!rendered.contains("file-secret-value"));
+            assert!(!rendered.contains("wrong-directory"));
+        }
+    }
+
+    #[test]
+    fn global_project_dotenv_and_process_layers_have_explicit_precedence() {
+        let root = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let global = settings.path().join("user.toml");
+        let key = "SOLASCOPE_CONFIG_LAYER_KEY_93D7";
+        fs::write(&global, "[search]\nlimit=3\nlexical_top_k=8\n").unwrap();
+        fs::write(settings.path().join(".env"), format!("{key}=global-key\nSOLASCOPE__SEARCH__LIMIT=4\nSOLASCOPE__SEARCH__LEXICAL_TOP_K=9\nSOLASCOPE__PRIVACY__REMOTE_OPT_IN=true\n")).unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[search]\nlimit=5\n[privacy]\nremote_opt_in=false\n",
+        )
+        .unwrap();
+        let project = load(root.path(), Some(&global), &[]).unwrap();
+        assert_eq!(project.search.limit, 5);
+        assert_eq!(project.search.lexical_top_k, 9);
+        assert!(!project.privacy.remote_opt_in);
+        assert_eq!(
+            project.embedding.environment.file_values()[key],
+            "global-key"
+        );
+        fs::write(
+            root.path().join(".env"),
+            format!("{key}=project-key\nSOLASCOPE__SEARCH__LIMIT=6\n"),
+        )
+        .unwrap();
+        let project = load(root.path(), Some(&global), &[]).unwrap();
+        assert_eq!(project.search.limit, 6);
+        assert_eq!(
+            project.embedding.environment.file_values()[key],
+            "project-key"
+        );
+        let process = load(
+            root.path(),
+            Some(&global),
+            &[("SOLASCOPE__SEARCH__LIMIT", "7")],
+        )
+        .unwrap();
+        assert_eq!(process.search.limit, 7);
+        assert_eq!(
+            process.embedding.environment.file_values()[key],
+            "project-key"
+        );
+    }
+
+    #[test]
+    fn dotenv_credentials_are_isolated_between_configurations() {
+        let key = "SOLASCOPE_CONFIG_ISOLATED_KEY_8412";
+        let mut environments = Vec::new();
+        let before = std::env::var_os(key);
+        for value in ["first-project-key", "second-project-key"] {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join(".solascope.toml"), "[search]\nlimit=2\n").unwrap();
+            fs::write(root.path().join(".env"), format!("{key}={value}\n")).unwrap();
+            let config = load(root.path(), None, &[]).unwrap();
+            environments.push(config.embedding.environment);
+        }
+        assert_eq!(environments[0].file_values()[key], "first-project-key");
+        assert_eq!(environments[1].file_values()[key], "second-project-key");
+        assert_eq!(std::env::var_os(key), before);
+    }
+
+    #[test]
+    fn dotenv_settings_reject_invalid_values_without_echoing_them() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(".solascope.toml"), "").unwrap();
+        fs::write(
+            root.path().join(".env"),
+            "SOLASCOPE__SEARCH__LIMIT='secret-invalid-limit'\n",
+        )
+        .unwrap();
+        let error = load(root.path(), None, &[]).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("secret-invalid-limit"));
+        let config = load(root.path(), None, &[("SOLASCOPE__SEARCH__LIMIT", "8")]).unwrap();
+        assert_eq!(config.search.limit, 8);
+    }
+
+    #[test]
+    fn an_unrelated_working_directory_dotenv_is_not_loaded_without_project_config() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(
+            root.path().join(".env"),
+            "invalid secret line without an equals sign\n",
+        )
+        .unwrap();
+        let config = load_with_sources(None, None, root.path(), None, &BTreeMap::new()).unwrap();
+        assert_eq!(config.embedding.provider, "disabled");
     }
 }
