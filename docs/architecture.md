@@ -1,118 +1,120 @@
-# 架构
+# Architecture
 
-## 模块与边界
+## Workspace
 
-| 包 | 职责 |
+| Package | Responsibility |
 | --- | --- |
-| `apps/solascope` | `solascope` 与 `sas` 两个入口、参数解析、输出格式、日志、rmcp stdio 服务 |
-| `crates/solascope-core` | 共享数据结构、错误与退出码、`EmbeddingProvider` / `RerankProvider` / `MetadataStore` / `LexicalIndex` / `VectorIndex` 接口 |
-| `crates/solascope-config` | TOML 分层配置、环境变量覆盖、校验与隐私约束 |
-| `crates/solascope-scanner` | 文件发现、忽略与敏感路径过滤、受根目录约束的读取、文件监听 |
-| `crates/solascope-parser` | Tree-sitter 定义提取、Chunk 生成与稳定标识 |
-| `crates/solascope-models` | Ollama、通用/OpenAI 兼容、DashScope、硅基流动 HTTP 协议，以及可选 FastEmbed Rerank |
-| `crates/solascope-storage` | SQLite 迁移、事务提交、向量缓存、FTS5、精确余弦检索、写入者锁 |
-| `crates/solascope-engine` | 索引、查询、诊断与监听流水线编排 |
-| `benchmarks` | 独立 `solascope-bench` 工具，直接调用 Engine 进行质量与性能评测 |
+| `apps/solascope` | The `solascope` and `sas` entry points, arguments, output formatting, logging, and rmcp stdio server |
+| `crates/solascope-core` | Shared types, errors, exit codes, and the `EmbeddingProvider`, `RerankProvider`, `MetadataStore`, `LexicalIndex`, and `VectorIndex` traits |
+| `crates/solascope-config` | Layered TOML configuration, environment overrides, validation, and privacy constraints |
+| `crates/solascope-scanner` | File discovery, ignore and sensitive-path filters, root-confined reads, and file watching |
+| `crates/solascope-parser` | Tree-sitter definition extraction, chunking, and stable identifiers |
+| `crates/solascope-models` | Ollama, generic/OpenAI-compatible, DashScope, and SiliconFlow HTTP protocols, plus optional FastEmbed reranking |
+| `crates/solascope-storage` | SQLite migrations, transactional updates, vector caches, FTS5, exact cosine retrieval, and writer locks |
+| `crates/solascope-engine` | Indexing, search, diagnostics, and watch orchestration |
+| `benchmarks` | The separate `solascope-bench` tool for quality and performance evaluation through Engine |
 
-CLI、MCP 和基准工具调用同一套 `solascope_engine::Engine`。分块在 parser 中，词法/向量检索在 storage 中，索引和检索编排在 engine 中；公共接口定义在 core。
+The CLI, MCP server, and benchmark tool call the same `solascope_engine::Engine`. Chunking lives in parser, lexical and vector retrieval in storage, and pipeline orchestration in engine. Core defines the shared interfaces.
 
-`Engine` 的克隆共享惰性初始化的模型适配器和查询向量缓存。本地 ONNX 模型不会在每次请求时重建。默认模型禁用；构建/启动核心程序不需要推理服务。
+Cloned Engine instances share lazily initialized model adapters and a query-vector cache. A local ONNX model is reused across requests. Models are disabled by default, so the core application can build and start without an inference service.
 
-## 索引流水线
+## Indexing pipeline
 
-1. 获取索引目录的独占文件锁；已有写入者时立即以 `WriterBusy`（退出码 5）失败。首次创建索引目录内的 `.gitignore`，不覆盖已有文件。
-2. 写入者按顺序迁移旧数据库；读操作不会迁移。比较当前 Embedding 指纹与已发布代际：默认 `strict` 拒绝不兼容增量写入；`fingerprint_policy = "rebuild"` 只在显式索引时转为重建。
-3. 计算分块签名，包含 `CHUNKER_VERSION`、启用语言、回退策略、Chunk 预算和重叠行数。规则变化会重新解析所有文件，不把新旧分块混在同一可见索引中。
-4. 扫描项目、计算 SHA-256，与已记录文件哈希比较，得到新增、修改、删除集合；使用有界 Rayon 线程池解析变化文件。
-5. 按 `指纹 + 完整输入文本哈希` 查询向量缓存。非重建任务还可按路径无关的复用键找移动文件的向量，只为剩余文本请求 Embedding。
-6. 模型请求在数据库写事务之外执行，按有界输入组、配置批次和并发执行。向量数量、维度和数值均校验；失败不发布半成品。
-7. 提交前重新读取变化文件并核对哈希，同时复核待删除路径。期间文件又发生变化则放弃提交；监听模式会重新扫描并重试。
-8. 在一个 SQLite 事务内更新文件、Chunk、FTS、向量映射、分块签名及代际记录，然后发布新的索引代际。
+1. Acquire an exclusive lock in the index directory. A competing writer fails immediately with `WriterBusy` (exit code 5). On first use, create an index-local `.gitignore` without replacing an existing file.
+2. Apply database migrations in order. Reads never migrate. Compare the configured embedding fingerprint with the published generation: `strict` rejects incompatible incremental writes; `fingerprint_policy = "rebuild"` converts an explicit indexing operation into a rebuild.
+3. Compute a chunking signature from `CHUNKER_VERSION`, enabled languages, fallback policy, chunk budget, and overlap. A changed signature requires all files to be parsed again before publication.
+4. Scan the project and compare source SHA-256 hashes with stored records to identify additions, changes, and deletions. Parse changed files in a bounded Rayon thread pool.
+5. Look up vectors by fingerprint and full-input hash. Incremental runs can also reuse moved-file vectors through a path-independent key. Request embeddings for the remaining inputs.
+6. Run model requests outside the database write transaction, with bounded input groups, batches, and concurrency. Validate vector counts, dimensions, and values before proceeding.
+7. Reread changed files and verify their hashes, then recheck pending deletions. Discard the update if source revisions changed in the meantime; watch mode rescans and retries.
+8. Update files, chunks, FTS, vector mappings, chunking metadata, and generation records in one SQLite transaction, then publish the new generation.
 
-任何一步失败都不覆盖上一个已发布快照。中断任务通过 `index_jobs` 记录，下次索引标记恢复并重新扫描。显式重建即使面对空项目也生成新代际。日志报告扫描、Embedding 进度和提交，索引报告分别统计精确缓存命中、新向量和路径复用向量。
+A failed update leaves the previous published snapshot available. Interrupted jobs remain in `index_jobs`; the next indexing run marks recovery and rescans. An explicit rebuild publishes a new generation even for an empty project. Reports distinguish exact cache hits, newly computed embeddings, and relocated embeddings.
 
-## 分块与位置映射
+## Chunking and source locations
 
-Rust、Python、JavaScript/JSX、TypeScript/TSX、Go 使用 Tree-sitter 定义提取。未知/禁用语言或损坏语法在允许回退时按行窗口分块，标记 `fallback`；不是跨文件类型检查或引用解析。
+Tree-sitter extracts definitions from Rust, Python, JavaScript/JSX, TypeScript/TSX, and Go. Unknown or disabled languages and files with invalid syntax use line windows when fallback is enabled, with `fallback` as the chunk kind. Parsing extracts syntax definitions rather than cross-file types or references.
 
-`fallback_policy = "skip"` 时，Engine 将无法生成 AST 的文件保存为无 Chunk 的文件记录，移除其旧定义，保留哈希并继续其他文件的索引；当轮跳过数进入报告和警告。底层 parser 的严格 API 仍返回解析错误，线程池或其他非解析错误不会被吞掉。
+With `fallback_policy = "skip"`, Engine stores an unparseable file's hash without chunks, removes its old definitions, and continues indexing other files. The report includes skipped-file counts and a warning. The parser's strict API still returns parse errors; thread-pool failures and other errors propagate.
 
-- 定义包含直接相邻的注释、属性、装饰器和声明包装；空行分隔的独立注释不强行附到后续定义。
-- 类、impl、接口等容器由头部、独立定义和未单独提取的成员片段组成，保留字段、常量及其注释。
-- 长定义优先选择预算内较浅的语法节点边界，这类分片不强制重叠；无合适边界时使用可重叠的行窗口，单行过长时在 UTF-8 边界拆分。
-- `max_chunk_tokens × 4` 是字节预算估算，不是模型 tokenizer 的 token 保证。
-- Chunk 保存原始源码的精确字节切片、1-based 闭区间行号、符号、签名、父级信息及内容哈希。覆盖测试检查字符边界、范围一致性和源码内容不遗漏。
+- Definitions include directly adjacent comments, attributes, decorators, and declaration wrappers. Blank-line-separated comments stay independent.
+- Classes, impl blocks, interfaces, and other containers retain their headers, extracted definitions, and remaining member text, including fields, constants, and comments.
+- Long definitions prefer shallow syntax-node boundaries within the budget. These splits do not require overlap. Otherwise, chunking uses overlapping line windows, splitting oversized lines only at UTF-8 boundaries.
+- `max_chunk_tokens × 4` estimates a byte budget; actual model token counts depend on the tokenizer.
+- Each chunk stores an exact source slice, a 1-based inclusive line range, symbol, signature, parent information, and content hash. Coverage tests check character boundaries, source ranges, and retained source content.
 
-## 标识、指纹与缓存
+## Identifiers, fingerprints, and caches
 
-| 标识/缓存键 | 用途 |
+| Identifier or key | Purpose |
 | --- | --- |
-| 实体 ID：项目、路径、限定符号名、类型的哈希 | 最终结果按实体去重 |
-| Chunk ID：实体 ID 加分片序号 | 合并多路召回、关联 FTS 与向量 |
-| Embedding 输入哈希 | 精确内容缓存；输入模板含路径、语言、符号、签名和正文，不含行号 |
-| Embedding 指纹 | provider、模型、规范化 endpoint、维度、归一化及模板/维度请求策略；防止向量空间混用 |
-| 路径无关复用键 | 模板版本、语言、符号、签名和正文哈希；识别只改变文件路径的代码 |
-| 查询缓存键 | 指纹加裁去两端空白的查询哈希；进程内 TTL 5 分钟，容量上限 128 |
+| Entity ID: hash of project, path, qualified symbol, and kind | Deduplicate final results |
+| Chunk ID: entity ID plus chunk ordinal | Merge retrieval channels and associate FTS entries with vectors |
+| Embedding-input hash | Exact cache lookup; the input template contains path, language, symbol, signature, and body, excluding line numbers |
+| Embedding fingerprint | Bind vectors to provider, model, normalized endpoint, dimensions, normalization, and input-template/dimension-request policy |
+| Path-independent reuse key | Match moved code using template version, language, symbol, signature, and body hash |
+| Query-cache key | Fingerprint plus trimmed-query hash; process-local TTL of five minutes and capacity of 128 entries |
 
-函数在同一文件内移动而完整输入不变时精确复用。文件移动/重命名会改变路径和完整输入，但可复用相同代码的旧路径向量。数据库将这种近似复用标为 `exact = false`，状态计入 `relocated_vectors`。
+Moving a function within a file can retain an identical embedding input and reuse an exact cache entry. Moving or renaming a file changes the path in the input, but matching code can reuse an old-path vector. Storage marks this approximate reuse as `exact = false`; status reports it as `relocated_vectors`.
 
-`index --rebuild` 只复用精确缓存，重新计算路径近似复用向量；精确结果可以替换近似结果，反向覆盖被禁止。Reranker 更换不影响向量索引。密钥、并发、超时等不进入模型指纹。
+`index --rebuild` reuses exact entries and recomputes relocated vectors. Exact results can replace approximate entries, while approximate results cannot replace exact ones. Changing the reranker does not affect the vector index. Credentials, concurrency, and timeout settings are excluded from the embedding fingerprint.
 
-## 模型协议
+## Model protocols
 
-Embedding 与 Reranker 的 provider 独立配置，统一接口不混淆供应商格式：
+Embedding and reranking providers are configured independently:
 
-- `EmbeddingProvider::embed` 对文档批次返回有序向量，`embed_query` 返回单条查询向量。DashScope 据此分别发送 `text_type = "document"` 与 `"query"`。
-- 通用/OpenAI 兼容和硅基流动 Embedding 使用 `/v1/embeddings`、平铺 `input` 及索引化 `data`；DashScope 原生使用 `/api/v1/services/embeddings/text-embedding/text-embedding` 和嵌套 `input/parameters`。
-- 通用、硅基流动和供应商所称的兼容 Rerank 使用平铺请求和顶层 `results`；DashScope 原生使用 `/api/v1/services/rerank/text-rerank/text-rerank` 和嵌套 `output.results`。兼容百炼可使用 `/compatible-api/v1/reranks`，不表示 OpenAI 公司定义了通用重排标准。
-- `RerankProvider::limits` 声明候选数和字符上限。返回分数必须映射回原始文档索引和 ID，且有限、无重复、无越界。
-- 本地 Rerank 在推理前检查真实 tokenizer 的完整查询/文档对长度；HTTP 服务仍受供应商自己的 token 上限约束，字符估算不能代替它。
+- `EmbeddingProvider::embed` returns ordered document vectors; `embed_query` returns one query vector. DashScope uses `text_type = "document"` and `"query"` respectively.
+- Generic/OpenAI-compatible and SiliconFlow embeddings use `/v1/embeddings`, a flat `input`, and indexed `data`. Native DashScope uses `/api/v1/services/embeddings/text-embedding/text-embedding` with nested `input` and `parameters`.
+- Generic, SiliconFlow, and compatible rerank APIs use flat requests and top-level `results`. Native DashScope uses `/api/v1/services/rerank/text-rerank/text-rerank` and nested `output.results`. Its compatible API can use `/compatible-api/v1/reranks`; request formats follow the vendor's API contract.
+- `RerankProvider::limits` declares document-count and character limits. Scores must be finite and map to original document indices and IDs, without duplicates or out-of-range indices.
+- Local reranking checks the complete query/document pair with the model's tokenizer before inference. HTTP services enforce their own token limits in addition to local character budgets.
 
-HTTP 请求有超时、有限重试、响应大小上限，不跟随重定向。本地地址不走代理，云端传输需要显式隐私 opt-in。真实模型服务及 ONNX 推理的验证边界另见[实施状态](implementation-status.md)。
+HTTP requests have timeouts, bounded retries, and response-size limits, and do not follow redirects. Loopback requests bypass proxies. Remote model use requires explicit privacy opt-in. See [support and limitations](implementation-status.md) for model validation status.
 
-## 查询流水线
+## Search pipeline
 
-1. 校验查询、返回条数、路径过滤和索引分块规则。需要向量通道时确认指纹一致，再计算或复用查询向量；不兼容模型永不混查。
-2. 在一个 SQLite 读事务快照内按模式召回：lexical 仅 FTS5 BM25，semantic 仅精确向量，hybrid 使用词法、符号（精确 > 前缀 > 包含）和可选向量。hybrid 的数据库通道依次执行，共用同一快照。
-3. 按 Chunk ID 合并来源，使用 RRF 融合，不直接相加各检索器原始分数。看起来是符号的查询优先精确定义；无名文本、测试/fixture/example 路径使用小幅权重调整，显式查询或过滤这些辅助代码时不惩罚路径。
-4. 重新读取候选文件：修改、删除或读到变化中的文件标记 `stale`；被当前隐私/忽略规则屏蔽的候选剔除。源码读取仍受项目根约束。
-5. 可选地将非 stale 的领先候选交给 Reranker，按配置及 provider 限额截断候选文本。校验评分映射后重排，精确符号优先仍保留；重排之后再次核对可见性与源文件状态。
-6. 按实体去重，返回前 `limit` 条，以及警告和阶段耗时。
+1. Validate the query, result limit, path filter, and index chunking version. If vectors are needed, verify the fingerprint and compute or reuse a query vector.
+2. Retrieve within one SQLite read transaction: lexical uses FTS5 BM25, semantic uses exact vectors, and hybrid uses lexical, symbol (exact, prefix, then substring), and optional vector channels. Hybrid database channels run sequentially against the same snapshot.
+3. Merge by chunk ID and apply reciprocal rank fusion (RRF). Symbol-like queries prioritize exact definitions. Small weights adjust unnamed text and test/fixture/example paths; explicitly requested or filtered support code avoids the path penalty.
+4. Reread candidate files. Mark modified, deleted, or concurrently changing sources as `stale`, and remove candidates blocked by current privacy or ignore rules. Reads remain confined to the project root.
+5. Optionally send leading non-stale candidates to the reranker, within configured and provider limits. Validate score mappings, retain exact-symbol priority, and recheck source visibility and revisions after reranking.
+6. Deduplicate by entity and return up to `limit` results, warnings, and stage timings.
 
-`find_symbol` 额外支持有限编辑距离的拼写纠错；字面匹配优先，模糊结果标为 `fuzzy`。混合搜索不使用这些模糊符号候选。
+`find_symbol` also supports limited edit-distance correction. Literal matches rank first, and corrected matches are marked `fuzzy`. Hybrid search does not use these fuzzy candidates.
 
-Embedding 临时不可用或认证失败时，允许的 hybrid 查询降级为词法加符号；纯 semantic 查询和模型不兼容错误不降级。Reranker 失败时按 `fail_open` 保留融合排序或报错。
+If enabled by configuration, hybrid queries fall back to lexical and symbol retrieval when embeddings are temporarily unavailable or authentication fails. Semantic queries and model-incompatibility errors do not fall back. Reranker failures either preserve fused order or return an error according to `fail_open`.
 
-`SearchResponse.timings` 包含 Embedding、重排、其余本地检索和总墙钟毫秒数。本地检索时间包括融合与源码校验，不只是 SQL。缓存命中时 `embedding_ms = 0`，不能据暖缓存结果推断真实模型延迟。
+`SearchResponse.timings` reports embedding, reranking, remaining local retrieval, and total wall-clock milliseconds. Local retrieval includes fusion and source checks as well as SQL. Query-vector cache hits set `embedding_ms = 0`, so warm-cache timings do not measure model inference latency.
 
-## SQLite 与迁移
+## SQLite and migrations
 
-SQLite 使用 WAL、外键和单写入者锁。表包括 `projects`、`files`、`chunks`、`chunk_fts`（FTS5）、`embedding_cache`、`chunk_embeddings`、`index_generations`、`index_jobs`，以及保存分块签名的 `meta`。FTS 行通过 `chunks` 触发器维护，与普通表在同一事务提交。
+SQLite uses WAL, foreign keys, and a single-writer file lock. Tables include `projects`, `files`, `chunks`, `chunk_fts` (FTS5), `embedding_cache`, `chunk_embeddings`, `index_generations`, `index_jobs`, and `meta` for chunking metadata. Triggers keep FTS rows in sync with chunks in the same transaction.
 
-向量以小端 `f32` BLOB 持久化，查询时逐行计算精确余弦相似度。首版优先逻辑正确，不能保证百万级 Chunk 的毫秒级检索；可通过 `VectorIndex` 替换为 ANN 后端后再做相同评测集对照。
+Vectors are stored as little-endian `f32` blobs and scanned for exact cosine similarity. Large indexes may need an ANN implementation behind `VectorIndex`, evaluated against the same query set.
 
-`PRAGMA user_version` 表示已应用的迁移数，当前为 2：
+`PRAGMA user_version` records the number of applied migrations, currently 2:
 
-- `migrations/0001_initial.sql`：初始 schema。
-- `migrations/0002_metadata_and_relocation.sql`：分块元数据、路径复用键与精确标记；迁移后从已保存的 Chunk 回填复用键。
+- `migrations/0001_initial.sql`: initial schema.
+- `migrations/0002_metadata_and_relocation.sql`: chunking metadata, relocation keys, and exactness flags; existing chunks backfill the reuse keys.
 
-每个迁移的 SQL、回填和版本更新在同一事务内执行；已发布迁移不改写，只追加。写入者可原地升级旧索引，旧 schema 的只读命令返回 `IndexOutdated`（退出码 3）并提示先运行 `index`。新于当前程序的 schema 拒绝打开，提示升级程序或换索引目录，**不要求删除原索引**。数据库在迁移或切换 journal mode 前先核对项目归属，拒绝被其他项目根复用；错误根目录不能改变旧 schema。无版本的无关数据库也不会被当作 SolaScope 索引迁移。
+Each migration's SQL, backfill, and version update share one transaction. New migrations are appended without rewriting published ones. Writers upgrade older indexes in place; read-only commands return `IndexOutdated` (exit code 3) and request an indexing run. A schema newer than the application is rejected with guidance to upgrade the program or choose another index directory.
 
-代际保留配置保留的是版本记录，不是可任意回滚的完整历史源码副本。`doctor` 检查数据库与 FTS 一致性；`--prune-cache` 只清理未引用向量，需写入者锁。
+Before migration or journal-mode changes, storage verifies that the database belongs to the project root. A wrong root cannot modify an older schema. Unrelated databases without a schema version are also rejected.
 
-## CLI、MCP、监听与日志
+Generation retention keeps version records, not complete historical source snapshots. `doctor` checks database and FTS consistency; `--prune-cache` removes only unreferenced vectors and requires the writer lock.
 
-- `sas` 是独立编译的第二个入口，复用同一 CLI 实现，不依赖 shell 别名。
-- `init` 在用户目录 `.solascope/` 创建 `.solascope.toml`，不写项目目录，也不把当前项目路径固化到用户默认配置。
-- 用户/项目配置各自读取同目录 `.env`；进程环境变量优先，文件相对路径按声明目录解析。配置实例持有隔离的凭据默认值，不修改进程环境；序列化和 Debug 隐藏这些值，模型请求和日志脱敏共用同一凭据来源。
-- 索引默认在项目内 `.solascope/`，也可以配置其他目录；索引目录不能包含项目根，源文件读取始终限定在项目根。
-- MCP 是四工具的只读 stdio 服务，不自动索引或迁移。`watch` 或 `index --watch` 在另一个进程更新，WAL 允许读到完整的已发布代际。
-- 监听先开启文件事件流，再初始扫描；事件防抖后执行哈希驱动的增量扫描，提交前修订复核，源变化则重试。它不是每文件持久化任务队列；丢失事件可用显式 `index` 修复。
-- `index.watch` 可由 `--no-watch` 关闭；持续监听的 JSON 模式只输出首次索引报告，后续更新写日志。
-- 默认日志写 stderr。文件日志只追加拥有 SolaScope 标识的项目内文件，配置的日志路径从源码索引/读取中排除；新建 Unix 日志权限为 0600。
-- 配置密钥值始终脱敏，默认也隐藏一般 Bearer token；详细级别默认只开启 SolaScope 模块，避免隐式打印协议正文。显式 `RUST_LOG` 需谨慎使用。
-- `--probe` 和 `doctor --models` 用固定句子探测配置模型，不发送源文件；MCP 探测信息只写 stderr。未显式请求时不进行启动推理探测。
+## CLI, MCP, watching, and logging
 
-## 测试与限制
+- `sas` is a separately compiled entry point sharing the CLI implementation.
+- `init` creates `.solascope.toml` in the user's `.solascope/` directory, without writing a project config or recording the current project root in user defaults.
+- User and project configuration each load a sibling `.env`. Process variables take precedence, and file-relative paths resolve against the declaring directory. Credentials remain isolated per configuration instance without modifying the process environment; serialization and Debug hide their values. Model authentication and log redaction share this credential source.
+- Indexes default to the project's `.solascope/` directory and can be relocated. The index directory cannot contain the project root; source reads always stay within that root.
+- MCP exposes four read-only stdio tools. A separate `watch` or `index --watch` process publishes updates; WAL lets readers see complete generations.
+- Watching starts the event stream before the initial scan. Debounced events trigger hash-based incremental scans, with source-revision checks before commit and retries on changes. An explicit `index` run can recover missed events.
+- `--no-watch` overrides `index.watch`. Watch mode writes only the initial report to JSON stdout; later progress goes to logs.
+- Logs default to stderr. File logging appends only to project-local files carrying the SolaScope log marker, excludes the configured log path from source access, and creates Unix files with mode `0600`.
+- Configured API-key values are always redacted; general Bearer-token redaction is also enabled by default. Verbose logging enables SolaScope modules, while third-party protocol libraries stay quiet by default. Explicit `RUST_LOG` settings need care.
+- `--probe` and `doctor --models` test configured models with fixed sentences rather than source files. MCP probe reports go to stderr. Startup probes require an explicit flag.
 
-HTTP 协议测试使用本地模拟服务，覆盖请求格式、结果映射、错误处理和降级。真实模型、ONNX 推理与跨平台运行仍待实测，详见[支持范围](implementation-status.md)。评测方法见 [benchmarks/README.md](../benchmarks/README.md)。
+## Testing and limitations
+
+HTTP protocol tests use local mock services to cover request formats, response mapping, errors, and fallback. Live models, ONNX inference, and cross-platform execution still need validation; see [support and limitations](implementation-status.md). Evaluation procedures are in the [benchmark guide](../benchmarks/README.md).

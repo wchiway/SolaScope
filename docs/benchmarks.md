@@ -1,39 +1,39 @@
-# 基准数据
+# Recorded benchmarks
 
-以下记录来自 Linux x86_64、4 个逻辑核、Rust 1.99，Embedding 和 Reranker 均禁用。数据用于观察索引和查询的量级，不是延迟保证。不同构建模式、分块版本和计时范围不能直接比较。
+These measurements used Linux x86_64, four logical CPUs, and Rust 1.99, with embeddings and reranking disabled. They indicate the scale of indexing and query costs, not latency guarantees. Different build profiles, chunking versions, and timing scopes are not directly comparable.
 
-评测工具用法见 [benchmarks/README.md](../benchmarks/README.md)。
+See the [benchmark guide](../benchmarks/README.md) for tool usage.
 
-## 调试构建记录
+## Debug build
 
-测量使用 `solascope-bench`，源文件复制到独立目录，索引放在新的临时目录中。索引各阶段执行一次；查询先执行一次，再重复 30 次。
+Measurements used `solascope-bench`, with source copied into separate directories and a fresh temporary index for each corpus. Each indexing stage ran once. Each query ran once before 30 repeated observations.
 
-| 语料 | 文件 | Chunk | 首次索引 | 无变化扫描 | 重建 | 重建后 VmHWM |
+| Corpus | Files | Chunks | First index | Unchanged scan | Rebuild | VmHWM after rebuild |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 五语言 fixture | 5 | 22 | 46.4 ms | 9.4 ms | 16.3 ms | 21.4 MiB |
+| Five-language fixture | 5 | 22 | 46.4 ms | 9.4 ms | 16.3 ms | 21.4 MiB |
 | tokio 1.54.1 | 582 | 10 560 | 4.21 s | 0.365 s | 5.17 s | 58.7 MiB |
-| 六个 Rust 库及项目源码 | 1073 | 26 966 | 14.23 s | 0.757 s | 12.50 s | 108.4 MiB |
+| Six Rust libraries and project source | 1073 | 26 966 | 14.23 s | 0.757 s | 12.50 s | 108.4 MiB |
 
-第三组包含 tokio 1.54.1、hyper 1.12.0、reqwest 0.12.28、rusqlite 0.43.0、clap_builder 4.6.7、rmcp 3.11.0 和项目的 `apps/`、`crates/`。首次索引目录约 93.7 MiB，重建后约 102.8 MiB。
+The third corpus contains tokio 1.54.1, hyper 1.12.0, reqwest 0.12.28, rusqlite 0.43.0, clap_builder 4.6.7, rmcp 3.11.0, and this project's `apps/` and `crates/` directories. Its index occupied about 93.7 MiB after first indexing and 102.8 MiB after rebuilding.
 
-VmHWM 是进程的累计驻留内存高水位，不是某个阶段独占的内存。索引时间只有一次观测；重建比首次索引快不代表稳定收益。
+VmHWM is the process-wide cumulative resident-memory high-water mark, rather than memory exclusive to a stage. Index timings are single observations; a faster rebuild does not establish a repeatable improvement.
 
-### 查询
+### Queries
 
-下表来自较大语料，P50/P95 使用每条查询后续的 30 次观测。计时包含 `Engine::search` 内的召回、融合和源码校验，不包含进程启动及 JSON 输出。
+The following results use the largest corpus. P50/P95 use the 30 repeated observations after the first call. Timing covers retrieval, fusion, and source checks within `Engine::search`, excluding process startup and JSON output.
 
-| 查询 | 模式 | P50 | P95 |
+| Query | Mode | P50 | P95 |
 | --- | --- | ---: | ---: |
 | `spawn_blocking` | lexical | 20.9 ms | 22.7 ms |
 | `connection closed before message completed` | lexical | 75.0 ms | 76.7 ms |
 | `how is the runtime shut down gracefully` | lexical | 121.3 ms | 130.3 ms |
-| `spawn_blocking` | hybrid，无模型 | 43.8 ms | 45.3 ms |
-| `connection closed before message completed` | hybrid，无模型 | 95.7 ms | 101.5 ms |
-| `how is the runtime shut down gracefully` | hybrid，无模型 | 141.0 ms | 149.0 ms |
+| `spawn_blocking` | hybrid, no models | 43.8 ms | 45.3 ms |
+| `connection closed before message completed` | hybrid, no models | 95.7 ms | 101.5 ms |
+| `how is the runtime shut down gracefully` | hybrid, no models | 141.0 ms | 149.0 ms |
 
-lexical 使用 FTS5；无模型 hybrid 还包含独立符号通道。semantic 和 hybrid+rerank 未测量。小语料使用 fixture 的 18 条查询，其余两组使用以上三个查询。
+Lexical uses FTS5; hybrid without models also includes the independent symbol channel. Semantic and hybrid+rerank were not measured. The smallest corpus used the fixture's 18 queries; both larger corpora used the three queries above.
 
-查询文件可写为：
+A query file for the larger corpora can contain:
 
 ```json
 [
@@ -49,42 +49,42 @@ cargo run -p solascope-bench -- perf --root /path/to/copied-corpus \
   --runs 30 --json
 ```
 
-以上命令使用调试构建，与表中数据一致。做正式性能对比时加 `--release`，并固定语料、查询集、模型配置和缓存条件。
+This command uses a debug build, matching the table. For performance comparisons, add `--release` and fix the corpus, query set, model configuration, and cache conditions.
 
-## 早期发布构建记录
+## Earlier release build
 
-早期 v0.1.0 使用相同六个 Rust 库及项目源码，索引了 1069 个文件、30 273 个 Chunk。其分块规则与上述记录不同，查询计时还包含进程启动、数据库打开和 JSON 输出。
+An earlier v0.1.0 build indexed the same six Rust libraries and project source: 1069 files and 30 273 chunks. It used different chunking rules, and query timing included process startup, database opening, and JSON output.
 
-| 操作 | 耗时 | 峰值内存 |
+| Operation | Time | Peak memory |
 | --- | ---: | ---: |
-| 首次索引 | 3.6 s | 109 MB |
-| 无变化扫描 | 0.25 s | 29 MB |
-| 修改一个文件后索引 | 0.26 s | 28 MB |
-| 全量重建 | 4.6 s | 108 MB |
+| First index | 3.6 s | 109 MB |
+| Unchanged scan | 0.25 s | 29 MB |
+| Index after changing one file | 0.26 s | 28 MB |
+| Full rebuild | 4.6 s | 108 MB |
 
-| 查询 | P50 | P95 |
+| Query | P50 | P95 |
 | --- | ---: | ---: |
-| lexical：`spawn_blocking` | 21.4 ms | 22.2 ms |
-| lexical：`connection closed before message completed` | 24.7 ms | 26.1 ms |
-| lexical：`how is the runtime shut down gracefully` | 29.6 ms | 30.6 ms |
-| hybrid，无模型：同上 | 29.8 ms | 30.7 ms |
-| lexical：`shutdown`，路径限于 tokio 源码 | 24.2 ms | 25.3 ms |
-| symbol：`spawn_blocking` | 16.5 ms | 17.2 ms |
-| symbol：无匹配 | 13.3 ms | 14.3 ms |
+| lexical: `spawn_blocking` | 21.4 ms | 22.2 ms |
+| lexical: `connection closed before message completed` | 24.7 ms | 26.1 ms |
+| lexical: `how is the runtime shut down gracefully` | 29.6 ms | 30.6 ms |
+| hybrid, no models: same natural-language query | 29.8 ms | 30.7 ms |
+| lexical: `shutdown`, restricted to tokio source | 24.2 ms | 25.3 ms |
+| symbol: `spawn_blocking` | 16.5 ms | 17.2 ms |
+| symbol: no match | 13.3 ms | 14.3 ms |
 
-数据库约 103 MB，源码约 15 MiB。索引存储正文、Embedding 输入文本和 FTS 数据；未做压缩。向量与重排延迟未测量。
+The database occupied about 103 MB for about 15 MiB of source. The index stores source bodies, embedding inputs, and FTS data without compression. Vector and reranking latency were not measured.
 
-## Fixture 质量
+## Fixture quality
 
-`tests/fixtures/multilang/` 包含五种语言的源文件及 18 条标注查询，其中 5 条标注了行区间。
+`tests/fixtures/multilang/` contains source files in five languages and 18 labeled queries, including five with expected line ranges.
 
 ```bash
 cargo test -p solascope-engine --test quality -- --nocapture
 ```
 
-| 模式 | Top1 | Recall@5 | MRR@10 | 错误定位率 |
+| Mode | Top1 | Recall@5 | MRR@10 | Wrong-location rate |
 | --- | ---: | ---: | ---: | ---: |
 | lexical | 1.000 | 1.000 | 1.000 | 0 |
-| hybrid，无模型 | 1.000 | 1.000 | 1.000 | 0 |
+| hybrid, no models | 1.000 | 1.000 | 1.000 | 0 |
 
-这组查询验证文件、符号与行号匹配。样本小，查询词与注释重合较多，不能据此判断真实项目的语义检索质量。真实模型对照、更多项目的标注集，以及 watch/CLI/MCP 并发延迟仍待测量。
+These queries check file, symbol, and line matching. The sample is small and query terms often overlap comments, so it does not establish semantic retrieval quality on real projects. Live-model comparisons, larger labeled corpora, and concurrent watch/CLI/MCP latency remain to be measured.

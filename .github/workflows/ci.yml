@@ -66,7 +66,7 @@ jobs:
           with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
               for binary in binaries:
                   package.write(binary, binary.name)
-              for name in ("LICENSE", "README.md", "docs/configuration.md",
+              for name in ("LICENSE", "README.md", "README.zh-CN.md", "docs/configuration.md",
                            "docs/mcp.md", "docs/architecture.md", "docs/benchmarks.md",
                            "docs/implementation-status.md", "benchmarks/README.md"):
                   package.write(root / name, name)
