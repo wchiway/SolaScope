@@ -183,6 +183,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
+GitHub Actions 已配置在 Linux、macOS、Windows 上执行工作区格式检查、Clippy、默认测试和打包测试，`local-rerank` 测试单独在 Linux 任务运行。所有检查通过后，可复用工作流构建两个 CLI 二进制，并连同公开文档及 `SHA256SUMS` 打包：Unix 使用 `.tar.gz`，Windows 使用 `.zip`，按版本和 Rust target 命名。工作流复用 Rust 依赖缓存，并取消被新提交替代的旧运行；不自动发布到 crates.io 或 GitHub Releases。
+
+打包测试也可使用 Python 3.9 或更新版本在本地运行：
+
+```bash
+python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+```
+
 Linux CLI 构建、安装和自动化测试已验证。模型协议测试使用本地模拟服务。真实模型质量、本地 ONNX 推理、macOS/Windows 运行、商业 MCP 客户端以及远程 CI 发行包仍待验证。
 
 ## 许可证

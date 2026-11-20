@@ -1,0 +1,54 @@
+name: Package release binaries
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  package:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Get native Rust target
+        id: target
+        run: |
+          target=$(
+              rustc -vV |
+                  python -I -c 'import sys; sys.stdout.write(next(line.split()[1] for line in sys.stdin if line.startswith("host: ")))'
+          )
+          printf 'triple=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: package-${{ steps.target.outputs.triple }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build CLI release binaries
+        run: cargo build --release --locked -p solascope-cli --bins --target "${{ steps.target.outputs.triple }}"
+      - name: Verify both entry points and package
+        run: python -I .github/scripts/package_release.py --target "${{ steps.target.outputs.triple }}"
+      - name: Upload platform package
+        uses: actions/upload-artifact@v7
+        with:
+          name: solascope-${{ steps.target.outputs.triple }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0

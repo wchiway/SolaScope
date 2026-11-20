@@ -181,6 +181,14 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
+GitHub Actions is configured to run workspace formatting, Clippy, default tests, and package tests on Linux, macOS, and Windows, with `local-rerank` tests in a separate Linux job. After all checks pass, a reusable workflow builds both CLI binaries and packages them with public documentation and `SHA256SUMS`: `.tar.gz` on Unix, `.zip` on Windows, named by version and Rust target. Runs reuse Rust dependency caches and cancel superseded runs; publishing to crates.io or GitHub Releases is not configured.
+
+Package tests can also run locally with Python 3.9 or newer:
+
+```bash
+python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+```
+
 Linux CLI builds, installation, and automated tests have been exercised. Model protocol tests use local mock servers. Live model quality, local ONNX inference, macOS/Windows execution, commercial MCP clients, and remote CI packages still need validation.
 
 ## License

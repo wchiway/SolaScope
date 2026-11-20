@@ -30,6 +30,22 @@ cargo fmt --all -- --check
 
 Live model services, local ONNX inference, macOS/Windows execution, and commercial MCP clients have not been tested. Three-platform CI and packaging workflows are configured; remote runners and distribution packages still need validation.
 
+### CI and packages
+
+The workflow layout is inspired by [zoxide's workflows](https://github.com/ajeetdsouza/zoxide/tree/2f4bcebaa62a44742280172c9b4c2753266716d0/.github/workflows), adapted to this workspace's stable Cargo toolchain rather than Nix/nightly or publishing jobs.
+
+- `ci.yml` runs formatting, Clippy, default workspace tests, and Python package tests on all three platforms. Optional `local-rerank` tests run independently on Linux.
+- After all validation jobs pass, `ci.yml` calls the reusable `package.yml` workflow. It reads the native Rust target from the runner's compiler, builds both `solascope` and `sas`, verifies that their version output matches, and includes the public documentation and `SHA256SUMS`.
+- Rust caches are separated by job/platform or build target and saved only for `main`; superseded CI runs are cancelled.
+- Archive tests cover contents, executable permissions on Unix, checksums, alias-version mismatches, invalid inputs, and symlink rejection. The packaging script uses Python's standard library.
+- Only workflow artifacts are uploaded. No crates.io or GitHub Release publication is configured.
+
+| Native platform | Runner | Archive |
+| --- | --- | --- |
+| Linux x86_64 (GNU) | `ubuntu-latest` | `.tar.gz` |
+| macOS (runner architecture) | `macos-latest` | `.tar.gz` |
+| Windows x86_64 (MSVC) | `windows-latest` | `.zip` |
+
 ## Current limitations
 
 - Vector retrieval uses an exact scan; there is no ANN backend.
