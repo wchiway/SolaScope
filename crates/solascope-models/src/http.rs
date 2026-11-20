@@ -215,6 +215,7 @@ impl HttpTransport {
     }
 
     async fn post_inner<T: DeserializeOwned>(&self, body: &Value) -> Result<T> {
+        let total_attempts = self.retries + 1;
         for attempt in 0..=self.retries {
             let mut request = self.client.post(self.endpoint.clone()).json(body);
             // Resolve live process values or this configuration's file defaults;
@@ -240,9 +241,10 @@ impl HttpTransport {
                 Ok(response) => response,
                 Err(error) => {
                     if temporary_network(&error) && attempt < self.retries {
-                        backoff(attempt).await;
+                        backoff(attempt, total_attempts, None, "network").await;
                         continue;
                     }
+                    log_failure(attempt, total_attempts, None, 0, "network");
                     return Err(Error::ModelUnavailable(
                         "model transport failed; check service availability and TLS configuration"
                             .into(),
@@ -262,32 +264,52 @@ impl HttpTransport {
                 Err(ReadError::Network(error))
                     if temporary_network(&error) && attempt < self.retries =>
                 {
-                    backoff(attempt).await;
+                    backoff(attempt, total_attempts, Some(status), "response_stream").await;
                     continue;
                 }
                 Err(ReadError::Network(_)) => {
+                    log_failure(attempt, total_attempts, Some(status), 0, "response_stream");
                     return Err(Error::ModelUnavailable(
                         "model response stream failed".into(),
-                    ))
+                    ));
                 }
                 Err(ReadError::TooLarge) => {
+                    log_failure(
+                        attempt,
+                        total_attempts,
+                        Some(status),
+                        0,
+                        "response_too_large",
+                    );
                     return Err(Error::ModelIncompatible(
                         "model response exceeds size budget".into(),
-                    ))
+                    ));
                 }
             };
             let payload = serde_json::from_slice::<Value>(&bytes).ok();
             if let Some((error, retry)) = service_failure(status, payload.as_ref()) {
+                let category = match &error {
+                    Error::Authentication(_) => "authentication_or_quota",
+                    Error::ModelIncompatible(_) => "model_incompatible",
+                    Error::ModelUnavailable(_) if status == StatusCode::TOO_MANY_REQUESTS => {
+                        "rate_limited"
+                    }
+                    Error::ModelUnavailable(_) => "model_unavailable",
+                    _ => "request_rejected",
+                };
                 if retry && attempt < self.retries {
-                    backoff(attempt).await;
+                    backoff(attempt, total_attempts, Some(status), category).await;
                     continue;
                 }
+                log_failure(attempt, total_attempts, Some(status), 0, category);
                 return Err(error);
             }
             let payload = payload.ok_or_else(|| {
+                log_failure(attempt, total_attempts, Some(status), 0, "invalid_response");
                 Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
             })?;
             return serde_json::from_value(payload).map_err(|_| {
+                log_failure(attempt, total_attempts, Some(status), 0, "invalid_response");
                 Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
             });
         }
@@ -324,6 +346,135 @@ fn temporary_network(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_body()
 }
 
-async fn backoff(attempt: usize) {
-    tokio::time::sleep(Duration::from_millis(100 * (1_u64 << attempt.min(5)))).await;
+fn log_failure(
+    attempt: usize,
+    total_attempts: usize,
+    status: Option<StatusCode>,
+    delay_ms: u64,
+    category: &'static str,
+) {
+    tracing::warn!(
+        attempt = attempt + 1,
+        total_attempts,
+        http_status = status.map(|status| status.as_u16()),
+        delay_ms,
+        retrying = delay_ms > 0,
+        error_category = category,
+        "model HTTP request failed"
+    );
+}
+
+async fn backoff(
+    attempt: usize,
+    total_attempts: usize,
+    status: Option<StatusCode>,
+    category: &'static str,
+) {
+    let delay_ms = 100 * (1_u64 << attempt.min(5));
+    log_failure(attempt, total_attempts, status, delay_ms, category);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+    use tracing::instrument::WithSubscriber;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn failure_diagnostics_report_retries_without_request_or_response_secrets() {
+        for (status, code, delays, category) in [
+            (429, "rate_limit_error", vec![100, 200, 0], "rate_limited"),
+            (
+                503,
+                "service_unavailable",
+                vec![100, 200, 0],
+                "model_unavailable",
+            ),
+            (
+                429,
+                "insufficient_quota",
+                vec![0],
+                "authentication_or_quota",
+            ),
+            (400, "bad_request", vec![0], "request_rejected"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("X-Vendor-Trace", "header-canary")
+                        .set_body_json(json!({
+                            "error": {"code": code, "message": "vendor-message-canary"}
+                        })),
+                )
+                .expect(delays.len() as u64)
+                .mount(&server)
+                .await;
+            let mut transport = HttpTransport::new(
+                Url::parse(&format!(
+                    "{}/endpoint-canary?token=url-token-canary",
+                    server.uri()
+                ))
+                .unwrap(),
+                String::new(),
+                3,
+                2,
+                false,
+                Environment::default(),
+            )
+            .unwrap();
+            let mut authorization = HeaderValue::from_static("Bearer credential-canary");
+            authorization.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(AUTHORIZATION, authorization);
+            transport.client = Client::builder()
+                .no_proxy()
+                .default_headers(headers)
+                .build()
+                .unwrap();
+
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter("solascope_models::http=warn")
+                .with_writer(Mutex::new(log.reopen().unwrap()))
+                .finish();
+            let body = json!({"input": "source-query-canary"});
+            let result = transport
+                .post::<Value>(&body)
+                .with_subscriber(subscriber)
+                .await;
+            assert!(result.is_err());
+            server.verify().await;
+
+            let contents = std::fs::read_to_string(log.path()).unwrap();
+            let events: Vec<_> = contents.lines().collect();
+            assert_eq!(events.len(), delays.len());
+            for (index, (event, delay_ms)) in events.iter().zip(&delays).enumerate() {
+                assert!(event.contains(&format!("attempt={}", index + 1)));
+                assert!(event.contains("total_attempts=3"));
+                assert!(event.contains(&format!("http_status={status}")));
+                assert!(event.contains(&format!("delay_ms={delay_ms}")));
+                assert!(event.contains(&format!("retrying={}", *delay_ms != 0)));
+                assert!(event.contains(&format!("error_category=\"{category}\"")));
+            }
+            for sensitive in [
+                server.uri().as_str(),
+                "endpoint-canary",
+                "url-token-canary",
+                "credential-canary",
+                "source-query-canary",
+                "vendor-message-canary",
+                "header-canary",
+            ] {
+                assert!(!contents.contains(sensitive));
+            }
+        }
+    }
 }

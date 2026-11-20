@@ -2609,6 +2609,8 @@ dependencies = [
  "solascope-core",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wiremock",
 ]
 
