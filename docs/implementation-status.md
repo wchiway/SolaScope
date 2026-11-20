@@ -12,14 +12,14 @@ Current version: v0.1.0.
 | Retrieval | Lexical, symbol, and exact-vector retrieval with RRF fusion; results include line ranges, match sources, and stale status |
 | Embeddings | Ollama, generic/OpenAI-compatible APIs, DashScope, and SiliconFlow |
 | Reranking | Generic compatible HTTP services, DashScope, SiliconFlow, and optional FastEmbed/ONNX |
-| MCP | Four read-only tools over stdio, sharing Engine with the CLI |
+| MCP | Four read-only tools over stdio, sharing Engine with the CLI; typed output schemas, tool annotations, and per-call path/default overrides |
 | Evaluation | Labeled-query quality metrics, indexing times, query percentiles, and Linux resident-memory sampling |
 
 See [configuration](configuration.md), [architecture](architecture.md), and [recorded benchmarks](benchmarks.md) for details.
 
 ## Validation
 
-Workspace tests, Clippy, formatting checks, and CLI end-to-end checks have run on Linux x86_64. HTTP model protocols use local mock services; MCP tests use both raw JSON-RPC and rmcp SDK clients. Embedding retry, cooldown, adaptive concurrency, RPM/TPM budget, and timeout behavior are exercised with local mocks and virtual time; these checks do not establish real provider throughput, quota behavior, or service-specific `Retry-After` behavior.
+Workspace tests, Clippy, formatting checks, and CLI end-to-end checks have run on Linux x86_64. HTTP model protocols use local mock services; MCP tests use both raw JSON-RPC and rmcp SDK clients. MCP coverage includes tool schemas and annotations, startup defaults and request overrides, independent reranking with `.env` authentication, current source visibility, index generation updates, and missing/outdated-index recovery. Embedding retry, cooldown, adaptive concurrency, RPM/TPM budget, and timeout behavior are exercised with local mocks and virtual time; these checks do not establish real provider throughput, quota behavior, or service-specific `Retry-After` behavior.
 
 ```bash
 cargo test --workspace --all-targets --locked

@@ -156,7 +156,7 @@ A client configuration can use:
 }
 ```
 
-The server exposes `search_code`, `find_symbol`, `get_code_context`, and `index_status`. Each server instance serves one fixed project root. Use a separate `index` or `watch` process to update the index. See [MCP integration](docs/mcp.md) for tool parameters, responses, and client setup.
+The server exposes `search_code`, `find_symbol`, `get_code_context`, and `index_status`, with read-only annotations and typed output schemas. Each instance serves one fixed project root and reads index updates from a separate `index` or `watch` process without restarting. Context reads current source even without an index. See [MCP integration](docs/mcp.md) for tool parameters, responses, and client setup.
 
 ## Privacy
 

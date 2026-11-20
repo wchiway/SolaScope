@@ -11,7 +11,8 @@ solascope mcp --root /abs/path/to/project
 - The server is read-only: it does not create, update, or migrate an index. Run `index` first, or keep a separate `watch` / `index --watch` process running.
 - Stdout carries protocol messages only. Diagnostics go to stderr and, by default, `logs/solascope.log` beside the active configuration. `log.persist = false` disables the automatic copy; an explicit `log.output` can redirect traces to a protected file within the project.
 - Configuration supplies the default result limit, retrieval mode, path filter, and reranking setting. Startup flags `--limit`, `--mode`, `--path`, and `--no-rerank` can override them.
-- Missing indexes and outdated schemas or chunking rules produce errors with instructions to run `index` separately.
+- Search, symbol lookup, and status require an existing index. Missing indexes and outdated schemas or chunking rules produce errors with instructions to run `index` separately. Context reads current source and works without an index.
+- Each search or symbol call reads the latest committed index generation. A separate indexing process can publish updates while the MCP server stays running. Current ignore and sensitive-path checks apply on every call.
 
 ## Client configuration
 
@@ -52,6 +53,10 @@ solascope mcp --root /abs/path/to/project --probe
 
 ## Tools
 
+`tools/list` includes parameter descriptions, a typed `outputSchema` for successful structured results, and `readOnlyHint: true` / `destructiveHint: false` annotations for all four tools. `search_code` has `openWorldHint: true` because configured models may use a remote service; the other tools have `openWorldHint: false`. Read-only means tools do not modify source or index data; configured diagnostics can still write logs.
+
+Use `search_code` to locate code from a question, keyword, or error; `find_symbol` for definitions and spelling correction; `get_code_context` to inspect current source; and `index_status` to inspect index counts and generation. Inspect warnings and `stale` before relying on indexed locations.
+
 ### search_code
 
 | Parameter | Type | Description |
@@ -59,8 +64,10 @@ solascope mcp --root /abs/path/to/project --probe
 | `query` | string, required | 1–4096 UTF-8 bytes; cannot be blank |
 | `limit` | integer | 1–100 |
 | `mode` | `lexical` \| `semantic` \| `hybrid` | Defaults to the server's configured mode |
-| `path_filter` | string | Project-relative path prefix or glob |
+| `path_filter` | string | Project-relative path prefix or glob; omitted/null inherits the server filter, `""` clears it |
 | `rerank` | boolean | Whether to use the configured reranker |
+
+Lexical mode uses FTS5 without embeddings, semantic mode uses vectors, and hybrid mode combines lexical, symbol, and optional vector retrieval. Reranking is independent and can run in any mode; set `rerank: false` with `mode: "lexical"` to avoid all model calls.
 
 With models disabled, hybrid search uses lexical and symbol retrieval and returns a warning; semantic search returns a model-unavailable error. If `search.semantic_fail_open` allows it, hybrid queries fall back when embeddings are temporarily unavailable or authentication fails. Fingerprint or dimension incompatibility does not fall back. Reranker failures preserve fused order or return an error according to `rerank.fail_open`.
 
@@ -70,7 +77,7 @@ With models disabled, hybrid search uses lexical and symbol retrieval and return
 | --- | --- | --- |
 | `name` | string, required | Symbol name, qualified name, or fragment; 1–4096 bytes |
 | `kind` | string | For example, `function`, `method`, `class`, or `struct` |
-| `path_filter` | string | Project-relative path prefix or glob |
+| `path_filter` | string | Project-relative path prefix or glob; omitted/null inherits the server filter, `""` clears it |
 | `limit` | integer | 1–100 |
 
 Matching prefers exact names, prefixes, substrings, then limited spelling correction. Corrected results use `fuzzy` in `match_sources` and are specific to this tool. No embedding or reranking requests are made.
@@ -83,13 +90,13 @@ Matching prefers exact names, prefixes, substrings, then limited spelling correc
 | `start_line`, `end_line` | integer | Inclusive range, starting at 1 |
 | `line`, `before`, `after` | integer | Center line and surrounding lines; an alternative to the explicit range |
 
-Returns up to 200 lines or 64 KiB from the current source file, subject to ignore and sensitive-path rules. Rejects `..`, absolute paths, Windows drive/UNC escapes, and symlinks outside the root. Include rules cannot override sensitive-path exclusions.
+Returns `relative_path`, `start_line`, `end_line`, and `lines` (an array of `{ "line": 1, "text": "..." }`) from the current source file without requiring an index. Line numbers are 1-based and inclusive. Explicit ranges and center lines must lie within the file; before/after context is clipped at file boundaries. Requests exceeding the 200-line / 64-KiB bounds return an error; content is not silently truncated. Reads are subject to ignore and sensitive-path rules. Rejects `..`, absolute paths, Windows drive/UNC escapes, and symlinks outside the root. Include rules cannot override sensitive-path exclusions.
 
 ### index_status
 
 Takes no parameters; pass `{}`. Returns the project ID, fixed root and index directory, index generation, file/chunk/vector counts, cache entries, `relocated_vectors`, embedding fingerprint, latest update time, and unfinished-job count.
 
-`relocated_vectors` counts vectors reused after moving or renaming files. An explicit `index --rebuild` recomputes these approximate entries using the current complete input. This tool does not probe models or update the index.
+`relocated_vectors` counts vectors reused after moving or renaming files. An explicit `index --rebuild` recomputes these approximate entries using the current complete input. This tool checks schema and chunking compatibility, but does not probe models, check embedding fingerprint compatibility against the current configuration, or update the index.
 
 ## Response structure
 

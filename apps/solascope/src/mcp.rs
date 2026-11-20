@@ -32,25 +32,36 @@ struct CodeServer {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SearchParams {
-    /// Nonempty search text, at most 4096 UTF-8 bytes.
+    /// Question, symbol, keyword, or error message; 1–4096 UTF-8 bytes, not blank.
     #[schemars(length(min = 1, max = 4096))]
     query: String,
     /// Number of results, from 1 to 100; defaults to server configuration.
     #[schemars(range(min = 1, max = 100))]
     limit: Option<usize>,
+    /// lexical: FTS5 only; semantic: embeddings required; hybrid: lexical, symbols,
+    /// and optional embeddings. Defaults to server configuration.
     mode: Option<Mode>,
-    /// Project-relative path/prefix; may not escape the server root.
+    /// Project-relative path prefix or glob (for example, src/ or **/*.rs).
+    /// Omit to inherit the server filter; an empty string clears it.
     path_filter: Option<String>,
+    /// Use the configured reranker in any mode. Defaults to server configuration;
+    /// false skips reranking. Lexical mode skips embeddings, but may still rerank.
     rerank: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SymbolParams {
+    /// Symbol name, qualified name, or fragment; 1–4096 UTF-8 bytes, not blank.
+    /// Matching prefers exact names, then prefixes, substrings, and spelling correction.
     #[schemars(length(min = 1, max = 4096))]
     name: String,
+    /// Definition kind, for example function, method, class, struct, enum, or trait.
     kind: Option<String>,
+    /// Project-relative path prefix or glob. Omit to inherit the server filter;
+    /// an empty string clears it.
     path_filter: Option<String>,
+    /// Number of results, from 1 to 100; defaults to server configuration.
     #[schemars(range(min = 1, max = 100))]
     limit: Option<usize>,
 }
@@ -58,11 +69,14 @@ struct SymbolParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ContextParams {
-    /// Source path relative to the fixed server root.
+    /// Current source file relative to the fixed root, subject to ignore and
+    /// sensitive-path rules. Does not require an index; use paths from search results.
+    #[schemars(length(min = 1))]
     path: String,
     /// Inclusive range start. Requires end_line and excludes line/before/after.
     #[schemars(range(min = 1))]
     start_line: Option<usize>,
+    /// Inclusive range end; must be >= start_line, with at most 200 lines total.
     #[schemars(range(min = 1))]
     end_line: Option<usize>,
     /// Center line; defaults to 1 when no range is supplied.
@@ -71,6 +85,7 @@ struct ContextParams {
     /// Lines before center; defaults to 10. Total is limited to 200 lines / 64 KiB.
     #[schemars(range(min = 0, max = 199))]
     before: Option<usize>,
+    /// Lines after center; defaults to 10. The combined range must fit in 200 lines.
     #[schemars(range(min = 0, max = 199))]
     after: Option<usize>,
 }
@@ -82,7 +97,9 @@ struct EmptyParams {}
 #[tool_router]
 impl CodeServer {
     #[tool(
-        description = "Search indexed source code in the fixed project root. Returns ranked locations, snippets, scores, and warnings; never creates an index."
+        description = "Search indexed code by question, symbol, keyword, or error message. Lexical uses FTS5 without embeddings; hybrid combines lexical, symbols, and optional embeddings; semantic requires embeddings. Returns ranked paths, symbols, line ranges, snippets, match_sources, stale flags, warnings, and timings from one index generation. For spelling correction use find_symbol; for current source use get_code_context. Requires an existing index; run solascope index separately.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::SearchResponse>(),
+        annotations(read_only_hint = true, destructive_hint = false, open_world_hint = true)
     )]
     async fn search_code(
         &self,
@@ -97,7 +114,8 @@ impl CodeServer {
                 limit: params.limit.unwrap_or(self.defaults.limit),
                 path_filter: params
                     .path_filter
-                    .or_else(|| self.defaults.path_filter.clone()),
+                    .or_else(|| self.defaults.path_filter.clone())
+                    .filter(|path| !path.is_empty()),
                 rerank: params.rerank.unwrap_or(self.defaults.rerank),
             };
             request.validate()?;
@@ -107,7 +125,9 @@ impl CodeServer {
     }
 
     #[tool(
-        description = "Find symbol definitions in the existing project index, optionally filtered by kind and relative path."
+        description = "Find indexed symbol definitions by exact name, prefix, substring, or limited spelling correction, optionally filtered by definition kind and relative path/glob. Corrected results include fuzzy in match_sources. Returns the same ranked-location structure as search_code, with stale flags and warnings. Does not call embedding or reranking models. Requires an existing index.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::SearchResponse>(),
+        annotations(read_only_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn find_symbol(
         &self,
@@ -127,7 +147,10 @@ impl CodeServer {
                     let request = SymbolRequest {
                         name: params.name,
                         kind: params.kind,
-                        path_filter: params.path_filter.or(defaults.path_filter),
+                        path_filter: params
+                            .path_filter
+                            .or(defaults.path_filter)
+                            .filter(|path| !path.is_empty()),
                         limit: params.limit.unwrap_or(defaults.limit),
                     };
                     request.validate()?;
@@ -139,7 +162,9 @@ impl CodeServer {
     }
 
     #[tool(
-        description = "Read numbered source context inside the fixed root. Supply an inclusive start_line/end_line pair or a center line with optional before/after. Maximum 200 lines and 64 KiB."
+        description = "Read current numbered source inside the fixed root, including when an index is missing or stale. Supply an inclusive start_line/end_line pair or a center line with optional before/after. Returns relative_path, start_line, end_line, and numbered lines. Maximum 200 lines and 64 KiB; ignore and sensitive-path rules apply. Does not call models.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::ContextResponse>(),
+        annotations(read_only_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn get_code_context(
         &self,
@@ -167,7 +192,9 @@ impl CodeServer {
     }
 
     #[tool(
-        description = "Inspect current index generation, counts, model identity, and last update for the fixed project. Does not index or modify source files."
+        description = "Inspect the fixed project's index generation, file/chunk/vector/cache counts, relocated_vectors, embedding fingerprint, last update, and unfinished jobs. Relocated vectors are approximate reuse after file moves; solascope index --rebuild refreshes them. Missing indexes and outdated schema or chunking rules return an error. Does not probe models, check embedding compatibility, create, migrate, or update an index.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::IndexStatus>(),
+        annotations(read_only_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn index_status(
         &self,
@@ -184,7 +211,7 @@ impl ServerHandler for CodeServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("solascope", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Read-only code search for one fixed project root. Index the project with `solascope index` before searching. Tool errors do not end the session.")
+            .with_instructions("Read-only code search for one fixed project root. Use search_code for questions, keywords, or error messages; find_symbol for definitions and spelling correction; get_code_context for current source, even without an index; and index_status for generation and counts. Search and symbol tools read the latest committed index generation on each call. Check warnings and stale flags before relying on indexed locations. Optional models follow server configuration and privacy settings. Run solascope index or watch separately to build or refresh the index, and doctor for diagnostics; tools never create, migrate, or update it. Tool errors do not end the session.")
     }
 }
 

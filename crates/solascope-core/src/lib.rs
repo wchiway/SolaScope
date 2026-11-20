@@ -137,7 +137,7 @@ impl Chunk {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ModelFingerprint {
     pub provider: String,
     pub model: String,
@@ -211,7 +211,9 @@ pub trait RerankProvider: Send + Sync {
     async fn rerank(&self, query: &str, documents: &[RerankDocument]) -> Result<Vec<RerankScore>>;
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     Lexical,
@@ -316,7 +318,7 @@ pub struct RankedChunk {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResult {
     pub project_id: String,
     pub relative_path: String,
@@ -337,7 +339,7 @@ pub struct SearchResult {
 
 /// Wall-clock milliseconds per search stage. A model stage is zero when it did
 /// not run or was served from the in-process query cache.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct SearchTimings {
     pub embedding_ms: f64,
     pub retrieval_ms: f64,
@@ -345,7 +347,7 @@ pub struct SearchTimings {
     pub total_ms: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResponse {
     pub query: String,
     pub mode: SearchMode,
@@ -380,13 +382,13 @@ impl Default for ContextRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextLine {
     pub line: usize,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextResponse {
     pub relative_path: String,
     pub start_line: usize,
@@ -401,7 +403,7 @@ pub struct IndexGeneration {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IndexStatus {
     pub project_id: String,
     pub root: String,

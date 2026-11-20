@@ -156,7 +156,7 @@ solascope mcp --root /absolute/path/to/project
 }
 ```
 
-服务提供 `search_code`、`find_symbol`、`get_code_context` 和 `index_status`。每个实例固定服务一个项目，索引更新由独立的 `index` 或 `watch` 进程完成。工具参数、返回结构和客户端接入见 [MCP 文档](docs/mcp.md)。
+服务提供 `search_code`、`find_symbol`、`get_code_context` 和 `index_status`，并声明只读属性和输出 schema。每个实例固定服务一个项目，无需重启即可读取独立 `index` 或 `watch` 进程发布的索引更新。上下文工具直接读取当前源码，无需预先建立索引。工具参数、返回结构和客户端接入见 [MCP 文档](docs/mcp.md)。
 
 ## 隐私
 
