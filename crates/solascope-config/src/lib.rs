@@ -833,7 +833,10 @@ mod tests {
         assert!(!config.rerank.allow_model_download);
         assert_eq!(config.embedding.provider, "disabled");
         assert_eq!(config.rerank.provider, "disabled");
-        assert_eq!(config.project.index_dir, root.path().join(".solascope"));
+        assert_eq!(
+            config.project.index_dir,
+            root.path().canonicalize().unwrap().join(".solascope")
+        );
         let path = write_default_config(root.path()).unwrap();
         let first = fs::read(&path).unwrap();
         assert!(write_default_config(root.path()).is_err());
@@ -905,6 +908,37 @@ mod tests {
         assert_eq!(config.search.lexical_top_k, 8);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn aliased_source_roots_use_canonical_default_index_paths() {
+        let workspace = tempdir().unwrap();
+        let source = workspace.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join(".git")).unwrap();
+        let alias = workspace.path().join("alias");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        assert_ne!(alias, canonical);
+        let defaults = Config::default_for_root(&alias).unwrap();
+        assert_eq!(defaults.project.root, canonical);
+        assert_eq!(defaults.project.index_dir, canonical.join(".solascope"));
+
+        let environment = BTreeMap::from([(
+            "SOLASCOPE__PROJECT__ROOT".into(),
+            alias.to_string_lossy().into_owned(),
+        )]);
+        for (root, cwd, env) in [
+            (Some(alias.as_path()), workspace.path(), BTreeMap::new()),
+            (None, alias.as_path(), BTreeMap::new()),
+            (None, workspace.path(), environment),
+        ] {
+            let config = load_with_sources(root, None, cwd, None, &env).unwrap();
+            assert_eq!(config.project.root, canonical);
+            assert_eq!(config.project.index_dir, canonical.join(".solascope"));
+        }
+        assert!(!source.join(".solascope").exists());
+    }
+
     #[test]
     fn cli_root_beats_environment_and_root_moves_default_index() {
         let cwd = tempdir().unwrap();
@@ -915,11 +949,16 @@ mod tests {
             env_root.path().to_string_lossy().into(),
         )]);
         let config = load_with_sources(Some(cli.path()), None, cwd.path(), None, &env).unwrap();
-        assert_eq!(config.project.root, cli.path());
-        assert_eq!(config.project.index_dir, cli.path().join(".solascope"));
+        let canonical_cli = cli.path().canonicalize().unwrap();
+        assert_eq!(config.project.root, canonical_cli);
+        assert_eq!(config.project.index_dir, canonical_cli.join(".solascope"));
         let config = load_with_sources(None, None, cwd.path(), None, &env).unwrap();
-        assert_eq!(config.project.root, env_root.path());
-        assert_eq!(config.project.index_dir, env_root.path().join(".solascope"));
+        let canonical_env_root = env_root.path().canonicalize().unwrap();
+        assert_eq!(config.project.root, canonical_env_root);
+        assert_eq!(
+            config.project.index_dir,
+            canonical_env_root.join(".solascope")
+        );
     }
 
     #[test]
@@ -1075,7 +1114,7 @@ mod tests {
             project.path().to_string_lossy().into_owned(),
         )]);
         let config = load_with_sources(None, None, cwd.path(), None, &env).unwrap();
-        assert_eq!(config.project.root, project.path());
+        assert_eq!(config.project.root, project.path().canonicalize().unwrap());
         assert_eq!(config.search.limit, 9);
     }
 
@@ -1127,8 +1166,8 @@ mod tests {
             "[log]\nlevel='debug'\noutput='logs/diagnostics.txt'\nredact_secrets=false\n[index]\nwatch=true\nhash_algorithm='sha256'\n[embedding]\nrequest_dimensions=false\nfingerprint_policy='rebuild'\n").unwrap();
         let config = load(root.path(), None, &[]).unwrap();
         assert_eq!(
-            config.log.output,
-            root.path().join("logs/diagnostics.txt").to_string_lossy()
+            Path::new(&config.log.output),
+            root.path().join("logs").join("diagnostics.txt")
         );
         assert!(!config.log.redact_secrets);
         assert!(config.index.watch);
@@ -1146,10 +1185,7 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(
-            config.log.output,
-            root.path().join("run.log").to_string_lossy()
-        );
+        assert_eq!(Path::new(&config.log.output), root.path().join("run.log"));
         assert!(config.log.redact_secrets);
         assert!(!config.index.watch);
         assert!(config.embedding.request_dimensions);

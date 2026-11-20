@@ -1081,9 +1081,11 @@ mod tests {
     use solascope_core::{hash_text, EMBEDDING_TEMPLATE_VERSION};
 
     fn update(root: &Path, path: &str, name: &str) -> FileUpdate {
+        // Store::open identifies projects by the canonical source root.
+        let root = root.canonicalize().unwrap();
         let content = format!("fn {name}() {{ println!(\"hello\"); }}");
         let embedding_text = format!("path: {path}\n{content}");
-        let id = project_id(root);
+        let id = project_id(&root);
         let chunk = Chunk {
             id: hash_text(&format!("{path}:{name}")),
             entity_id: hash_text(name),
@@ -1164,6 +1166,26 @@ mod tests {
         let lock = WriterLock::acquire(&directory).unwrap();
         let store = Store::open(&directory, root, true).unwrap();
         (directory, lock, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updates_from_aliased_roots_match_the_stores_project_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let alias = workspace.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+        let (_, lock, mut store) = open(&alias);
+        let file = update(&alias, "lib.rs", "greet");
+        assert_eq!(file.chunks[0].project_id, store.project_id);
+        assert_eq!(
+            file.source.absolute_path,
+            root.path().canonicalize().unwrap().join("lib.rs")
+        );
+        commit(&mut store, &lock, &[file], &[], None, &[]).unwrap();
+        assert_eq!(store.lexical_search("greet", 10, None).unwrap().len(), 1);
+        assert_eq!(store.status().unwrap().files, 1);
+        store.integrity_check().unwrap();
     }
 
     #[test]

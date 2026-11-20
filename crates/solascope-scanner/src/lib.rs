@@ -531,11 +531,34 @@ mod tests {
         let result = scan(&config).unwrap();
         assert_eq!(paths(&result), ["a/hello.py", "empty.txt", "z.rs"]);
         assert_eq!(result.files[2].hash, hash_bytes(b"fn z() {}\n"));
-        assert_eq!(result.files[2].absolute_path, root.path().join("z.rs"));
+        assert_eq!(
+            result.files[2].absolute_path,
+            root.path().canonicalize().unwrap().join("z.rs")
+        );
         assert_eq!(paths(&scan(&config).unwrap()), paths(&result));
         assert_eq!(
             read_file(&config, "a\\hello.py").unwrap().relative_path,
             "a/hello.py"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanning_an_aliased_root_returns_canonical_source_paths() {
+        let (root, mut config) = fixture();
+        write(root.path(), "source.rs", "fn source() {}\n");
+        let workspace = tempdir().unwrap();
+        let alias = workspace.path().join("alias");
+        std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+        // Policy must also normalize roots supplied directly by library callers.
+        config.project.root = alias;
+        let result = scan(&config).unwrap();
+        assert_eq!(paths(&result), ["source.rs"]);
+        let expected = root.path().canonicalize().unwrap().join("source.rs");
+        assert_eq!(result.files[0].absolute_path, expected);
+        assert_eq!(
+            read_file(&config, "source.rs").unwrap().absolute_path,
+            expected
         );
     }
 
@@ -731,8 +754,10 @@ mod tests {
 
     #[test]
     fn watch_event_filter_covers_deletions_noise_and_ignore_changes() {
-        let (root, config) = fixture();
-        let event = |path: &str| Event::new(EventKind::Any).add_path(root.path().join(path));
+        let (_root, config) = fixture();
+        // watch() registers the canonical root with the filesystem backend.
+        let event =
+            |path: &str| Event::new(EventKind::Any).add_path(config.project.root.join(path));
         assert!(event_is_relevant(&config, &event("src/deleted.rs")));
         assert!(event_is_relevant(&config, &event(".gitignore")));
         assert!(event_is_relevant(&config, &event(".solascopeignore")));
@@ -747,7 +772,7 @@ mod tests {
             assert!(!event_is_relevant(&config, &event(path)), "{path}");
         }
         let event = Event::new(EventKind::Access(notify::event::AccessKind::Any))
-            .add_path(root.path().join("src.rs"));
+            .add_path(config.project.root.join("src.rs"));
         assert!(!event_is_relevant(&config, &event));
     }
 
