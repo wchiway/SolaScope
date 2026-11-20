@@ -59,6 +59,13 @@ section!(EmbeddingConfig {
     concurrency: usize = 2,
     timeout_secs: u64 = 30,
     retries: usize = 2,
+    retry_base_delay_ms: u64 = 1_000,
+    retry_max_delay_ms: u64 = 60_000,
+    rate_limit_cooldown_ms: u64 = 5_000,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requests_per_minute: Option<u32> = None,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_per_minute: Option<u64> = None,
     fingerprint_policy: String = "strict".into(),
 });
 section!(RerankConfig {
@@ -106,6 +113,44 @@ section!(LogConfig {
     #[serde(skip)]
     directory: Option<PathBuf> = None,
 });
+
+impl EmbeddingConfig {
+    /// Validate retry delays and optional provider rate budgets.
+    pub fn validate_rate_limits(&self) -> Result<()> {
+        if self.retry_base_delay_ms == 0 {
+            return Err(invalid("embedding.retry_base_delay_ms must be positive"));
+        }
+        if self.retry_max_delay_ms == 0 || self.retry_max_delay_ms > 300_000 {
+            return Err(invalid(
+                "embedding.retry_max_delay_ms must be between 1 and 300000",
+            ));
+        }
+        if self.rate_limit_cooldown_ms == 0 {
+            return Err(invalid("embedding.rate_limit_cooldown_ms must be positive"));
+        }
+        if self.retry_base_delay_ms > self.retry_max_delay_ms {
+            return Err(invalid(
+                "embedding.retry_base_delay_ms must not exceed retry_max_delay_ms",
+            ));
+        }
+        if self.rate_limit_cooldown_ms > self.retry_max_delay_ms {
+            return Err(invalid(
+                "embedding.rate_limit_cooldown_ms must not exceed retry_max_delay_ms",
+            ));
+        }
+        if let Some(requests) = self.requests_per_minute {
+            if requests == 0 {
+                return Err(invalid("embedding.requests_per_minute must be positive"));
+            }
+        }
+        if let Some(tokens) = self.tokens_per_minute {
+            if tokens == 0 {
+                return Err(invalid("embedding.tokens_per_minute must be positive"));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -225,6 +270,7 @@ impl Config {
             &["off", "error", "warn", "info", "debug", "trace"],
             "log.level",
         )?;
+        self.embedding.validate_rate_limits()?;
         one_of(
             &self.embedding.fingerprint_policy,
             &["strict", "rebuild"],
@@ -281,6 +327,12 @@ impl Config {
             if count == 0 {
                 return Err(invalid(&format!("{name} must be positive")));
             }
+        }
+        if self.embedding.timeout_secs > 300 {
+            return Err(invalid("embedding.timeout_secs must not exceed 300"));
+        }
+        if self.embedding.retries > 5 {
+            return Err(invalid("embedding.retries must not exceed 5"));
         }
         if !self.search.fusion_k.is_finite() || self.search.fusion_k <= 0.0 {
             return Err(invalid("search.fusion_k must be finite and positive"));
@@ -478,12 +530,29 @@ fn environment_layer(
         let field_default = defaults
             .get(&parts[0])
             .and_then(|group| group.get(&parts[1]));
-        // Optional values are omitted by TOML serialization; cache_dir is the
-        // only nullable field, and an environment value sets a concrete path.
+        // Optional fields are omitted by TOML serialization; recognize their
+        // environment spellings explicitly so values still receive strict typing.
         let is_path = parts[0] == "rerank" && parts[1] == "cache_dir";
+        let optional_number = parts[0] == "embedding"
+            && matches!(
+                parts[1].as_str(),
+                "requests_per_minute" | "tokens_per_minute"
+            );
         let value = match field_default {
             Some(toml::Value::String(_)) => toml::Value::String(raw.clone()),
             None if is_path => toml::Value::String(raw.clone()),
+            None if optional_number => {
+                let wrapped: toml::Value = toml::from_str(&format!("value = {raw}"))
+                    .map_err(|_| invalid("invalid TOML environment override (values redacted)"))?;
+                let number = wrapped
+                    .get("value")
+                    .and_then(toml::Value::as_integer)
+                    .filter(|number| *number >= 0)
+                    .ok_or_else(|| {
+                        invalid("invalid integer environment override (values redacted)")
+                    })?;
+                toml::Value::Integer(number)
+            }
             Some(_) => {
                 let wrapped: toml::Value = toml::from_str(&format!("value = {raw}"))
                     .map_err(|_| invalid("invalid TOML environment override (values redacted)"))?;
@@ -1253,5 +1322,118 @@ mod tests {
         .unwrap();
         let config = load_with_sources(None, None, root.path(), None, &BTreeMap::new()).unwrap();
         assert_eq!(config.embedding.provider, "disabled");
+    }
+
+    #[test]
+    fn embedding_rate_limits_keep_defaults_and_obey_configuration_layer_precedence() {
+        let root = tempdir().unwrap();
+        let settings = tempdir().unwrap();
+        let global = settings.path().join("user.toml");
+        fs::write(
+            &global,
+            "[embedding]\nrequests_per_minute=11\ntokens_per_minute=1100\n",
+        )
+        .unwrap();
+        fs::write(settings.path().join(".env"), "SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE=12\nSOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE=1200\n").unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[embedding]\nretry_base_delay_ms=250\nrequests_per_minute=21\ntokens_per_minute=2100\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".env"),
+            "SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE=22\nSOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE=2200\n",
+        )
+        .unwrap();
+
+        let config = load(root.path(), Some(&global), &[]).unwrap();
+        assert_eq!(config.embedding.retry_base_delay_ms, 250);
+        assert_eq!(config.embedding.retry_max_delay_ms, 60_000);
+        assert_eq!(config.embedding.rate_limit_cooldown_ms, 5_000);
+        assert_eq!(config.embedding.requests_per_minute, Some(22));
+        assert_eq!(config.embedding.tokens_per_minute, Some(2_200));
+
+        let process = load(
+            root.path(),
+            Some(&global),
+            &[
+                ("SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE", "31"),
+                ("SOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE", "3100"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(process.embedding.requests_per_minute, Some(31));
+        assert_eq!(process.embedding.tokens_per_minute, Some(3_100));
+
+        fs::write(root.path().join(".solascope.toml"), "[embedding]\n").unwrap();
+        fs::remove_file(root.path().join(".env")).unwrap();
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[embedding]\nretries=0\n",
+        )
+        .unwrap();
+        let no_retries = load(root.path(), None, &[]).unwrap();
+        assert_eq!(no_retries.embedding.retries, 0);
+
+        fs::write(root.path().join(".solascope.toml"), "[embedding]\n").unwrap();
+        let legacy = load(root.path(), None, &[]).unwrap();
+        assert_eq!(legacy.embedding.retry_base_delay_ms, 1_000);
+        assert_eq!(legacy.embedding.retry_max_delay_ms, 60_000);
+        assert_eq!(legacy.embedding.rate_limit_cooldown_ms, 5_000);
+        assert_eq!(legacy.embedding.requests_per_minute, None);
+        assert_eq!(legacy.embedding.tokens_per_minute, None);
+        let serialized = toml::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("requests_per_minute"));
+        assert!(!serialized.contains("tokens_per_minute"));
+    }
+
+    #[test]
+    fn embedding_rate_limits_reject_invalid_combinations_and_environment_types() {
+        let root = tempdir().unwrap();
+        let cases = [
+            "retry_base_delay_ms=0",
+            "retry_base_delay_ms=60001",
+            "retry_max_delay_ms=0",
+            "retry_max_delay_ms=300001",
+            "rate_limit_cooldown_ms=0",
+            "rate_limit_cooldown_ms=60001",
+            "requests_per_minute=0",
+            "requests_per_minute=-1",
+            "tokens_per_minute=0",
+            "tokens_per_minute=-1",
+            "requests_per_minute=4294967296",
+            "tokens_per_minute=18446744073709551616",
+            "timeout_secs=301",
+            "retries=6",
+        ];
+        for setting in cases {
+            fs::write(
+                root.path().join(".solascope.toml"),
+                format!("[embedding]\n{setting}\n"),
+            )
+            .unwrap();
+            assert!(load(root.path(), None, &[]).is_err(), "accepted {setting}");
+        }
+        fs::write(root.path().join(".solascope.toml"), "[embedding]\n").unwrap();
+        for (name, raw) in [
+            ("SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE", "true"),
+            ("SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE", "0"),
+            ("SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE", "-1"),
+            ("SOLASCOPE__EMBEDDING__REQUESTS_PER_MINUTE", "4294967296"),
+            ("SOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE", "0"),
+            ("SOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE", "-1"),
+            (
+                "SOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE",
+                "18446744073709551616",
+            ),
+            (
+                "SOLASCOPE__EMBEDDING__TOKENS_PER_MINUTE",
+                "not-a-number-secret",
+            ),
+            ("SOLASCOPE__EMBEDDING__UNKNOWN_RATE", "4"),
+        ] {
+            let error = load(root.path(), None, &[(name, raw)]).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(raw));
+        }
     }
 }

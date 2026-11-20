@@ -19,7 +19,7 @@ See [configuration](configuration.md), [architecture](architecture.md), and [rec
 
 ## Validation
 
-Workspace tests, Clippy, formatting checks, and CLI end-to-end checks have run on Linux x86_64. HTTP model protocols use local mock services; MCP tests use both raw JSON-RPC and rmcp SDK clients.
+Workspace tests, Clippy, formatting checks, and CLI end-to-end checks have run on Linux x86_64. HTTP model protocols use local mock services; MCP tests use both raw JSON-RPC and rmcp SDK clients. Embedding retry, cooldown, adaptive concurrency, RPM/TPM budget, and timeout behavior are exercised with local mocks and virtual time; these checks do not establish real provider throughput, quota behavior, or service-specific `Retry-After` behavior.
 
 ```bash
 cargo test --workspace --all-targets --locked

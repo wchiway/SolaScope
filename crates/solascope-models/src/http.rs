@@ -1,13 +1,19 @@
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use reqwest::{
-    header::{HeaderValue, AUTHORIZATION},
+    header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER},
     Client, StatusCode, Url,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use solascope_config::Environment;
+use solascope_config::{EmbeddingConfig, Environment};
 use solascope_core::{Error, Result};
+
+use crate::rate_limit::RateLimiter;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
@@ -19,6 +25,7 @@ pub(crate) struct HttpTransport {
     environment: Environment,
     retries: usize,
     timeout: Duration,
+    limits: Option<Arc<RateLimiter>>,
 }
 
 /// Accept only HTTP(S) URLs with credentials kept in environment variables.
@@ -73,9 +80,15 @@ pub(crate) fn endpoint(base: &str, suffix: &str) -> Result<(Url, bool)> {
     Ok((url, !loopback))
 }
 
+struct ServiceFailure {
+    error: Error,
+    retry: bool,
+    rate_limited: bool,
+}
+
 // Error payloads can arrive with HTTP 200 on compatible gateways. Classify
 // only known codes and never expose response messages, URLs or credentials.
-fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, bool)> {
+fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<ServiceFailure> {
     let codes: Vec<String> = body
         .into_iter()
         .flat_map(|value| {
@@ -121,10 +134,11 @@ fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, b
         "prepaidbilloverdue",
         "postpaidbilloverdue",
     ]) {
-        return Some((
-            Error::Authentication("model service rejected authentication or quota".into()),
-            false,
-        ));
+        return Some(ServiceFailure {
+            error: Error::Authentication("model service rejected authentication or quota".into()),
+            retry: false,
+            rate_limited: false,
+        });
     }
     if status == StatusCode::NOT_FOUND
         || is_code(&[
@@ -135,21 +149,20 @@ fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, b
             "invaliddimension",
         ])
     {
-        return Some((
-            Error::ModelIncompatible("model or model API is unavailable/incompatible".into()),
-            false,
-        ));
+        return Some(ServiceFailure {
+            error: Error::ModelIncompatible(
+                "model or model API is unavailable/incompatible".into(),
+            ),
+            retry: false,
+            rate_limited: false,
+        });
     }
-    if status == StatusCode::TOO_MANY_REQUESTS
+    let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+        || is_code(&["ratelimitexceeded", "ratelimiterror"])
+        || codes.iter().any(|code| code.starts_with("throttling"));
+    if rate_limited
         || status.is_server_error()
-        || is_code(&[
-            "ratelimitexceeded",
-            "ratelimiterror",
-            "serviceunavailable",
-            "internalerror",
-            "timeout",
-        ])
-        || codes.iter().any(|code| code.starts_with("throttling"))
+        || is_code(&["serviceunavailable", "internalerror", "timeout"])
     {
         let message = if status.is_success() {
             "model service temporarily unavailable".into()
@@ -159,7 +172,11 @@ fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, b
                 status.as_u16()
             )
         };
-        return Some((Error::ModelUnavailable(message), true));
+        return Some(ServiceFailure {
+            error: Error::ModelUnavailable(message),
+            retry: true,
+            rate_limited,
+        });
     }
     let message = if status.is_success() {
         "model service returned an error; check endpoint and model configuration".into()
@@ -169,7 +186,11 @@ fn service_failure(status: StatusCode, body: Option<&Value>) -> Option<(Error, b
             status.as_u16()
         )
     };
-    Some((Error::Config(message), false))
+    Some(ServiceFailure {
+        error: Error::Config(message),
+        retry: false,
+        rate_limited: false,
+    })
 }
 
 impl HttpTransport {
@@ -203,18 +224,63 @@ impl HttpTransport {
             environment,
             retries,
             timeout,
+            limits: None,
         })
     }
 
-    /// One deadline covers attempts, response streaming and backoff. All work
-    /// stays in the caller's future, so dropping it cancels outstanding HTTP.
+    pub(crate) fn with_embedding_limits(mut self, config: &EmbeddingConfig) -> Result<Self> {
+        self.limits = Some(RateLimiter::new(config)?);
+        Ok(self)
+    }
+
+    pub(crate) fn token_limit(&self) -> Option<u64> {
+        self.limits.as_ref().and_then(|limits| limits.token_limit())
+    }
+
     pub(crate) async fn post<T: DeserializeOwned>(&self, body: &Value) -> Result<T> {
-        tokio::time::timeout(self.timeout, self.post_inner(body))
+        self.post_with_tokens(body, 0).await
+    }
+
+    /// One deadline covers admission, attempts, streaming and backoff. Dropping
+    /// this future cancels HTTP and releases its queued or active request slot.
+    pub(crate) async fn post_with_tokens<T: DeserializeOwned>(
+        &self,
+        body: &Value,
+        tokens: u64,
+    ) -> Result<T> {
+        tokio::time::timeout(self.timeout, self.post_inner(body, tokens))
             .await
             .map_err(|_| Error::ModelUnavailable("model request deadline exceeded".into()))?
     }
 
-    async fn post_inner<T: DeserializeOwned>(&self, body: &Value) -> Result<T> {
+    async fn retry_backoff(
+        &self,
+        attempt: usize,
+        total_attempts: usize,
+        status: Option<StatusCode>,
+        category: &'static str,
+        hint: Option<Duration>,
+    ) {
+        if let Some(limits) = &self.limits {
+            let delay = limits.retry_delay(attempt, hint);
+            log_failure(
+                attempt,
+                total_attempts,
+                status,
+                delay_millis(delay),
+                category,
+            );
+            if let Some(until) = tokio::time::Instant::now().checked_add(delay) {
+                tokio::time::sleep_until(until).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } else {
+            backoff(attempt, total_attempts, status, category).await;
+        }
+    }
+
+    async fn post_inner<T: DeserializeOwned>(&self, body: &Value, tokens: u64) -> Result<T> {
         let total_attempts = self.retries + 1;
         for attempt in 0..=self.retries {
             let mut request = self.client.post(self.endpoint.clone()).json(body);
@@ -237,11 +303,17 @@ impl HttpTransport {
                 header.set_sensitive(true);
                 request = request.header(AUTHORIZATION, header);
             }
+            let mut permit = match &self.limits {
+                Some(limits) => Some(limits.acquire(tokens).await?),
+                None => None,
+            };
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
                     if temporary_network(&error) && attempt < self.retries {
-                        backoff(attempt, total_attempts, None, "network").await;
+                        drop(permit);
+                        self.retry_backoff(attempt, total_attempts, None, "network", None)
+                            .await;
                         continue;
                     }
                     log_failure(attempt, total_attempts, None, 0, "network");
@@ -252,6 +324,7 @@ impl HttpTransport {
                 }
             };
             let status = response.status();
+            let hint = retry_after(response.headers());
             let budget = if status.is_success() {
                 MAX_RESPONSE_BYTES
             } else {
@@ -264,7 +337,15 @@ impl HttpTransport {
                 Err(ReadError::Network(error))
                     if temporary_network(&error) && attempt < self.retries =>
                 {
-                    backoff(attempt, total_attempts, Some(status), "response_stream").await;
+                    drop(permit);
+                    self.retry_backoff(
+                        attempt,
+                        total_attempts,
+                        Some(status),
+                        "response_stream",
+                        None,
+                    )
+                    .await;
                     continue;
                 }
                 Err(ReadError::Network(_)) => {
@@ -287,31 +368,66 @@ impl HttpTransport {
                 }
             };
             let payload = serde_json::from_slice::<Value>(&bytes).ok();
-            if let Some((error, retry)) = service_failure(status, payload.as_ref()) {
-                let category = match &error {
+            if let Some(failure) = service_failure(status, payload.as_ref()) {
+                let category = match &failure.error {
                     Error::Authentication(_) => "authentication_or_quota",
                     Error::ModelIncompatible(_) => "model_incompatible",
-                    Error::ModelUnavailable(_) if status == StatusCode::TOO_MANY_REQUESTS => {
-                        "rate_limited"
-                    }
+                    Error::ModelUnavailable(_) if failure.rate_limited => "rate_limited",
                     Error::ModelUnavailable(_) => "model_unavailable",
                     _ => "request_rejected",
                 };
-                if retry && attempt < self.retries {
-                    backoff(attempt, total_attempts, Some(status), category).await;
+                if failure.rate_limited {
+                    if let Some(limits) = &self.limits {
+                        let delay = match limits.rate_limited(hint) {
+                            Ok(delay) => delay,
+                            Err(error) => {
+                                drop(permit.take());
+                                log_failure(
+                                    attempt,
+                                    total_attempts,
+                                    Some(status),
+                                    0,
+                                    "invalid_retry_after",
+                                );
+                                return Err(error);
+                            }
+                        };
+                        drop(permit.take());
+                        if attempt < self.retries {
+                            log_failure(
+                                attempt,
+                                total_attempts,
+                                Some(status),
+                                delay_millis(delay),
+                                category,
+                            );
+                            continue;
+                        }
+                    }
+                }
+                if failure.retry && attempt < self.retries {
+                    drop(permit);
+                    self.retry_backoff(attempt, total_attempts, Some(status), category, hint)
+                        .await;
                     continue;
                 }
                 log_failure(attempt, total_attempts, Some(status), 0, category);
-                return Err(error);
+                return Err(failure.error);
             }
             let payload = payload.ok_or_else(|| {
                 log_failure(attempt, total_attempts, Some(status), 0, "invalid_response");
                 Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
             })?;
-            return serde_json::from_value(payload).map_err(|_| {
+            let result = serde_json::from_value(payload).map_err(|_| {
                 log_failure(attempt, total_attempts, Some(status), 0, "invalid_response");
                 Error::ModelIncompatible("model returned invalid or incompatible JSON".into())
             });
+            if result.is_ok() {
+                if let Some(permit) = permit {
+                    permit.succeed();
+                }
+            }
+            return result;
         }
         Err(Error::ModelUnavailable("model retries exhausted".into()))
     }
@@ -364,6 +480,32 @@ fn log_failure(
     );
 }
 
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    parse_retry_after(headers.get(RETRY_AFTER)?.to_str().ok()?, SystemTime::now())
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // An overflowing but syntactically valid hint must not become a short
+        // fallback retry. The caller's deadline still bounds an enormous wait.
+        Some(
+            value
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::MAX),
+        )
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()
+            .map(|date| date.duration_since(now).unwrap_or_default())
+    }
+}
+
+fn delay_millis(delay: Duration) -> u64 {
+    delay.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 async fn backoff(
     attempt: usize,
     total_attempts: usize,
@@ -384,6 +526,94 @@ mod tests {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates_without_shortening_large_hints() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(
+            parse_retry_after(" 12 ", now),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(parse_retry_after("0", now), Some(Duration::ZERO));
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(60));
+        assert_eq!(
+            parse_retry_after(&future, now),
+            Some(Duration::from_secs(60))
+        );
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(60));
+        assert_eq!(parse_retry_after(&past, now), Some(Duration::ZERO));
+        for invalid in ["", "-1", "1.5", "not-a-date"] {
+            assert_eq!(parse_retry_after(invalid, now), None);
+        }
+        assert_eq!(
+            parse_retry_after("999999999999999999999999", now),
+            Some(Duration::MAX)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("12"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(12)));
+        assert_eq!(delay_millis(Duration::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn embedding_cooldown_diagnostics_never_log_headers_sources_or_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .insert_header("X-Vendor-Trace", "header-canary")
+                .set_body_json(json!({"error": {"code": "RateLimitExceeded", "message": "vendor-message-canary"}})))
+            .expect(3)
+            .mount(&server).await;
+        let transport = HttpTransport::new(
+            Url::parse(&format!("{}/endpoint-canary", server.uri())).unwrap(),
+            String::new(),
+            3,
+            2,
+            false,
+            Environment::default(),
+        )
+        .unwrap()
+        .with_embedding_limits(&EmbeddingConfig {
+            retry_base_delay_ms: 4,
+            retry_max_delay_ms: 4,
+            rate_limit_cooldown_ms: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter("solascope_models=warn")
+            .with_writer(Mutex::new(log.reopen().unwrap()))
+            .finish();
+        let result = transport
+            .post::<Value>(&json!({"input": "source-query-canary"}))
+            .with_subscriber(subscriber)
+            .await;
+        assert!(matches!(result, Err(Error::ModelUnavailable(_))));
+        let contents = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.contains("model HTTP request failed"))
+                .count(),
+            3
+        );
+        assert!(contents.contains("effective_concurrency=1"));
+        assert!(contents.contains("delay_ms=4"));
+        for sensitive in [
+            server.uri().as_str(),
+            "endpoint-canary",
+            "source-query-canary",
+            "vendor-message-canary",
+            "header-canary",
+        ] {
+            assert!(!contents.contains(sensitive), "{contents}");
+        }
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn failure_diagnostics_report_retries_without_request_or_response_secrets() {

@@ -33,6 +33,9 @@ fn embedding(server: &MockServer, provider: &str) -> EmbeddingConfig {
         concurrency: 2,
         timeout_secs: 3,
         retries: 2,
+        retry_base_delay_ms: 10,
+        retry_max_delay_ms: 100,
+        rate_limit_cooldown_ms: 20,
         ..Default::default()
     }
 }
@@ -575,6 +578,11 @@ async fn fingerprint_tracks_vector_space_but_not_operational_configuration() {
     config.batch_size = 3;
     config.concurrency = 1;
     config.retries = 0;
+    config.retry_base_delay_ms = 100;
+    config.retry_max_delay_ms = 1_000;
+    config.rate_limit_cooldown_ms = 200;
+    config.requests_per_minute = Some(60);
+    config.tokens_per_minute = Some(12_345);
     let operational = build_embedding(&config, &privacy(true))
         .unwrap()
         .unwrap()
@@ -607,7 +615,15 @@ async fn invalid_operational_limits_fail_during_construction() {
         "batch_size",
         "concurrency",
         "timeout",
+        "timeout_max",
         "retries",
+        "retry_base",
+        "retry_max",
+        "cooldown",
+        "base_above_max",
+        "cooldown_above_max",
+        "rpm",
+        "tpm",
     ] {
         let mut config = embedding(&server, "ollama");
         match invalid {
@@ -615,12 +631,24 @@ async fn invalid_operational_limits_fail_during_construction() {
             "batch_size" => config.batch_size = 0,
             "concurrency" => config.concurrency = 0,
             "timeout" => config.timeout_secs = 0,
-            _ => config.retries = 6,
+            "timeout_max" => config.timeout_secs = 301,
+            "retries" => config.retries = 6,
+            "retry_base" => config.retry_base_delay_ms = 0,
+            "retry_max" => config.retry_max_delay_ms = 300_001,
+            "cooldown" => config.rate_limit_cooldown_ms = 0,
+            "base_above_max" => config.retry_base_delay_ms = config.retry_max_delay_ms + 1,
+            "cooldown_above_max" => config.rate_limit_cooldown_ms = config.retry_max_delay_ms + 1,
+            "rpm" => config.requests_per_minute = Some(0),
+            "tpm" => config.tokens_per_minute = Some(0),
+            _ => unreachable!(),
         }
-        assert!(matches!(
-            build_embedding(&config, &privacy(false)),
-            Err(Error::Config(_))
-        ));
+        assert!(
+            matches!(
+                build_embedding(&config, &privacy(false)),
+                Err(Error::Config(_))
+            ),
+            "{invalid}"
+        );
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -1073,4 +1101,227 @@ async fn legacy_dashscope_embedding_rejects_oversized_text_without_truncation() 
     assert!(matches!(error, Error::InvalidInput(_)));
     assert!(error.to_string().contains("2048"));
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rate_limits_cool_down_query_and_document_requests_even_without_retries() {
+    for status in [429, 200] {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(status).set_body_json(json!({"error": {
+                        "code": "Throttling.RateQuota", "message": "Too many requests"
+                    }}))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let config = EmbeddingConfig {
+            retries: 0,
+            rate_limit_cooldown_ms: 100,
+            retry_max_delay_ms: 200,
+            ..embedding(&server, "openai")
+        };
+        let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+        assert!(matches!(
+            provider.embed(&["limited".into()]).await,
+            Err(Error::ModelUnavailable(_))
+        ));
+        let query_provider = provider.clone();
+        let documents = vec!["document".into()];
+        let mut requests = Box::pin(async {
+            tokio::join!(
+                query_provider.embed_query("query"),
+                provider.embed(&documents)
+            )
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), requests.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let (query, documents) = requests.await;
+        assert_eq!(query.unwrap(), vec![1.0, 0.0]);
+        assert_eq!(documents.unwrap(), vec![vec![1.0, 0.0]]);
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn retry_after_is_a_minimum_wait_even_above_the_configured_backoff_cap() {
+    for status in [429, 503] {
+        let server = MockServer::start().await;
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = times.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                let mut times = captured.lock().unwrap();
+                times.push(std::time::Instant::now());
+                if times.len() == 1 {
+                    ResponseTemplate::new(status).insert_header("Retry-After", "1")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = build_embedding(&embedding(&server, "openai"), &privacy(true))
+            .unwrap()
+            .unwrap();
+        provider.embed(&["code".into()]).await.unwrap();
+        let times = times.lock().unwrap();
+        assert!(times[1].duration_since(times[0]) >= Duration::from_millis(950));
+    }
+}
+
+#[tokio::test]
+async fn enormous_retry_after_hints_are_bounded_and_do_not_poison_later_requests() {
+    for status in [429, 503] {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(status)
+                        .insert_header("Retry-After", "999999999999999999999999")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = build_embedding(
+            &EmbeddingConfig {
+                timeout_secs: 1,
+                ..embedding(&server, "openai")
+            },
+            &privacy(true),
+        )
+        .unwrap()
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            provider.embed(&["code".into()]).await,
+            Err(Error::ModelUnavailable(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.embed_query("query").await.unwrap(), vec![1.0, 0.0]);
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn rpm_pacing_counts_retries_and_queries_against_the_same_budget() {
+    let server = MockServer::start().await;
+    let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = times.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            let mut times = captured.lock().unwrap();
+            times.push(std::time::Instant::now());
+            if times.len() == 1 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+            }
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(
+        &EmbeddingConfig {
+            requests_per_minute: Some(600),
+            ..embedding(&server, "openai")
+        },
+        &privacy(true),
+    )
+    .unwrap()
+    .unwrap();
+    provider.embed(&["code".into()]).await.unwrap();
+    provider.embed_query("query").await.unwrap();
+    let times = times.lock().unwrap();
+    assert_eq!(times.len(), 3);
+    assert!(times
+        .windows(2)
+        .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(90)));
+}
+
+#[tokio::test]
+async fn token_admission_is_inside_the_deadline_and_cancellation_releases_the_queue() {
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(
+        &EmbeddingConfig {
+            concurrency: 1,
+            tokens_per_minute: Some(3),
+            timeout_secs: 1,
+            ..embedding(&server, "openai")
+        },
+        &privacy(true),
+    )
+    .unwrap()
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        provider.embed(&["aa".into()]).await,
+        Err(Error::ModelUnavailable(_))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.embed_query("a").await.unwrap(), vec![1.0, 0.0]);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn oversized_utf8_estimates_fail_before_any_embedding_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = build_embedding(
+        &EmbeddingConfig {
+            tokens_per_minute: Some(5),
+            ..embedding(&server, "openai")
+        },
+        &privacy(true),
+    )
+    .unwrap()
+    .unwrap();
+    let error = provider
+        .embed(&["a".into(), "你好".into()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(!error.to_string().contains("你好"));
+    server.verify().await;
 }

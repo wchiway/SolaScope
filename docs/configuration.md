@@ -103,9 +103,14 @@ After parser settings or chunking rules change, the next `index` reparses all fi
 | `request_dimensions` | `true` | Request the configured dimensions when the protocol supports variable dimensions; `false` omits the request field but still validates output dimensions |
 | `api_key_env` | `OPENAI_API_KEY` | The **name** of the environment variable containing the API key; `ollama` sends no key |
 | `batch_size` | `32` | Configured texts per batch, from 1–256; DashScope reduces batches to known model limits |
-| `concurrency` | `2` | Concurrent requests, from 1–32 |
-| `timeout_secs` | `30` | Timeout per HTTP request |
-| `retries` | `2` | Retries for 429, 5xx, and transient network errors, up to 5 |
+| `concurrency` | `2` | Maximum concurrent embedding HTTP requests, from 1–32; requests start with all slots available |
+| `timeout_secs` | `30` | Total timeout budget per HTTP batch, from 1–300 seconds, including queueing, shared cooldown, sending, response reads, and retries |
+| `retries` | `2` | Retries for retryable rate limits, 5xx, and transient network errors, from 0–5; authentication, balance, and permanent quota errors are not retried |
+| `retry_base_delay_ms` | `1000` | Initial fallback retry delay; doubles per attempt and is capped by `retry_max_delay_ms` |
+| `retry_max_delay_ms` | `60000` | Maximum fallback retry delay and cooldown, from 1–300000 ms; a provider's `Retry-After` may require a longer wait |
+| `rate_limit_cooldown_ms` | `5000` | Minimum configured cooldown after a recognized rate limit; must not exceed `retry_max_delay_ms` |
+| `requests_per_minute` | `None` | Optional smooth request budget; when set, spaces actual HTTP attempts at least `60 / value` seconds apart |
+| `tokens_per_minute` | `None` | Optional 60-second sliding-window budget based on conservative UTF-8 input byte counts; large batches are split to fit |
 | `fingerprint_policy` | `strict` | `strict`: reject incremental writes when the fingerprint changes; `rebuild`: rebuild automatically on the next explicit `index` |
 
 #### Embedding protocols
@@ -121,9 +126,17 @@ URL construction preserves overlapping path segments such as an existing `/v1`; 
 
 DashScope uses `text_type = "document"` for document vectors and `"query"` for search queries. Known batch limits are 10 for `text-embedding-v3/v4`, 25 for `v1/v2`, and 20 for `qwen3.7-text-embedding*`; other models use a conservative limit of 10 texts per batch. `v1/v2` requests omit `dimension` and `output_type`, and each text is checked against the 2,048-character limit before sending. Other models remain subject to the service's token and dimension limits. SolaScope does not silently truncate input or truncate or pad returned vectors.
 
-Indexing queues at most 128 inputs at a time, aligned to whole effective provider batches where they fit within that window. For DashScope's 20-input batches, intermediate groups contain 120 inputs, so only the final group may need a partial batch. Completed HTTP batches immediately refill available concurrency slots, even when an earlier request is slow. Results are restored to input order before vectors are associated with source chunks. This scheduling does not increase `embedding.concurrency` or bypass provider quotas.
+Indexing queues at most 128 inputs at a time, aligned to whole effective provider batches where they fit within that window. For DashScope's 20-input batches, intermediate groups contain 120 inputs, so only the final group may need a partial batch. Completed HTTP batches immediately refill available concurrency slots, even when an earlier request is slow. Results are restored to input order before vectors are associated with source chunks.
 
-The `requesting embeddings` event reports `effective_batch_size`, `concurrency`, and `group_inputs`. Progress events include `batch_elapsed_ms` for the group and average `inputs_per_second` for the embedding phase. With `--verbose`, `embedding batch complete` events report individual HTTP batch input counts and elapsed milliseconds, without recording text or endpoint URLs.
+`embedding.concurrency` is a maximum, and all slots are initially available. A recognized HTTP 429 or known rate-limit code in an HTTP 200 error envelope places every embedding request using that provider instance into a shared cooldown. Engine clones share their adapter and cooldown; separate provider or Engine instances and separate processes do not. A 429 sets effective concurrency to one. Successful requests already in flight from an earlier cooldown epoch do not count toward recovery. Every three consecutive successes in the new epoch increase effective concurrency by one, up to the configured maximum. Every ten consecutive successes reduce the base cooldown for the next rate-limit event, down to `rate_limit_cooldown_ms`.
+
+Fallback retry delay is `retry_base_delay_ms × 2^attempt`, capped at `retry_max_delay_ms`, with nonnegative bounded jitter that never exceeds the cap. A recognized 429 starts at the configured cooldown and doubles it on later rate-limit events up to the maximum. Concurrent requests observing the same cooldown event do not double it again, though a longer `Retry-After` can extend the wait. Both delta-seconds and HTTP-date `Retry-After` values are supported; a valid hint is a minimum wait and is not shortened to the fallback maximum. Authentication, balance, and permanent quota failures are not retried. Reranking retains its existing independent retry behavior; embedding retry budgets do not apply to rerank requests.
+
+When `requests_per_minute` is set, actual HTTP attempts are spaced smoothly by at least `60 / requests_per_minute` seconds. When `tokens_per_minute` is set, a 60-second sliding window tracks conservative UTF-8 input byte counts. This is an input-size estimate, not the provider's tokenizer or reported billed usage, so actual provider limits may still be reached. Large text batches are split to fit the full minute budget, then wait for sufficient sliding-window capacity. A single text larger than the full minute budget fails before sending and asks the user to increase the configured budget. Requests are not charged before they leave the queue; every actual HTTP attempt, including failures and retries, consumes budget.
+
+`timeout_secs` bounds the complete lifetime of each HTTP batch, including queueing, cooldown waits, HTTP sending, response-body reads, and all retries. When the budget expires, the request future is canceled and queue or active concurrency capacity is released. The `retries` setting still limits the number of retries independently.
+
+The `requesting embeddings` event reports `effective_batch_size`, configured `concurrency`, and `group_inputs`. Progress events include `batch_elapsed_ms` for the group and average `inputs_per_second` for the embedding phase. With `--verbose`, `embedding batch complete` events report individual HTTP batch input counts and elapsed milliseconds. Rate-limit logs contain only numeric durations, effective concurrency, and classified errors; they do not record source text, keys, URLs, or raw HTTP headers.
 
 Use `request_dimensions = false` for compatible services that do not accept variable-dimension parameters. In that case, `dimensions` must match the model's default output dimensions.
 
@@ -135,7 +148,7 @@ The fingerprint binds the provider, model, normalized full endpoint, dimensions,
 solascope index --rebuild
 ```
 
-With `fingerprint_policy = "rebuild"`, the next explicit indexing operation rebuilds automatically and emits a warning. Queries always reject an incompatible model/index combination and never rebuild automatically. Batch size, concurrency, timeout, retries, and the key's environment variable name are not part of the vector-space fingerprint.
+With `fingerprint_policy = "rebuild"`, the next explicit indexing operation rebuilds automatically and emits a warning. Queries always reject an incompatible model/index combination and never rebuild automatically. Batch size, concurrency, timeout, retry delays, cooldown, RPM/TPM budgets, retries, and the key's environment variable name are not part of the vector-space fingerprint. The source template and vector fingerprint remain unchanged by these rate-limit settings.
 
 Moving code within a file reuses the exact cache entry when the complete embedding input stays the same. Moving or renaming a file can reuse vectors from the old path when the language, symbol, signature, and body match. This is approximate reuse because the template includes the path, and it is counted in `relocated_embeddings` / `relocated_vectors`. An explicit `--rebuild` recomputes these vectors using the current path while reusing other exact cache entries.
 
@@ -208,7 +221,7 @@ Embedding and reranking providers can be combined independently. Changing the re
 
 Every HTTP model provider except Ollama on a local loopback address requires explicit opt-in, even when configured with a local address. Endpoints accept only HTTP(S) and reject embedded credentials, query strings, and fragments. The HTTP client does not follow redirects. Local loopback requests bypass environment proxies, and `localhost` is pinned to `127.0.0.1`.
 
-HTTP errors and error envelopes within HTTP 200 responses are classified by provider error codes. Authentication and quota failures are not retried; known rate limits and transient failures receive bounded retries; model and dimension incompatibilities produce explicit errors. Full error bodies, URL credentials, and keys are not echoed.
+HTTP errors and error envelopes within HTTP 200 responses are classified by provider error codes. Authentication, balance, and permanent quota failures are not retried; known rate limits and transient failures receive bounded retries and may trigger shared embedding cooldown. Full error bodies, URLs, raw HTTP headers, and keys are not echoed.
 
 ### log
 
@@ -233,7 +246,9 @@ HTTP diagnostics record retry attempts, status codes, wait times, and static err
 
 A 429 generally indicates a provider rate limit. Check the model's account-specific request and token quotas; some services also use it for quota errors. The diagnostic event distinguishes recognized authentication/quota codes from retryable rate limits without recording the vendor's error body. An unrecognized code remains classified by HTTP status.
 
-`embedding.concurrency` limits simultaneous requests, not requests or tokens per minute. Provider-specific batch caps can split one indexing progress group into several HTTP requests. Lowering concurrency can reduce bursts. The current retry policy waits 100 ms, then doubles on each retry; `retries = 2` permits three attempts with 100 ms and 200 ms waits. It does not interpret `Retry-After` or impose an RPM/TPM budget, so increasing retries alone may not cover the provider's reset window.
+Provider-specific batch caps can split one indexing progress group into several HTTP requests. `embedding.concurrency` is a maximum and starts fully available; shared rate-limit cooldown and adaptive recovery temporarily adjust effective concurrency. Configure `requests_per_minute` and `tokens_per_minute` for provider budgets. Without a valid `Retry-After`, retries use the configured exponential fallback delay and bounded nonnegative jitter. A valid, representable `Retry-After` is honored as a minimum wait, even when longer than the fallback delay cap. An unrepresentable rate-limit hint fails that call without retrying and leaves a finite fallback cooldown instead of permanently blocking the adapter.
+
+RPM/TPM budgets are unset by default because account quotas vary. Use limits appropriate for your provider and leave headroom for other clients. With minute-window budgets, increase `timeout_secs` when necessary (for example, to `120`): its default 30-second total budget may expire while waiting for the next window. The maximum remains 300 seconds.
 
 Index progress is not a persistent checkpoint. New embeddings are published with the complete index transaction; a failed run leaves the existing index unchanged and can require those uncommitted embeddings again on retry. Changing batch size, concurrency, or retries does not change the embedding fingerprint and does not require `--rebuild`.
 

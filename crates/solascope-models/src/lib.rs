@@ -5,6 +5,7 @@ mod embedding;
 mod http;
 #[cfg(feature = "local-rerank")]
 mod local;
+mod rate_limit;
 mod rerank;
 
 use std::sync::Arc;

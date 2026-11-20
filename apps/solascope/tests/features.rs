@@ -111,7 +111,7 @@ async fn model_rate_limit_retries_and_final_errors_are_persisted_without_vendor_
     let settings = tempfile::tempdir().unwrap();
     let config = settings.path().join("settings.toml");
     let server = MockServer::start().await;
-    std::fs::write(&config, format!("[embedding]\nprovider='ollama'\nmodel='test'\nendpoint='{}'\ndimensions=2\nretries=1\n", server.uri())).unwrap();
+    std::fs::write(&config, format!("[embedding]\nprovider='ollama'\nmodel='test'\nendpoint='{}'\ndimensions=2\nretries=1\nretry_base_delay_ms=10\nretry_max_delay_ms=100\nrate_limit_cooldown_ms=20\n", server.uri())).unwrap();
     Mock::given(method("POST"))
         .and(path("/api/embed"))
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {"code": "RateLimitExceeded", "message": "VENDOR_BODY_MUST_NOT_BE_LOGGED"}})))

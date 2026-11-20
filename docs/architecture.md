@@ -16,7 +16,7 @@
 
 The CLI, MCP server, and benchmark tool call the same `solascope_engine::Engine`. Chunking lives in parser, lexical and vector retrieval in storage, and pipeline orchestration in engine. Core defines the shared interfaces.
 
-Cloned Engine instances share lazily initialized model adapters and a query-vector cache. A local ONNX model is reused across requests. Models are disabled by default, so the core application can build and start without an inference service.
+Cloned Engine instances share lazily initialized model adapters and a query-vector cache. Embedding requests made through the same shared provider adapter also share cooldown and adaptive concurrency state across indexing and queries. Independent provider or Engine instances and separate processes do not share that state. A local ONNX model is reused across requests. Models are disabled by default, so the core application can build and start without an inference service.
 
 ## Indexing pipeline
 
@@ -25,7 +25,7 @@ Cloned Engine instances share lazily initialized model adapters and a query-vect
 3. Compute a chunking signature from `CHUNKER_VERSION`, enabled languages, fallback policy, chunk budget, and overlap. A changed signature requires all files to be parsed again before publication.
 4. Scan the project and compare source SHA-256 hashes with stored records to identify additions, changes, and deletions. Parse changed files in a bounded Rayon thread pool.
 5. Look up vectors by fingerprint and full-input hash. Incremental runs can also reuse moved-file vectors through a path-independent key. Request embeddings for the remaining inputs.
-6. Run model requests outside the database write transaction. Queue at most 128 inputs in groups aligned to the provider's effective batch size. HTTP batches complete out of order to keep bounded concurrency slots occupied; restore original input order before associating vectors with chunks. Validate vector counts, dimensions, and values before proceeding.
+6. Run model requests outside the database write transaction. Queue at most 128 inputs in groups aligned to the provider's effective batch size. HTTP batches complete out of order to keep bounded concurrency slots occupied; restore original input order before associating vectors with chunks. Embedding requests use shared rate-limit cooldown, adaptive concurrency, and optional RPM/TPM budgets. Validate vector counts, dimensions, and values before proceeding.
 7. Reread changed files and verify their hashes, then recheck pending deletions. Discard the update if source revisions changed in the meantime; watch mode rescans and retries.
 8. Update files, chunks, FTS, vector mappings, chunking metadata, and generation records in one SQLite transaction, then publish the new generation.
 
@@ -56,7 +56,7 @@ With `fallback_policy = "skip"`, Engine stores an unparseable file's hash withou
 
 Moving a function within a file can retain an identical embedding input and reuse an exact cache entry. Moving or renaming a file changes the path in the input, but matching code can reuse an old-path vector. Storage marks this approximate reuse as `exact = false`; status reports it as `relocated_vectors`.
 
-`index --rebuild` reuses exact entries and recomputes relocated vectors. Exact results can replace approximate entries, while approximate results cannot replace exact ones. Changing the reranker does not affect the vector index. Credentials, concurrency, and timeout settings are excluded from the embedding fingerprint.
+`index --rebuild` reuses exact entries and recomputes relocated vectors. Exact results can replace approximate entries, while approximate results cannot replace exact ones. Changing the reranker does not affect the vector index. Credentials, concurrency, timeout, retry delays, cooldown, RPM/TPM budgets, and other scheduling settings are excluded from the embedding fingerprint. The source template and vector fingerprint do not change when these limits change.
 
 ## Model protocols
 
@@ -68,7 +68,15 @@ Embedding and reranking providers are configured independently:
 - `RerankProvider::limits` declares document-count and character limits. Scores must be finite and map to original document indices and IDs, without duplicates or out-of-range indices.
 - Local reranking checks the complete query/document pair with the model's tokenizer before inference. HTTP services enforce their own token limits in addition to local character budgets.
 
-HTTP requests have timeouts, bounded retries, and response-size limits, and do not follow redirects. Loopback requests bypass proxies. Remote model use requires explicit privacy opt-in. See [support and limitations](implementation-status.md) for model validation status.
+HTTP requests have bounded timeouts and retries, response-size limits, and do not follow redirects. Loopback requests bypass proxies. Remote model use requires explicit privacy opt-in. See [support and limitations](implementation-status.md) for model validation status.
+
+Embedding concurrency is a maximum, with all configured slots available initially. HTTP 429 responses and known rate-limit error codes inside HTTP 200 responses put all embedding requests using the same provider instance into shared cooldown across indexing and queries. A 429 reduces effective concurrency to one. In-flight successes from an older cooldown epoch do not count toward recovery; each three consecutive successes in the current epoch add one slot up to the configured maximum. Each ten consecutive successes reduce the base cooldown for the next event down to the configured minimum. The same concurrent cooldown event is applied only once, while a longer valid `Retry-After` may extend its wait. Independent provider instances and processes do not share cooldown state.
+
+Fallback retries use `base × 2^attempt`, capped at the configured maximum, with bounded nonnegative jitter that never exceeds the cap. Repeated 429 events double the cooldown to that maximum, starting at the configured cooldown. `Retry-After` supports delta-seconds and HTTP-date and sets a minimum wait even when longer than the fallback cap. An unrepresentable rate-limit hint fails that request without permanently blocking the shared adapter. Authentication, balance, and permanent quota errors are not retried. Rerank keeps its existing independent retry strategy.
+
+Optional RPM budgets space actual HTTP attempts smoothly by at least `60 / RPM` seconds. Optional TPM budgets use conservative UTF-8 input byte counts in a 60-second sliding window, split oversized batches, and reject a single text larger than the full budget before sending. Queueing does not precharge budget; every HTTP attempt, including failures and retries, counts. The timeout for each HTTP batch covers queueing, cooldown, sending, response reading, and retries; expiry cancels the future and releases queued or active capacity. Retry counts remain bounded independently by `retries`.
+
+Model diagnostic events record only numeric durations, effective concurrency, and classified errors. They omit source text, keys, URLs, and raw HTTP headers.
 
 ## Search pipeline
 

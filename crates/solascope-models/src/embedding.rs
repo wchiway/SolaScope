@@ -6,7 +6,6 @@ use solascope_config::{EmbeddingConfig, PrivacyConfig};
 use solascope_core::{
     EmbeddingProvider, Error, ModelFingerprint, Result, EMBEDDING_TEMPLATE_VERSION,
 };
-use tokio::sync::Semaphore;
 
 use crate::{
     http::{endpoint, HttpTransport},
@@ -30,7 +29,6 @@ pub(crate) struct HttpEmbedding {
     request_dimensions: bool,
     batch_size: usize,
     concurrency: usize,
-    permits: Semaphore,
 }
 
 impl HttpEmbedding {
@@ -109,7 +107,8 @@ impl HttpEmbedding {
             config.retries,
             endpoint_remote,
             config.environment.clone(),
-        )?;
+        )?
+        .with_embedding_limits(config)?;
         let batch_size = if protocol == Protocol::DashScope {
             config.batch_size.min(dashscope_batch_limit(&config.model))
         } else {
@@ -123,20 +122,22 @@ impl HttpEmbedding {
             request_dimensions,
             batch_size,
             concurrency: config.concurrency,
-            permits: Semaphore::new(config.concurrency),
         })
     }
 
     async fn batch(&self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
-        let _permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
         let started = std::time::Instant::now();
+        let tokens = texts.iter().map(|text| text.len() as u64).sum();
         let model = &self.fingerprint.model;
         let dimensions = self.fingerprint.dimensions;
         let vectors = match self.protocol {
             Protocol::Ollama => {
                 let response: OllamaResponse = self
                     .transport
-                    .post(&json!({"model": model, "input": texts, "truncate": false}))
+                    .post_with_tokens(
+                        &json!({"model": model, "input": texts, "truncate": false}),
+                        tokens,
+                    )
                     .await?;
                 if response.embeddings.len() != texts.len() {
                     return Err(Error::ModelIncompatible(
@@ -150,7 +151,8 @@ impl HttpEmbedding {
                 if self.request_dimensions {
                     body["dimensions"] = json!(dimensions);
                 }
-                let response: OpenAiResponse = self.transport.post(&body).await?;
+                let response: OpenAiResponse =
+                    self.transport.post_with_tokens(&body, tokens).await?;
                 ordered(response.data, texts.len())?
             }
             Protocol::DashScope => {
@@ -162,7 +164,8 @@ impl HttpEmbedding {
                 if self.request_dimensions {
                     body["parameters"]["dimension"] = json!(dimensions);
                 }
-                let response: DashScopeResponse = self.transport.post(&body).await?;
+                let response: DashScopeResponse =
+                    self.transport.post_with_tokens(&body, tokens).await?;
                 let embeddings = match (response.output, response.embeddings) {
                     (Some(output), None) => output.embeddings,
                     (None, Some(embeddings)) => embeddings,
@@ -222,10 +225,7 @@ impl HttpEmbedding {
         }
         // Complete ready batches immediately so slow requests do not hold idle
         // slots. Restore input order before associating vectors with source.
-        let inputs: Vec<Vec<String>> = texts
-            .chunks(self.batch_size)
-            .map(<[String]>::to_vec)
-            .collect();
+        let inputs = split_batches(texts, self.batch_size, self.transport.token_limit())?;
         let mut batches: Vec<(usize, Vec<Vec<f32>>)> = stream::iter(inputs.into_iter().enumerate())
             .map(|(index, batch)| async move {
                 self.batch(&batch, query)
@@ -268,6 +268,37 @@ impl EmbeddingProvider for HttpEmbedding {
     }
 }
 
+// UTF-8 input bytes provide a conservative estimate without loading a model's
+// tokenizer. Split only when a configured minute budget cannot fit a batch.
+fn split_batches(
+    texts: &[String],
+    batch_size: usize,
+    token_limit: Option<u64>,
+) -> Result<Vec<Vec<String>>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut tokens = 0;
+    for text in texts {
+        let cost = text.len() as u64;
+        if token_limit.is_some_and(|limit| cost > limit) {
+            return Err(Error::InvalidInput(
+                "embedding input exceeds tokens_per_minute estimate; raise the budget or split the input"
+                    .into(),
+            ));
+        }
+        if batch.len() == batch_size || token_limit.is_some_and(|limit| cost > limit - tokens) {
+            batches.push(std::mem::take(&mut batch));
+            tokens = 0;
+        }
+        tokens += cost;
+        batch.push(text.clone());
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
 fn dashscope_batch_limit(model: &str) -> usize {
     if model.starts_with("qwen3.7-text-embedding") {
         20
@@ -297,6 +328,25 @@ fn ordered(items: Vec<IndexedEmbedding>, expected: usize) -> Result<Vec<Vec<f32>
             vector.ok_or_else(|| Error::ModelIncompatible("missing embedding index".into()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_estimates_split_batches_without_changing_input_order() {
+        let texts = vec!["aa".into(), "你好".into(), "bbb".into(), "cccc".into()];
+        let batches = split_batches(&texts, 3, Some(8)).unwrap();
+        assert_eq!(batches, vec![vec!["aa", "你好"], vec!["bbb", "cccc"]]);
+        assert_eq!(batches.into_iter().flatten().collect::<Vec<_>>(), texts);
+        assert_eq!(split_batches(&texts, 2, None).unwrap().len(), 2);
+        assert!(matches!(
+            split_batches(&texts, 3, Some(5)),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(split_batches(&[], 2, Some(1)).unwrap().is_empty());
+    }
 }
 
 #[derive(Deserialize)]

@@ -2602,6 +2602,8 @@ dependencies = [
  "async-trait",
  "fastembed",
  "futures-util",
+ "httpdate",
+ "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",
