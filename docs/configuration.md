@@ -121,6 +121,10 @@ URL construction preserves overlapping path segments such as an existing `/v1`; 
 
 DashScope uses `text_type = "document"` for document vectors and `"query"` for search queries. Known batch limits are 10 for `text-embedding-v3/v4`, 25 for `v1/v2`, and 20 for `qwen3.7-text-embedding*`; other models use a conservative limit of 10 texts per batch. `v1/v2` requests omit `dimension` and `output_type`, and each text is checked against the 2,048-character limit before sending. Other models remain subject to the service's token and dimension limits. SolaScope does not silently truncate input or truncate or pad returned vectors.
 
+Indexing queues at most 128 inputs at a time, aligned to whole effective provider batches where they fit within that window. For DashScope's 20-input batches, intermediate groups contain 120 inputs, so only the final group may need a partial batch. Completed HTTP batches immediately refill available concurrency slots, even when an earlier request is slow. Results are restored to input order before vectors are associated with source chunks. This scheduling does not increase `embedding.concurrency` or bypass provider quotas.
+
+The `requesting embeddings` event reports `effective_batch_size`, `concurrency`, and `group_inputs`. Progress events include `batch_elapsed_ms` for the group and average `inputs_per_second` for the embedding phase. With `--verbose`, `embedding batch complete` events report individual HTTP batch input counts and elapsed milliseconds, without recording text or endpoint URLs.
+
 Use `request_dimensions = false` for compatible services that do not accept variable-dimension parameters. In that case, `dimensions` must match the model's default output dimensions.
 
 #### Fingerprints and cache reuse after moves

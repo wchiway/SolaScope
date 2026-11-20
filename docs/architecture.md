@@ -25,7 +25,7 @@ Cloned Engine instances share lazily initialized model adapters and a query-vect
 3. Compute a chunking signature from `CHUNKER_VERSION`, enabled languages, fallback policy, chunk budget, and overlap. A changed signature requires all files to be parsed again before publication.
 4. Scan the project and compare source SHA-256 hashes with stored records to identify additions, changes, and deletions. Parse changed files in a bounded Rayon thread pool.
 5. Look up vectors by fingerprint and full-input hash. Incremental runs can also reuse moved-file vectors through a path-independent key. Request embeddings for the remaining inputs.
-6. Run model requests outside the database write transaction, with bounded input groups, batches, and concurrency. Validate vector counts, dimensions, and values before proceeding.
+6. Run model requests outside the database write transaction. Queue at most 128 inputs in groups aligned to the provider's effective batch size. HTTP batches complete out of order to keep bounded concurrency slots occupied; restore original input order before associating vectors with chunks. Validate vector counts, dimensions, and values before proceeding.
 7. Reread changed files and verify their hashes, then recheck pending deletions. Discard the update if source revisions changed in the meantime; watch mode rescans and retries.
 8. Update files, chunks, FTS, vector mappings, chunking metadata, and generation records in one SQLite transaction, then publish the new generation.
 

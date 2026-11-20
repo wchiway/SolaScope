@@ -283,24 +283,28 @@ impl Engine {
                 embedded = missing.len();
                 cache_hits = hashes.len() - embedded - relocated;
                 if embedded > 0 {
+                    let effective_batch_size = provider
+                        .batch_size_hint()
+                        .unwrap_or(self.config.embedding.batch_size)
+                        .clamp(1, 128);
+                    let group_inputs = (128 / effective_batch_size) * effective_batch_size;
                     tracing::info!(
                         inputs = embedded,
                         cache_hits,
                         relocated,
+                        effective_batch_size,
+                        concurrency = self.config.embedding.concurrency,
+                        group_inputs,
                         "requesting embeddings"
                     );
                     let texts: Vec<String> = missing
                         .values()
                         .map(|chunk| chunk.embedding_text.clone())
                         .collect();
-                    let group_size = self
-                        .config
-                        .embedding
-                        .batch_size
-                        .saturating_mul(self.config.embedding.concurrency)
-                        .clamp(1, 128);
                     let mut generated = Vec::with_capacity(texts.len());
-                    for batch in texts.chunks(group_size) {
+                    let embedding_started = Instant::now();
+                    for batch in texts.chunks(group_inputs) {
+                        let batch_started = Instant::now();
                         let output = tokio::select! {
                             _ = cancel.cancelled() => return Err(Error::Cancelled),
                             result = provider.embed(batch) => result.map_err(indexing_hint)?,
@@ -311,9 +315,17 @@ impl Engine {
                             ));
                         }
                         generated.extend(output);
+                        let elapsed_seconds = embedding_started.elapsed().as_secs_f64();
+                        let inputs_per_second = if elapsed_seconds > 0.0 {
+                            generated.len() as f64 / elapsed_seconds
+                        } else {
+                            0.0
+                        };
                         tracing::info!(
                             done = generated.len(),
                             total = embedded,
+                            batch_elapsed_ms = milliseconds(batch_started.elapsed()),
+                            inputs_per_second,
                             "embedding progress"
                         );
                     }

@@ -1,6 +1,8 @@
 use serde_json::json;
 use solascope_config::Config;
-use solascope_core::{ContextRequest, Error, SearchMode, SearchRequest, SymbolRequest};
+use solascope_core::{
+    ContextRequest, Error, SearchMode, SearchRequest, SymbolRequest, VectorIndex,
+};
 use solascope_engine::Engine;
 use solascope_storage::{Store, WriterLock};
 use std::fs;
@@ -421,6 +423,102 @@ async fn initial_index_splits_inputs_larger_than_provider_request_limit() {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert!(body["input"].as_array().unwrap().len() <= 128);
         assert!(!request.headers.contains_key("authorization"));
+    }
+}
+
+#[tokio::test]
+async fn dashscope_index_fills_effective_batches_and_preserves_source_vectors() {
+    const INPUTS: usize = 257;
+    let root = fixture();
+    let source: String = (0..INPUTS)
+        .map(|number| format!("fn generated_{number}() -> usize {{ {number} }}\n"))
+        .collect();
+    fs::write(root.path().join("src/lib.rs"), source).unwrap();
+    let server = MockServer::start().await;
+    let requests_started = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v1/services/embeddings/text-embedding/text-embedding",
+        ))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert_eq!(body["model"], "qwen3.7-text-embedding");
+            assert_eq!(body["parameters"]["text_type"], "document");
+            let inputs = body["input"]["texts"].as_array().unwrap();
+            assert!(!inputs.is_empty() && inputs.len() <= 20);
+            let entries: Vec<_> = inputs
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, text)| {
+                    let number: usize = text
+                        .as_str()
+                        .unwrap()
+                        .split("fn generated_")
+                        .nth(1)
+                        .unwrap()
+                        .split('(')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    json!({
+                        "text_index": index,
+                        "embedding": [(number + 1) as f32, (INPUTS - number) as f32]
+                    })
+                })
+                .collect();
+            let request_index = requests_started.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(if request_index == 0 {
+                    40
+                } else {
+                    1
+                }))
+                .set_body_json(json!({"output": {"embeddings": entries}}))
+        })
+        .expect(13)
+        .mount(&server)
+        .await;
+    let mut config = with_embedding(root.path(), &server);
+    config.embedding.provider = "dashscope".into();
+    config.embedding.model = "qwen3.7-text-embedding".into();
+    config.embedding.api_key_env = "SOLASCOPE_ENGINE_TEST_QWEN37_BATCH_KEY".into();
+    std::env::set_var(&config.embedding.api_key_env, "mock-qwen37-batch-key");
+    config.embedding.batch_size = 32;
+    config.embedding.concurrency = 2;
+    config.privacy.remote_opt_in = true;
+    let engine = Engine::new(config).unwrap();
+    let report = engine.index(false).await.unwrap();
+    assert_eq!(report.embedded_chunks, INPUTS);
+    assert_eq!(report.chunks, INPUTS);
+    let requests = server.received_requests().await.unwrap();
+    let sizes: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            body["input"]["texts"].as_array().unwrap().len()
+        })
+        .collect();
+    assert_eq!(sizes, [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 17]);
+
+    let store = Store::open(&engine.config().project.index_dir, root.path(), false).unwrap();
+    let fingerprint = store
+        .current_generation()
+        .unwrap()
+        .unwrap()
+        .fingerprint
+        .unwrap();
+    for number in 0..INPUTS {
+        let vector = [(number + 1) as f32, (INPUTS - number) as f32];
+        let hits = store
+            .vector_search(&vector, &fingerprint.key(), 1, None)
+            .unwrap();
+        assert_eq!(
+            hits[0].chunk.symbol.as_deref(),
+            Some(format!("generated_{number}").as_str())
+        );
+        assert_eq!(hits[0].chunk.relative_path, "src/lib.rs");
     }
 }
 

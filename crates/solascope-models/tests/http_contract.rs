@@ -151,6 +151,55 @@ async fn openai_restores_indices_and_batch_order_without_duplicating_v1() {
 }
 
 #[tokio::test]
+async fn completed_batches_refill_slots_before_a_slow_batch_and_preserve_order() {
+    let server = MockServer::start().await;
+    let third_started = Arc::new(tokio::sync::Notify::new());
+    let notification = third_started.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let input = body["input"][0].as_str().unwrap();
+            let (vector, delay) = match input {
+                "slow" => (json!([1.0, 0.0]), Duration::from_secs(2)),
+                "fast" => (json!([0.0, 1.0]), Duration::ZERO),
+                "next" => {
+                    notification.notify_one();
+                    (json!([-1.0, 0.0]), Duration::ZERO)
+                }
+                _ => panic!("unexpected input"),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"index": 0, "embedding": vector}]}))
+                .set_delay(delay)
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    let mut config = embedding(&server, "openai");
+    config.batch_size = 1;
+    config.concurrency = 2;
+    config.timeout_secs = 5;
+    let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+    assert_eq!(provider.batch_size_hint(), Some(1));
+    let running = tokio::spawn(async move {
+        provider
+            .embed(&["slow".into(), "fast".into(), "next".into()])
+            .await
+    });
+    let refilled = tokio::time::timeout(Duration::from_secs(1), third_started.notified()).await;
+    if refilled.is_err() {
+        running.abort();
+        panic!("a completed request must refill its slot before the slow request returns");
+    }
+    let result = running.await.unwrap().unwrap();
+    assert_eq!(
+        result,
+        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![-1.0, 0.0]]
+    );
+}
+
+#[tokio::test]
 async fn embedding_rejects_count_index_and_vector_corruption() {
     let invalid = [
         json!({"data": []}),
@@ -635,6 +684,7 @@ async fn dashscope_batches_follow_model_limits_and_restore_document_order() {
         config.endpoint = format!("{}/api/v1/", server.uri());
         config.batch_size = 256;
         let provider = build_embedding(&config, &privacy(true)).unwrap().unwrap();
+        assert_eq!(provider.batch_size_hint(), Some(limit));
         let inputs: Vec<_> = (0..limit + 2).map(|number| number.to_string()).collect();
         let vectors = provider.embed(&inputs).await.unwrap();
         assert_eq!(vectors.len(), inputs.len());

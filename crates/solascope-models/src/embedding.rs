@@ -129,6 +129,7 @@ impl HttpEmbedding {
 
     async fn batch(&self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
         let _permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
+        let started = std::time::Instant::now();
         let model = &self.fingerprint.model;
         let dimensions = self.fingerprint.dimensions;
         let vectors = match self.protocol {
@@ -175,10 +176,17 @@ impl HttpEmbedding {
                 ordered(embeddings, texts.len())?
             }
         };
-        vectors
+        let vectors = vectors
             .into_iter()
             .map(|vector| normalize_vector(vector, dimensions))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        tracing::debug!(
+            inputs = texts.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            query,
+            "embedding batch complete"
+        );
+        Ok(vectors)
     }
 
     async fn run(&self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>> {
@@ -212,17 +220,26 @@ impl HttpEmbedding {
                 ));
             }
         }
-        // Owned futures preserve batch order and are dropped on cancellation.
+        // Complete ready batches immediately so slow requests do not hold idle
+        // slots. Restore input order before associating vectors with source.
         let inputs: Vec<Vec<String>> = texts
             .chunks(self.batch_size)
             .map(<[String]>::to_vec)
             .collect();
-        let batches: Vec<Vec<Vec<f32>>> = stream::iter(inputs)
-            .map(|batch: Vec<String>| async move { self.batch(&batch, query).await })
-            .buffered(self.concurrency)
+        let mut batches: Vec<(usize, Vec<Vec<f32>>)> = stream::iter(inputs.into_iter().enumerate())
+            .map(|(index, batch)| async move {
+                self.batch(&batch, query)
+                    .await
+                    .map(|vectors| (index, vectors))
+            })
+            .buffer_unordered(self.concurrency)
             .try_collect()
             .await?;
-        Ok(batches.into_iter().flatten().collect())
+        batches.sort_unstable_by_key(|(index, _)| *index);
+        Ok(batches
+            .into_iter()
+            .flat_map(|(_, vectors)| vectors)
+            .collect())
     }
 }
 
@@ -233,6 +250,9 @@ impl EmbeddingProvider for HttpEmbedding {
     }
     fn is_remote(&self) -> bool {
         self.remote
+    }
+    fn batch_size_hint(&self) -> Option<usize> {
+        Some(self.batch_size)
     }
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.run(texts, false).await

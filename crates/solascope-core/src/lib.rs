@@ -165,6 +165,10 @@ impl ModelFingerprint {
 pub trait EmbeddingProvider: Send + Sync {
     fn fingerprint(&self) -> ModelFingerprint;
     fn is_remote(&self) -> bool;
+    /// Effective HTTP batch size, when known, for aligning bounded indexing groups.
+    fn batch_size_hint(&self) -> Option<usize> {
+        None
+    }
     /// Embed index documents, keeping the input order.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     /// Providers with asymmetric query/document modes override this method.
