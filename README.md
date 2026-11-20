@@ -181,15 +181,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-GitHub Actions is configured to run workspace formatting, Clippy, default tests, and package tests on Linux, macOS, and Windows, with `local-rerank` tests in a separate Linux job. After all checks pass, a reusable workflow builds both CLI binaries and packages them with public documentation and `SHA256SUMS`: `.tar.gz` on Unix, `.zip` on Windows, named by version and Rust target. Runs reuse Rust dependency caches and cancel superseded runs; publishing to crates.io or GitHub Releases is not configured.
+GitHub Actions is configured to run workspace formatting, Clippy, default tests, and package tests on Linux, macOS, and Windows, with `local-rerank` tests in a separate Linux job. After all checks pass, a reusable workflow builds both CLI binaries and packages them with public documentation and `SHA256SUMS`: `.tar.gz` on Unix, `.zip` on Windows, named by version and Rust target. Runs reuse Rust dependency caches and cancel superseded runs.
 
-Package tests can also run locally with Python 3.9 or newer:
+Following zoxide's release convention, a `main` push whose commit message starts with `chore(release)` creates a **draft GitHub Release** after CI succeeds. The release workflow reuses the three platform packages, verifies their contents and checksums, and combines their checksum entries into one `SHA256SUMS`. Maintainers can also run `release.yml` manually on `main`, supplying the ID of a successful `ci.yml` run from `main`. The tag is `v<workspace version>` and targets that run's source commit; existing releases are rejected, and existing tags must match the source commit. Drafts require manual review and publication. Publishing to crates.io is not configured. See [release operations](docs/implementation-status.md#release-operations) for the procedure and validation limits.
+
+Package and release-collection tests can also run locally with Python 3.9 or newer:
 
 ```bash
 python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 ```
 
-Linux CLI builds, installation, and automated tests have been exercised. Model protocol tests use local mock servers. Live model quality, local ONNX inference, macOS/Windows execution, commercial MCP clients, and remote CI packages still need validation.
+Linux CLI builds, installation, and automated tests have been exercised. Model protocol tests use local mock servers. Live model quality, local ONNX inference, macOS/Windows execution, commercial MCP clients, remote CI packages, and GitHub draft-release creation still need validation.
 
 ## License
 

@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [Test and package]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful main CI run ID whose packages will be released
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  prepare:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        startsWith(github.event.workflow_run.head_commit.message, 'chore(release)')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CI_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+    outputs:
+      source_sha: ${{ steps.ci.outputs.source_sha }}
+      version: ${{ steps.assets.outputs.version }}
+      tag: ${{ steps.assets.outputs.tag }}
+      prerelease: ${{ steps.assets.outputs.prerelease }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Validate the source CI run
+        id: ci
+        run: |
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              printf '::error::A numeric CI run ID is required.\n'
+              exit 1
+          fi
+          metadata=$(mktemp -d "$RUNNER_TEMP/release-metadata.XXXXXX")
+          gh api "repos/$GH_REPO/actions/runs/$CI_RUN_ID" >"$metadata/run.json"
+          jq -e --arg repo "$GH_REPO" '
+            .status == "completed" and .conclusion == "success" and
+            (.event == "push" or .event == "workflow_dispatch") and
+            .head_branch == "main" and .head_repository.full_name == $repo and
+            .path == ".github/workflows/ci.yml"
+          ' "$metadata/run.json" >/dev/null
+          source_sha=$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' "$metadata/run.json")
+          main_sha=$(gh api "repos/$GH_REPO/branches/main" --jq '.commit.sha')
+          if [[ "$source_sha" != "$main_sha" ]]; then
+              relation=$(gh api "repos/$GH_REPO/compare/$source_sha...$main_sha" --jq '.status')
+              if [[ "$relation" != ahead && "$relation" != identical ]]; then
+                  printf '::error::The CI commit is no longer in main history.\n'
+                  exit 1
+              fi
+          fi
+          printf 'run_id=%s\nsource_sha=%s\n' "$CI_RUN_ID" "$source_sha" >>"$GITHUB_OUTPUT"
+      - name: Check out the verified source manifest
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.ci.outputs.source_sha }}
+          path: version-source
+          persist-credentials: false
+      - name: Download the verified CI packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: solascope-*
+          path: dist/ci-artifacts
+          merge-multiple: false
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.ci.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify packages and combine checksums
+        id: assets
+        run: |
+          version=$(python -I -c 'from pathlib import Path; import tomllib; sys_version = tomllib.loads(Path("version-source/Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]; print(sys_version)')
+          python -I -B .github/scripts/collect_release.py \
+              --artifacts dist/ci-artifacts --output dist/release --version "$version"
+          prerelease=false
+          if [[ "${version%%+*}" == *-* ]]; then
+              prerelease=true
+          fi
+          printf 'version=%s\ntag=v%s\nprerelease=%s\n' "$version" "$version" "$prerelease" >>"$GITHUB_OUTPUT"
+      - name: Upload validated release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/release/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Create draft release
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+    steps:
+      - name: Download validated release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets
+          path: dist/release
+      - name: Preserve existing releases and tags
+        run: |
+          existing=$(gh api --paginate "repos/$GH_REPO/releases" |
+              jq -r --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag) | .html_url')
+          if [[ -n "$existing" ]]; then
+              printf '::error::Release %s already exists; review it instead of overwriting it.\n' "$RELEASE_TAG"
+              exit 1
+          fi
+          object=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" |
+              jq -c --arg ref "refs/tags/$RELEASE_TAG" '.[] | select(.ref == $ref) | .object')
+          if [[ -n "$object" ]]; then
+              type=$(jq -er '.type' <<<"$object")
+              sha=$(jq -er '.sha' <<<"$object")
+              for _ in {1..10}; do
+                  if [[ "$type" != tag ]]; then
+                      break
+                  fi
+                  object=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object')
+                  type=$(jq -er '.type' <<<"$object")
+                  sha=$(jq -er '.sha' <<<"$object")
+              done
+              if [[ "$type" != commit || "$sha" != "$SOURCE_SHA" ]]; then
+                  printf '::error::The release tag does not point to the verified CI commit.\n'
+                  exit 1
+              fi
+          fi
+      - name: Create draft and upload assets
+        run: |
+          args=(--repo "$GH_REPO" --target "$SOURCE_SHA" --title "$RELEASE_TAG" --notes "" --draft)
+          if [[ "$PRERELEASE" == true ]]; then
+              args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/release/* "${args[@]}"
