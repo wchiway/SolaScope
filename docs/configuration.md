@@ -211,12 +211,27 @@ HTTP errors and error envelopes within HTTP 200 responses are classified by prov
 | Field | Default | Description |
 | --- | --- | --- |
 | `level` | `info` | `off`, `error`, `warn`, `info`, `debug`, or `trace` |
-| `output` | `stderr` | `stderr` or a log file within the project root; cannot write into `.git` or escape the root through symlinks |
+| `output` | `stderr` | Console diagnostics to stderr with an automatic file copy, or an explicit log file within the project root |
+| `persist` | `true` | With `output = "stderr"`, append a file copy beside the active configuration; `false` keeps stderr only |
 | `redact_secrets` | `true` | Additionally redact generic Bearer tokens; configured API key values are always redacted |
 
-File logs carry the marker `# SolaScope diagnostic log`. SolaScope appends only to logs it created; an existing file without that marker is left unchanged and causes an error. New Unix files use permissions `0600`. The configured log file is excluded from indexing and source-context reads.
+By default, CLI diagnostics go to stderr and `<configuration-directory>/logs/solascope.log`. A project configuration or `--config FILE` selects that file's directory; otherwise the user configuration directory is used, even before its TOML file has been created. For the standard user configuration this is `~/.solascope/logs/solascope.log` on Linux/macOS, or `$USERPROFILE/.solascope/logs/solascope.log` on Windows. Configuration selection does not change the source directory.
+
+The file is appended across commands. Set `log.persist = false` to disable the automatic copy. An explicit `log.output` file preserves the existing project-confined behavior and is used regardless of `persist`; it replaces the normal trace destinations. Logs cannot escape the selected configuration directory or project root through symlinks, and cannot be written into `.git`.
+
+File logs carry the marker `# SolaScope diagnostic log`. SolaScope appends only to logs it created; an existing file without that marker is left unchanged and causes an error. New Unix files use permissions `0600`. The selected log path is excluded from indexing and source-context reads, including when automatic persistence is disabled.
+
+HTTP diagnostics record retry attempts, status codes, wait times, and static error categories. Final CLI failures are also logged. Request URLs, request/response bodies, vendor error messages, and credentials are excluded from model-transport events. All destinations use the same secret-redaction path.
 
 `--verbose` sets SolaScope modules to debug; third-party modules remain at warn by default to avoid implicitly logging model/MCP bodies. Without `--verbose`, an explicit `RUST_LOG` can override levels. Do not enable verbose logging for protocol libraries that may print complete requests or responses. File logging changes only the diagnostic log destination; CLI errors, warnings, and MCP probe messages still stay out of stdout.
+
+#### Investigating HTTP 429
+
+A 429 generally indicates a provider rate limit. Check the model's account-specific request and token quotas; some services also use it for quota errors. The diagnostic event distinguishes recognized authentication/quota codes from retryable rate limits without recording the vendor's error body. An unrecognized code remains classified by HTTP status.
+
+`embedding.concurrency` limits simultaneous requests, not requests or tokens per minute. Provider-specific batch caps can split one indexing progress group into several HTTP requests. Lowering concurrency can reduce bursts. The current retry policy waits 100 ms, then doubles on each retry; `retries = 2` permits three attempts with 100 ms and 200 ms waits. It does not interpret `Retry-After` or impose an RPM/TPM budget, so increasing retries alone may not cover the provider's reset window.
+
+Index progress is not a persistent checkpoint. New embeddings are published with the complete index transaction; a failed run leaves the existing index unchanged and can require those uncommitted embeddings again on retry. Changing batch size, concurrency, or retries does not change the embedding fingerprint and does not require `--rebuild`.
 
 ## Always-excluded paths
 

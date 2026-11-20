@@ -216,8 +216,8 @@ impl Policy {
             root,
             directory,
             index,
-            log: (config.log.output != "stderr").then(|| {
-                let path = PathBuf::from(&config.log.output);
+            log: Some({
+                let path = config.diagnostic_log_path();
                 path.canonicalize().unwrap_or(path)
             }),
             include: globs(&config.project.include)?,
@@ -749,6 +749,24 @@ mod tests {
         let event = Event::new(EventKind::Access(notify::event::AccessKind::Any))
             .add_path(root.path().join("src.rs"));
         assert!(!event_is_relevant(&config, &event));
+    }
+
+    #[test]
+    fn automatic_configuration_logs_cannot_be_indexed_or_read() {
+        let (root, mut config) = fixture();
+        write(root.path(), "src/lib.rs", "fn read() {}");
+        write(
+            root.path(),
+            "logs/solascope.log",
+            "private diagnostic event",
+        );
+        config.log.directory = Some(root.path().to_path_buf());
+        config.project.include = vec!["**/*".into()];
+        assert_eq!(paths(&scan(&config).unwrap()), ["src/lib.rs"]);
+        assert!(read_file(&config, "logs/solascope.log").is_err());
+        config.log.persist = false;
+        assert_eq!(paths(&scan(&config).unwrap()), ["src/lib.rs"]);
+        assert!(read_file(&config, "logs/solascope.log").is_err());
     }
 
     #[test]

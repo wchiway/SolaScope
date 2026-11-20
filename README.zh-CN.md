@@ -112,6 +112,8 @@ Embedding 和重排默认禁用，可通过用户配置或项目覆盖启用：
 
 API Key 可放在配置文件同目录的 `.env` 中，例如 `DASHSCOPE_API_KEY` 和 `SILICONFLOW_API_KEY`。TOML 通过 `api_key_env` 引用变量名，已有进程环境变量优先。修改 `.env` 后应重启监听进程或 MCP 服务。
 
+CLI 诊断日志同时追加到实际配置目录下的 `logs/solascope.log`。使用默认用户配置时，Linux/macOS 为 `~/.solascope/logs/solascope.log`，Windows 为 `$USERPROFILE/.solascope/logs/solascope.log`。日志记录脱敏后的重试状态和最终错误；设置 `log.persist = false` 可仅保留 stderr 输出。
+
 全部字段、优先级、服务协议和示例见[配置文档](docs/configuration.md)。
 
 向量索引绑定 provider、模型、endpoint、维度、归一化和输入模板组成的指纹。修改 Embedding 配置后重建索引：

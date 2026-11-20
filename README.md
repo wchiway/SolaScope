@@ -112,6 +112,8 @@ HTTP model providers require `privacy.remote_opt_in = true`, except for Ollama o
 
 Store API keys in a `.env` beside the configuration file, using variable names such as `DASHSCOPE_API_KEY` and `SILICONFLOW_API_KEY`. The TOML configuration references those names through `api_key_env`. Existing process variables take precedence. Restart a watcher or MCP server after changing `.env`.
 
+CLI diagnostics are also appended to `logs/solascope.log` beside the active configuration, normally `~/.solascope/logs/solascope.log` on Linux/macOS or `$USERPROFILE/.solascope/logs/solascope.log` on Windows. Retry status and final failures are recorded with credentials redacted. Set `log.persist = false` to keep stderr only.
+
 The [configuration reference](docs/configuration.md) covers every field, precedence rule, provider protocol, and setup example.
 
 An embedding index is bound to a fingerprint of the provider, model, endpoint, dimensions, normalization, and input template. After changing the embedding setup, rebuild the index:

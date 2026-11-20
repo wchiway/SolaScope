@@ -277,6 +277,7 @@ fn interrupt_signal() -> (CancellationToken, tokio::task::JoinHandle<()>) {
 
 fn report_error(error: Error, json_output: bool) -> i32 {
     let code = error.exit_code();
+    logging::record_error(&error);
     if json_output {
         eprintln!(
             "{}",

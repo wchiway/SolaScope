@@ -9,7 +9,7 @@ solascope mcp --root /abs/path/to/project
 
 - Each server instance has one fixed project root. Tool arguments cannot change it.
 - The server is read-only: it does not create, update, or migrate an index. Run `index` first, or keep a separate `watch` / `index --watch` process running.
-- Stdout carries protocol messages only. Diagnostics default to stderr; `log.output` can redirect logs to a protected file within the project.
+- Stdout carries protocol messages only. Diagnostics go to stderr and, by default, `logs/solascope.log` beside the active configuration. `log.persist = false` disables the automatic copy; an explicit `log.output` can redirect traces to a protected file within the project.
 - Configuration supplies the default result limit, retrieval mode, path filter, and reranking setting. Startup flags `--limit`, `--mode`, `--path`, and `--no-rerank` can override them.
 - Missing indexes and outdated schemas or chunking rules produce errors with instructions to run `index` separately.
 

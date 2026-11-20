@@ -55,6 +55,85 @@ fn success(output: &std::process::Output) -> Value {
 }
 
 #[tokio::test]
+async fn automatic_logs_follow_user_and_explicit_configuration_without_polluting_json() {
+    let root = fixture();
+    let mut first = command(root.path());
+    first.args(["index", "--json"]);
+    let indexed = output(first).await;
+    assert_eq!(success(&indexed)["files_total"], 1);
+    let user_log = root.path().join("user-home/.solascope/logs/solascope.log");
+    assert!(std::fs::read_to_string(user_log)
+        .unwrap()
+        .contains("index committed"));
+    let settings = tempfile::tempdir().unwrap();
+    let config = settings.path().join("settings.toml");
+    std::fs::write(&config, "[log]\nlevel='info'\n").unwrap();
+    let mut second = command(root.path());
+    second.args(["index", "--json", "--config"]).arg(&config);
+    let indexed = output(second).await;
+    assert_eq!(success(&indexed)["files_unchanged"], 1);
+    assert!(String::from_utf8_lossy(&indexed.stderr).contains("scan complete"));
+    let path = settings.path().join("logs/solascope.log");
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(before.contains("scan complete") && before.contains("index committed"));
+    assert!(!root.path().join("logs").exists());
+    let mut third = command(root.path());
+    third.args(["index", "--json", "--config"]).arg(&config);
+    success(&output(third).await);
+    let after = std::fs::read_to_string(path).unwrap();
+    assert!(after.starts_with(&before) && after.len() > before.len());
+}
+
+#[tokio::test]
+async fn automatic_project_logs_are_excluded_from_index_and_context() {
+    let root = fixture();
+    std::fs::write(root.path().join(".solascope.toml"), "[log]\nlevel='info'\n").unwrap();
+    let mut index = command(root.path());
+    index.args(["index", "--json"]);
+    assert_eq!(success(&output(index).await)["files_total"], 1);
+    let path = root.path().join("logs/solascope.log");
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("index committed"));
+    let mut context = command(root.path());
+    context.args(["context", "logs/solascope.log", "--json"]);
+    let failed = output(context).await;
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(failed.stdout.is_empty());
+    assert!(std::fs::read_to_string(path)
+        .unwrap()
+        .contains("command failed"));
+}
+
+#[tokio::test]
+async fn model_rate_limit_retries_and_final_errors_are_persisted_without_vendor_bodies() {
+    let root = fixture();
+    let settings = tempfile::tempdir().unwrap();
+    let config = settings.path().join("settings.toml");
+    let server = MockServer::start().await;
+    std::fs::write(&config, format!("[embedding]\nprovider='ollama'\nmodel='test'\nendpoint='{}'\ndimensions=2\nretries=1\n", server.uri())).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {"code": "RateLimitExceeded", "message": "VENDOR_BODY_MUST_NOT_BE_LOGGED"}})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut index = command(root.path());
+    index.args(["index", "--json", "--config"]).arg(&config);
+    let failed = output(index).await;
+    assert_eq!(failed.status.code(), Some(4));
+    assert!(failed.stdout.is_empty());
+    let content = std::fs::read_to_string(settings.path().join("logs/solascope.log")).unwrap();
+    assert!(
+        content.contains("429") && content.contains("command failed"),
+        "{content}"
+    );
+    assert!(content.contains("existing index is unchanged"), "{content}");
+    assert!(!content.contains("VENDOR_BODY_MUST_NOT_BE_LOGGED"));
+    assert!(!content.contains(&server.uri()));
+}
+
+#[tokio::test]
 async fn configured_logs_are_appended_and_never_indexed() {
     let root = fixture();
     std::fs::write(

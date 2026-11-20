@@ -101,7 +101,10 @@ section!(PrivacyConfig {
 section!(LogConfig {
     level: String = "info".into(),
     output: String = "stderr".into(),
+    persist: bool = true,
     redact_secrets: bool = true,
+    #[serde(skip)]
+    directory: Option<PathBuf> = None,
 });
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -128,6 +131,19 @@ impl Config {
         config.project.root = root;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The explicit log destination, or the reserved log beside the active configuration.
+    pub fn diagnostic_log_path(&self) -> PathBuf {
+        if self.log.output != "stderr" {
+            PathBuf::from(&self.log.output)
+        } else {
+            self.log
+                .directory
+                .as_deref()
+                .unwrap_or(&self.project.root)
+                .join("logs/solascope.log")
+        }
     }
 
     /// Load settings from the nearest project configuration or an explicit file.
@@ -223,6 +239,14 @@ impl Config {
         )?;
         if self.log.output != "stderr" && !Path::new(&self.log.output).is_absolute() {
             return Err(invalid("log.output must be \"stderr\" or a file path"));
+        }
+        if self
+            .log
+            .directory
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid("log configuration directory must be absolute"));
         }
         for (name, count) in [
             ("project.max_file_size", self.project.max_file_size),
@@ -499,6 +523,10 @@ fn load_with_sources(
     let defaults = value.clone();
     let mut explicit_index = false;
     let mut environment = Environment::default();
+    let mut log_directory = global
+        .and_then(Path::parent)
+        .unwrap_or(&selected)
+        .to_path_buf();
     let project = config_path
         .map(|path| absolute(path, cwd))
         .unwrap_or_else(|| {
@@ -521,6 +549,7 @@ fn load_with_sources(
             Err(error) => return Err(error.into()),
         };
         if present {
+            log_directory = path.parent().unwrap_or(&selected).to_path_buf();
             let layer = load_layer(path)?;
             explicit_index |= layer
                 .get("project")
@@ -568,6 +597,7 @@ fn load_with_sources(
     }
     base.embedding.environment = environment.clone();
     base.rerank.environment = environment;
+    base.log.directory = Some(absolute(&log_directory, cwd));
     base.validate()?;
     Ok(base)
 }
@@ -639,6 +669,90 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         load_with_sources(None, None, root, global, &env)
+    }
+
+    #[test]
+    fn diagnostic_logs_follow_the_selected_configuration_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let settings = tempfile::tempdir().unwrap();
+        let global = settings.path().join("user/.solascope.toml");
+        let config = load_with_sources(
+            Some(source.path()),
+            None,
+            source.path(),
+            Some(&global),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.diagnostic_log_path(),
+            settings.path().join("user/logs/solascope.log")
+        );
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(&global, "[log]\nlevel='debug'\n").unwrap();
+        let config = load_with_sources(
+            Some(source.path()),
+            None,
+            source.path(),
+            Some(&global),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.diagnostic_log_path(),
+            settings.path().join("user/logs/solascope.log")
+        );
+        fs::write(source.path().join(".solascope.toml"), "[search]\nlimit=3\n").unwrap();
+        let config = load_with_sources(
+            Some(source.path()),
+            None,
+            source.path(),
+            Some(&global),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.diagnostic_log_path(),
+            source.path().join("logs/solascope.log")
+        );
+        let explicit = settings.path().join("explicit.toml");
+        fs::write(&explicit, "[log]\nlevel='info'\n").unwrap();
+        let config = load_with_sources(
+            Some(source.path()),
+            Some(&explicit),
+            source.path(),
+            Some(&global),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.diagnostic_log_path(),
+            settings.path().join("logs/solascope.log")
+        );
+        assert_eq!(config.project.root, source.path().canonicalize().unwrap());
+        let serialized = toml::Value::try_from(&config).unwrap();
+        assert!(serialized["log"].get("directory").is_none());
+    }
+
+    #[test]
+    fn automatic_log_persistence_can_be_disabled_without_changing_explicit_output() {
+        let root = tempfile::tempdir().unwrap();
+        let environment =
+            BTreeMap::from([("SOLASCOPE__LOG__PERSIST".to_owned(), "false".to_owned())]);
+        let config =
+            load_with_sources(Some(root.path()), None, root.path(), None, &environment).unwrap();
+        assert!(!config.log.persist);
+        assert_eq!(
+            config.diagnostic_log_path(),
+            root.path().join("logs/solascope.log")
+        );
+        fs::write(
+            root.path().join(".solascope.toml"),
+            "[log]\noutput='custom.log'\npersist=false\n",
+        )
+        .unwrap();
+        let config = load(root.path(), None, &[]).unwrap();
+        assert_eq!(config.diagnostic_log_path(), root.path().join("custom.log"));
     }
 
     #[test]

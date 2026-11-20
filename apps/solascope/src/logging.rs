@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cap_std::fs::{Dir, OpenOptions};
 use solascope_config::{Config, Environment};
@@ -9,6 +9,8 @@ use solascope_core::{Error, Result};
 use tracing_subscriber::fmt::writer::MakeWriter;
 
 const HEADER: &[u8] = b"# SolaScope diagnostic log\n";
+
+static ERROR_LOG: OnceLock<tracing::Dispatch> = OnceLock::new();
 
 pub(crate) fn initialize(config: &Config, verbose: bool) -> Result<()> {
     let level = if verbose { "debug" } else { &config.log.level };
@@ -42,18 +44,41 @@ pub(crate) fn initialize(config: &Config, verbose: bool) -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(defaults))
     };
+    let writer = LogWriter::new(config)?;
+    let error_log = writer.file_only().map(|writer| {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(filter.to_string()))
+                .with_writer(writer)
+                .with_ansi(false)
+                .finish(),
+        )
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(LogWriter::new(config)?)
+        .with_writer(writer)
         .with_ansi(false)
         .try_init()
-        .map_err(|_| Error::Config("could not initialize diagnostic logging".into()))
+        .map_err(|_| Error::Config("could not initialize diagnostic logging".into()))?;
+    if let Some(dispatch) = error_log {
+        let _ = ERROR_LOG.set(dispatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn record_error(error: &Error) {
+    if let Some(dispatch) = ERROR_LOG.get() {
+        tracing::dispatcher::with_default(dispatch, || {
+            tracing::error!(exit_code = error.exit_code(), error = %error, "command failed");
+        });
+    }
 }
 
 #[derive(Clone)]
 enum Destination {
     Stderr,
     File(Arc<Mutex<File>>),
+    StderrAndFile(Arc<Mutex<File>>),
 }
 
 #[derive(Clone)]
@@ -66,7 +91,11 @@ struct LogWriter {
 impl LogWriter {
     fn new(config: &Config) -> Result<Self> {
         let destination = if config.log.output == "stderr" {
-            Destination::Stderr
+            if config.log.persist {
+                Destination::StderrAndFile(Arc::new(Mutex::new(open_log(config)?)))
+            } else {
+                Destination::Stderr
+            }
         } else {
             Destination::File(Arc::new(Mutex::new(open_log(config)?)))
         };
@@ -86,6 +115,16 @@ impl LogWriter {
             ]),
             redact_bearer: config.log.redact_secrets,
         })
+    }
+
+    fn file_only(&self) -> Option<Self> {
+        match &self.destination {
+            Destination::File(file) | Destination::StderrAndFile(file) => Some(Self {
+                destination: Destination::File(file.clone()),
+                ..self.clone()
+            }),
+            Destination::Stderr => None,
+        }
     }
 }
 
@@ -130,12 +169,16 @@ impl Write for LogEntry {
         self.bytes.clear();
         match &self.destination {
             Destination::Stderr => io::stderr().lock().write_all(rendered.as_bytes()),
-            Destination::File(file) => {
+            Destination::File(file) | Destination::StderrAndFile(file) => {
                 let mut file = file
                     .lock()
                     .map_err(|_| io::Error::other("log lock poisoned"))?;
                 file.write_all(rendered.as_bytes())?;
-                file.flush()
+                file.flush()?;
+                if matches!(self.destination, Destination::StderrAndFile(_)) {
+                    io::stderr().lock().write_all(rendered.as_bytes())?;
+                }
+                Ok(())
             }
         }
     }
@@ -209,22 +252,44 @@ fn canonical_candidate(path: &Path) -> Result<PathBuf> {
 }
 
 fn open_log(config: &Config) -> Result<File> {
-    let root = config.project.root.canonicalize()?;
-    let path = Path::new(&config.log.output);
-    if path
-        .symlink_metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::Privacy("log file cannot be a symbolic link".into()));
-    }
-    let candidate = canonical_candidate(path)?;
-    let relative = candidate
-        .strip_prefix(&root)
-        .map_err(|_| Error::Privacy("log file must stay inside the project root".into()))?;
-    solascope_core::validate_relative_path(&relative.to_string_lossy())?;
-    if relative
+    let path = config.diagnostic_log_path();
+    let root = if config.log.output == "stderr" {
+        config
+            .log
+            .directory
+            .as_deref()
+            .unwrap_or(&config.project.root)
+    } else {
+        &config.project.root
+    };
+    let root = canonical_candidate(root)?;
+    if root
         .components()
-        .any(|component| component.as_os_str() == ".git")
+        .any(|component| component.as_os_str().eq_ignore_ascii_case(".git"))
+    {
+        return Err(Error::Privacy("cannot write logs into Git metadata".into()));
+    }
+    std::fs::create_dir_all(&root)?;
+    let root = root.canonicalize()?;
+    if let Ok(metadata) = path.symlink_metadata() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Privacy(
+                "log destination must be a regular file, not a symbolic link".into(),
+            ));
+        }
+    }
+    let candidate = canonical_candidate(&path)?;
+    let relative = candidate.strip_prefix(&root).map_err(|_| {
+        Error::Privacy(if config.log.output == "stderr" {
+            "log file must stay inside the configuration directory".into()
+        } else {
+            "log file must stay inside the project root".into()
+        })
+    })?;
+    solascope_core::validate_relative_path(&relative.to_string_lossy())?;
+    if candidate
+        .components()
+        .any(|component| component.as_os_str().eq_ignore_ascii_case(".git"))
     {
         return Err(Error::Privacy("cannot write logs into Git metadata".into()));
     }
@@ -276,6 +341,67 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         config
+    }
+
+    #[test]
+    fn automatic_logs_append_beside_configuration_outside_the_source_root() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = tempfile::tempdir().unwrap();
+        let directory = settings.path().join("new-user-directory");
+        let mut config = Config::default_for_root(root.path()).unwrap();
+        config.log.directory = Some(directory.clone());
+        let writer = LogWriter::new(&config).unwrap();
+        writer
+            .make_writer()
+            .write_all(b"first diagnostic\n")
+            .unwrap();
+        writer
+            .make_writer()
+            .write_all(b"second diagnostic\n")
+            .unwrap();
+        let path = directory.join("logs/solascope.log");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(std::str::from_utf8(HEADER).unwrap()));
+        assert!(content.contains("first diagnostic") && content.contains("second diagnostic"));
+        assert!(!root.path().join("logs").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_automatic_logs_does_not_create_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default_for_root(root.path()).unwrap();
+        config.log.persist = false;
+        LogWriter::new(&config).unwrap();
+        assert!(!root.path().join("logs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_logs_reject_configuration_directory_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let settings = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), settings.path().join("logs")).unwrap();
+        let mut config = Config::default_for_root(root.path()).unwrap();
+        config.log.directory = Some(settings.path().to_path_buf());
+        assert!(matches!(LogWriter::new(&config), Err(Error::Privacy(_))));
+        assert!(!outside.path().join("solascope.log").exists());
+        let metadata = outside.path().join(".git");
+        std::fs::create_dir(&metadata).unwrap();
+        let alias = settings.path().join("configuration-alias");
+        symlink(&metadata, &alias).unwrap();
+        config.log.directory = Some(alias);
+        assert!(matches!(LogWriter::new(&config), Err(Error::Privacy(_))));
+        assert!(!metadata.join("logs").exists());
     }
 
     #[test]
