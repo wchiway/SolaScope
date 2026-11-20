@@ -50,6 +50,11 @@ pub(crate) enum Command {
         #[arg(long)]
         probe: bool,
     },
+    /// Create .solascopeignore in the project root without overwriting it.
+    Ignore {
+        /// Project directory; defaults to the current directory.
+        path: Option<PathBuf>,
+    },
     /// Recursively index the current directory or an explicit path.
     Index {
         /// Directory to index; defaults to the current directory.
@@ -105,7 +110,9 @@ pub(crate) enum Command {
 impl Command {
     pub fn project_path(&self) -> Option<&Path> {
         match self {
-            Self::Index { path, .. } | Self::Watch { path, .. } => path.as_deref(),
+            Self::Ignore { path } | Self::Index { path, .. } | Self::Watch { path, .. } => {
+                path.as_deref()
+            }
             _ => None,
         }
     }

@@ -51,6 +51,7 @@ fn both_names_have_identical_help_and_version_without_config_or_database() {
     for args in [
         vec!["--help"],
         vec!["--version"],
+        vec!["ignore", "--help"],
         vec!["index", "--help"],
         vec!["search", "--help"],
         vec!["context", "--help"],
@@ -101,6 +102,220 @@ fn init_json_reports_path_and_does_not_overwrite() {
     assert!(!second.status.success());
     assert!(second.stdout.is_empty());
     assert_eq!(std::fs::read(config).unwrap(), original);
+}
+
+#[test]
+fn ignore_json_creates_project_rules_without_overwriting() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".solascopeignore");
+        let value = json_ok(
+            command(binary, root.path())
+                .args(["ignore", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            Path::new(value["ignore_path"].as_str().unwrap()),
+            path.canonicalize().unwrap()
+        );
+        let template = std::fs::read_to_string(&path).unwrap();
+        assert!(template.contains("gitignore syntax"));
+        assert!(template.contains("# generated/\n"));
+        assert!(template.contains("# !important.log\n"));
+        assert!(template
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with('#')));
+        assert!(!root.path().join(".solaignore").exists());
+        assert!(!root.path().join(".solascope").exists());
+        assert!(!root.path().join(".solascope.toml").exists());
+        assert!(!root
+            .path()
+            .join("user-home/.solascope/.solascope.toml")
+            .exists());
+
+        let rules = "generated/\n*.log\n!important.log\n";
+        std::fs::write(&path, rules).unwrap();
+        let second = command(binary, root.path())
+            .args(["ignore", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(second.status.code(), Some(2));
+        assert!(second.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&second.stderr).contains("left unchanged"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rules);
+    }
+}
+
+#[test]
+fn ignore_text_reports_the_created_path() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = tempfile::tempdir().unwrap();
+        let output = command(binary, root.path()).arg("ignore").output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let path = root.path().join(".solascopeignore").canonicalize().unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("Created {}\n", path.display())
+        );
+    }
+}
+
+#[test]
+fn ignore_uses_cwd_environment_root_flag_and_positional_path() {
+    for binary in [SOLASCOPE, SAS] {
+        let root = tempfile::tempdir().unwrap();
+        let environment = root.path().join("environment");
+        let flag = root.path().join("flag");
+        let positional = root.path().join("positional");
+        let configured = root.path().join("configured");
+        for directory in [&environment, &flag, &positional, &configured] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(
+            root.path().join(".solascope.toml"),
+            "[project]\nroot='configured'\n",
+        )
+        .unwrap();
+        for (args, process_root, expected_root) in [
+            (vec!["ignore", "--json"], None, root.path()),
+            (
+                vec!["ignore", "--json"],
+                Some(environment.as_path()),
+                environment.as_path(),
+            ),
+            (
+                vec!["ignore", "--root", flag.to_str().unwrap(), "--json"],
+                Some(environment.as_path()),
+                flag.as_path(),
+            ),
+            (
+                vec![
+                    "--root",
+                    flag.to_str().unwrap(),
+                    "ignore",
+                    positional.to_str().unwrap(),
+                    "--json",
+                ],
+                Some(environment.as_path()),
+                positional.as_path(),
+            ),
+        ] {
+            let mut invocation = command(binary, root.path());
+            if let Some(process_root) = process_root {
+                invocation.env("SOLASCOPE__PROJECT__ROOT", process_root);
+            } else {
+                invocation.env_remove("SOLASCOPE__PROJECT__ROOT");
+            }
+            let value = json_ok(invocation.args(args).output().unwrap());
+            assert_eq!(
+                Path::new(value["ignore_path"].as_str().unwrap()),
+                expected_root
+                    .join(".solascopeignore")
+                    .canonicalize()
+                    .unwrap()
+            );
+        }
+        assert!(!configured.join(".solascopeignore").exists());
+    }
+}
+
+#[test]
+fn created_ignore_rules_apply_to_index_search_symbols_and_context() {
+    let root = fixture();
+    std::fs::create_dir(root.path().join("generated")).unwrap();
+    for (path, source) in [
+        ("generated/hidden.rs", "pub fn blocked_ignore_symbol() {}\n"),
+        ("excluded.rs", "pub fn wildcard_ignore_symbol() {}\n"),
+    ] {
+        std::fs::write(root.path().join(path), source).unwrap();
+    }
+    json_ok(
+        command(SOLASCOPE, root.path())
+            .args(["ignore", "--json"])
+            .output()
+            .unwrap(),
+    );
+    json_ok(
+        command(SAS, root.path())
+            .args(["index", "--json"])
+            .output()
+            .unwrap(),
+    );
+    for name in ["blocked_ignore_symbol", "wildcard_ignore_symbol"] {
+        let response = json_ok(
+            command(SAS, root.path())
+                .args(["symbol", name, "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert!(!response["results"].as_array().unwrap().is_empty());
+    }
+
+    std::fs::write(
+        root.path().join(".solascopeignore"),
+        "generated/\n*.rs\n!fixture.rs\n",
+    )
+    .unwrap();
+    for (path, name) in [
+        ("generated/hidden.rs", "blocked_ignore_symbol"),
+        ("excluded.rs", "wildcard_ignore_symbol"),
+    ] {
+        for args in [
+            vec!["search", name, "--mode", "lexical", "--json"],
+            vec!["symbol", name, "--json"],
+        ] {
+            let response = json_ok(command(SAS, root.path()).args(args).output().unwrap());
+            assert!(response["results"].as_array().unwrap().is_empty());
+        }
+        let context = command(SOLASCOPE, root.path())
+            .args(["context", path, "--json"])
+            .output()
+            .unwrap();
+        assert!(!context.status.success());
+        assert!(context.stdout.is_empty());
+    }
+    let report = json_ok(
+        command(SAS, root.path())
+            .args(["index", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["files_total"], 2);
+    let retained = json_ok(
+        command(SAS, root.path())
+            .args(["symbol", "sparkling_fixture_symbol", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(retained["results"][0]["relative_path"], "fixture.rs");
+}
+
+#[cfg(unix)]
+#[test]
+fn ignore_does_not_overwrite_an_existing_symlink_target() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("rules");
+    std::fs::write(&target, "original rules\n").unwrap();
+    std::os::unix::fs::symlink(&target, root.path().join(".solascopeignore")).unwrap();
+    let output = command(SAS, root.path())
+        .args(["ignore", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "original rules\n");
+    assert!(
+        std::fs::symlink_metadata(root.path().join(".solascopeignore"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

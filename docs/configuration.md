@@ -20,7 +20,7 @@ Unknown fields and unknown `SOLASCOPE__*` variables are rejected to catch typos.
 
 ### Source directory and configuration location
 
-Directory selection is separate from configuration precedence: the positional path (`index [path]` / `watch [path]`) takes precedence over `--root`, then the process environment variable `SOLASCOPE__PROJECT__ROOT`, then the current working directory. By default, `index` recursively scans the current directory and all levels of subdirectories without expanding to a parent Git root. Ignore rules, file-size limits, and privacy filters still apply.
+Directory selection is separate from configuration precedence: the positional path (`ignore [path]` / `index [path]` / `watch [path]`) takes precedence over `--root`, then the process environment variable `SOLASCOPE__PROJECT__ROOT`, then the current working directory. By default, `index` recursively scans the current directory and all levels of subdirectories without expanding to a parent Git root. Ignore rules, file-size limits, and privacy filters still apply.
 
 When no source directory is explicitly selected, a parent configuration can supply settings. A positional path, `--root`, or process environment root limits automatic project configuration loading to that directory; unrelated parent configurations are not inherited. Use `--config` to load settings from another directory.
 
@@ -78,6 +78,34 @@ Each CLI invocation reloads these files. Restart MCP/watch services after changi
 | `max_file_size` | `1048576` | Skip files larger than this number of bytes |
 
 The index contains source snippets and should be stored privately. When a writer first uses an index directory, it creates a `.gitignore` containing `*` without overwriting an existing file. You must still check whether index files are already tracked by Git.
+
+### Ignore files
+
+Create a project ignore file with either executable:
+
+```bash
+solascope ignore
+sas ignore --root /path/to/project
+solascope ignore /path/to/project --json
+```
+
+The command creates `<project-root>/.solascopeignore` with commented examples only; edit it to activate rules. It does not build an index or contact model services. An existing file is left unchanged and returns exit code 2. JSON output contains the created file's absolute `ignore_path`.
+
+Scans and source reads honor `.gitignore` and `.solascopeignore` in each directory, even without a Git repository. Patterns are relative to the directory containing the ignore file. At the same directory level, `.solascopeignore` is applied after `.gitignore`; more nested rules are applied after parent rules.
+
+Use gitignore-style patterns, for example:
+
+```gitignore
+# Exclude a directory and its contents.
+generated/
+# Exclude matching files, except important.log.
+*.log
+!important.log
+```
+
+Blank lines and `#` comments are allowed. Patterns support `*`, `?`, character classes, and `**`; a leading `/` anchors a pattern to the ignore file's directory, a trailing `/` matches directories, and `!` negates an earlier ignore rule. Negation cannot bypass built-in privacy/noise filters, `project.exclude`, `project.include`, the index directory, or sensitive-path restrictions.
+
+Search results and `context` reads follow current ignore rules even before reindexing. Run `index` after editing rules to remove newly ignored files from storage; a running `watch` or `index --watch` process detects ignore-file changes and updates the index automatically.
 
 ### parser
 

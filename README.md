@@ -60,6 +60,15 @@ It does not create a project configuration or bind the user defaults to the curr
 
 A project `.solascope.toml` can supply settings, including one discovered in a parent directory or selected with `--config`. Its location and any `project.root` value in TOML or a sibling `.env` do not select the source directory. `project.index_dir` controls only where index data is stored. Search, status, and watch use the same directory selection rules.
 
+Create an optional project ignore file:
+
+```bash
+solascope ignore
+# Equivalent: sas ignore
+```
+
+This creates `.solascopeignore` in the project root with commented gitignore-style examples, without overwriting an existing file. Use `ignore /path/to/project` or `ignore --root /path/to/project` to select another root. Edit the file to exclude files or directories; see the [ignore-file reference](docs/configuration.md#ignore-files) for syntax and privacy restrictions.
+
 Keep the index up to date while editing:
 
 ```bash
@@ -73,6 +82,7 @@ Results identify a relative path, a 1-based line range, a symbol when available,
 | Command | Purpose |
 | --- | --- |
 | `init [--probe]` | Create user defaults; optionally probe the configured models |
+| `ignore [path]` | Create `.solascopeignore` in the project root without overwriting existing rules |
 | `index [path] [--rebuild] [--probe]` | Recursively index the current directory or an explicit path; rebuild all chunks when requested |
 | `index [path] --watch` | Index once, then watch for changes; `--no-watch` overrides `index.watch` |
 | `search <query>` | Search code with optional embeddings and reranking |

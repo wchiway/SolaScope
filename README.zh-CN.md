@@ -60,6 +60,15 @@ sas status
 
 项目 `.solascope.toml` 用于提供设置，也可以从上级目录发现或用 `--config` 指定。配置文件所在位置及 TOML / 同目录 `.env` 中的 `project.root` 都不改变扫描目录。`project.index_dir` 只指定索引数据保存位置。搜索、状态和监听使用相同的目录选择规则。
 
+创建可选的项目忽略文件：
+
+```bash
+solascope ignore
+# 等价命令：sas ignore
+```
+
+命令在项目根目录创建 `.solascopeignore`，内容为注释形式的 gitignore 风格示例，不覆盖已有文件。使用 `ignore /path/to/project` 或 `ignore --root /path/to/project` 可以指定其他项目根目录。编辑该文件来忽略文件或文件夹；语法和隐私限制见[忽略文件说明](docs/configuration.md#ignore-files)。
+
 开发时持续更新索引：
 
 ```bash
@@ -73,6 +82,7 @@ solascope index --watch
 | 命令 | 用途 |
 | --- | --- |
 | `init [--probe]` | 创建用户配置；可选探测已配置的模型 |
+| `ignore [path]` | 在项目根目录创建 `.solascopeignore`，不覆盖已有规则 |
 | `index [path] [--rebuild] [--probe]` | 递归索引当前目录或显式路径；可选全量重建 |
 | `index [path] --watch` | 首次索引后持续监听；`--no-watch` 覆盖 `index.watch` |
 | `search <query>` | 搜索代码，可使用向量和重排 |

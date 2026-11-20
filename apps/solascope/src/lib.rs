@@ -4,7 +4,11 @@ mod cli;
 mod logging;
 mod mcp;
 
-use std::io::{self, Write};
+use std::{
+    fs::OpenOptions,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use serde::Serialize;
@@ -59,7 +63,47 @@ fn configuration(cli: &Cli) -> Result<Config> {
     Config::load(root, cli.config.as_deref())
 }
 
+fn write_default_ignore(root: &Path) -> Result<PathBuf> {
+    let path = root.join(".solascopeignore");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Error::Config(format!(
+                    "{} already exists and was left unchanged",
+                    path.display()
+                ))
+            } else {
+                Error::Io(error)
+            }
+        })?;
+    file.write_all(
+        concat!(
+            "# SolaScope ignore rules (gitignore syntax).\n",
+            "# Patterns are relative to this project root.\n",
+            "# Uncomment and customize the examples below:\n",
+            "# generated/\n",
+            "# *.log\n",
+            "# !important.log\n",
+        )
+        .as_bytes(),
+    )?;
+    Ok(path)
+}
+
 async fn execute(cli: Cli, config: Config) -> Result<()> {
+    if let Command::Ignore { .. } = &cli.command {
+        let path = write_default_ignore(&config.project.root)?;
+        if cli.json {
+            emit(&json!({"ignore_path": path}), true)?;
+        } else {
+            writeln!(io::stdout().lock(), "Created {}", path.display())?;
+        }
+        return Ok(());
+    }
+
     if let Command::Init { probe, .. } = &cli.command {
         let destination = solascope_config::user_config_path()?;
         let directory = destination
@@ -123,7 +167,9 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
         rerank: !cli.no_rerank,
     };
     match cli.command {
-        Command::Init { .. } => unreachable!("init handled above"),
+        Command::Init { .. } | Command::Ignore { .. } => {
+            unreachable!("file creation commands handled above")
+        }
         Command::Index {
             rebuild,
             watch,
