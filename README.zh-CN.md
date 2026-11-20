@@ -12,7 +12,7 @@ SolaScope 无需模型即可运行。默认使用 SQLite FTS5 和符号检索，
 - **独立模型配置**：Embedding 与重排分别选择服务，支持 Ollama、OpenAI 兼容接口、百炼 DashScope、硅基流动，以及可选的本地 ONNX 重排。
 - **共用检索引擎**：CLI、MCP 和评测工具使用同一套索引与检索实现。
 
-当前版本：**0.1.0**。已验证范围见[支持与限制](docs/implementation-status.md)。详细文档使用英文。
+当前版本：**0.1.1**。已验证范围见[支持与限制](docs/implementation-status.md)。详细文档使用英文。
 
 ## 架构概览
 

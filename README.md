@@ -12,7 +12,7 @@ SolaScope works without a model. SQLite FTS5 and symbol lookup provide the defau
 - **Independent model providers.** Choose embedding and reranking services separately, including Ollama, OpenAI-compatible APIs, DashScope, SiliconFlow, and optional local ONNX reranking.
 - **One search engine.** The CLI, MCP server, and benchmark tools share the same indexing and retrieval implementation.
 
-Current version: **0.1.0**. See [support and limitations](docs/implementation-status.md) for the tested scope.
+Current version: **0.1.1**. See [support and limitations](docs/implementation-status.md) for the tested scope.
 
 ## Architecture at a glance
 

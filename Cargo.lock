@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "serde",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cap-std",
  "clap",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cap-std",
  "dirs",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hex",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rayon",
  "serde_json",
@@ -2598,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-models"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2619,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-parser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "solascope-core",
  "tree-sitter",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-scanner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cap-std",
  "globset",
@@ -2646,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "solascope-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fs2",
  "globset",
