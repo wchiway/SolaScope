@@ -136,11 +136,11 @@ solascope index --rebuild
 
 ## MCP 接入
 
-先建立索引，再启动服务：
+在项目目录内建立索引并启动服务：
 
 ```bash
-solascope index --root /absolute/path/to/project
-solascope mcp --root /absolute/path/to/project
+solascope index
+solascope mcp
 ```
 
 客户端配置示例：
@@ -150,13 +150,13 @@ solascope mcp --root /absolute/path/to/project
   "mcpServers": {
     "solascope": {
       "command": "solascope",
-      "args": ["mcp", "--root", "/absolute/path/to/project"]
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-服务提供 `search_code`、`find_symbol`、`get_code_context` 和 `index_status`，并声明只读属性和输出 schema。每个实例固定服务一个项目，无需重启即可读取独立 `index` 或 `watch` 进程发布的索引更新。上下文工具直接读取当前源码，无需预先建立索引。工具参数、返回结构和客户端接入见 [MCP 文档](docs/mcp.md)。
+服务提供 `search_code`、`find_symbol`、`get_code_context` 和 `index_status`，并声明只读属性和输出 schema。启动时无需配置路径：工具默认使用服务进程的当前目录，agent 也可以在每次调用时通过可选 `root` 选择其他项目。索引默认位于各项目的 `.solascope/` 目录，无需重启即可读取独立 `index` 或 `watch` 进程发布的索引更新。上下文工具直接读取当前源码，无需预先建立索引。工具参数、返回结构和客户端接入见 [MCP 文档](docs/mcp.md)。
 
 ## 隐私
 

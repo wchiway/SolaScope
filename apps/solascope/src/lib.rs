@@ -158,11 +158,8 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
 
     let engine = Engine::new(config)?;
     let defaults = mcp::Defaults {
-        limit: cli.limit.unwrap_or(engine.config().search.limit),
-        mode: cli
-            .mode
-            .map(Into::into)
-            .unwrap_or(engine.config().search.mode),
+        limit: cli.limit,
+        mode: cli.mode.map(Into::into),
         path_filter: cli.path_filter,
         rerank: !cli.no_rerank,
     };
@@ -204,8 +201,8 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
         Command::Search { query } => {
             let request = SearchRequest {
                 query,
-                mode: defaults.mode,
-                limit: defaults.limit,
+                mode: defaults.mode.unwrap_or(engine.config().search.mode),
+                limit: defaults.limit.unwrap_or(engine.config().search.limit),
                 path_filter: defaults.path_filter,
                 rerank: defaults.rerank,
             };
@@ -218,7 +215,7 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
                 name,
                 kind,
                 path_filter: defaults.path_filter,
-                limit: defaults.limit,
+                limit: defaults.limit.unwrap_or(engine.config().search.limit),
             };
             request.validate()?;
             emit_search(&engine.find_symbol(request)?, cli.json)
@@ -276,7 +273,7 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
                 if probe {
                     startup_probe(&engine, &cancel).await?;
                 }
-                mcp::serve(engine, defaults, cancel).await
+                mcp::serve(engine, defaults, cli.config, cancel).await
             }
             .await;
             signal.abort();

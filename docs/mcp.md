@@ -2,15 +2,19 @@
 
 SolaScope provides a stdio MCP server that shares the CLI's search engine and index.
 
+Run these commands in the project directory:
+
 ```bash
-solascope index --root /abs/path/to/project
-solascope mcp --root /abs/path/to/project
+solascope index
+solascope mcp
 ```
 
-- Each server instance has one fixed project root. Tool arguments cannot change it.
+- No startup root or index path is required. The default project is the server's current working directory. An optional startup `--root` or process `SOLASCOPE__PROJECT__ROOT` changes that default.
+- All four tools accept an optional `root` project directory, so an agent can select a project on each call. Absolute paths are accepted; relative roots resolve from the server's working directory. Omitting `root` or passing `null` uses the startup default, even after calls to another project.
+- A selected project's index defaults to `<root>/.solascope/`. `root` selects the source project, not a database file; `project.index_dir` can still override storage through normal configuration.
 - The server is read-only: it does not create, update, or migrate an index. Run `index` first, or keep a separate `watch` / `index --watch` process running.
 - Stdout carries protocol messages only. Diagnostics go to stderr and, by default, `logs/solascope.log` beside the active configuration. `log.persist = false` disables the automatic copy; an explicit `log.output` can redirect traces to a protected file within the project.
-- Configuration supplies the default result limit, retrieval mode, path filter, and reranking setting. Startup flags `--limit`, `--mode`, `--path`, and `--no-rerank` can override them.
+- Each selected project loads its own configuration and sibling `.env`, including custom index storage, parser, privacy, models, and search defaults. Startup `--config` remains an explicit settings override for every project. Tool arguments override startup `--limit`, `--mode`, `--path`, and `--no-rerank`, which override project defaults.
 - Search, symbol lookup, and status require an existing index. Missing indexes and outdated schemas or chunking rules produce errors with instructions to run `index` separately. Context reads current source and works without an index.
 - Each search or symbol call reads the latest committed index generation. A separate indexing process can publish updates while the MCP server stays running. Current ignore and sensitive-path checks apply on every call.
 
@@ -23,7 +27,7 @@ Clients that use an `mcpServers` configuration can launch the server as follows:
   "mcpServers": {
     "solascope": {
       "command": "solascope",
-      "args": ["mcp", "--root", "/abs/path/to/project"]
+      "args": ["mcp"]
     }
   }
 }
@@ -32,10 +36,20 @@ Clients that use an `mcpServers` configuration can launch the server as follows:
 For Claude Code:
 
 ```bash
-claude mcp add solascope -- solascope mcp --root /abs/path/to/project
+claude mcp add solascope -- solascope mcp
 ```
 
-If `solascope` is not on `PATH`, set `command` to the binary's absolute path. `sas` is an equivalent entry point.
+If `solascope` is not on `PATH`, set `command` to the binary's absolute path. `sas` is an equivalent entry point. The current directory is the server process's working directory chosen by the client; an agent working elsewhere should pass that project's absolute `root`.
+
+For example, tool arguments for searching another project can be:
+
+```json
+{ "root": "/abs/path/to/project", "query": "where are transactions committed", "mode": "lexical", "rerank": false }
+```
+
+Calling `index_status` with `{}` inspects the default project; `{ "root": "/abs/path/to/project" }` reports another project's resolved root and index directory. No tool changes the process working directory or the default for subsequent calls.
+
+The server retains engines for up to eight additional projects to reuse model adapters and query caches. Project settings and `.env` are loaded on first access and again if an evicted project is revisited. Restart after configuration edits for consistent refresh; index generations and ignore files are checked on each call.
 
 Remote-model keys can be stored in a `.env` beside the user configuration: `~/.solascope/.env` on Linux/macOS or `$USERPROFILE/.solascope/.env` on Windows. Client-provided `env` values become process variables and take precedence. `--config FILE` also loads a `.env` beside FILE. Restart the server after editing the file. Keep keys out of arguments, URLs, and TOML values.
 
@@ -46,16 +60,24 @@ End-to-end protocol tests use a raw JSON-RPC client and an rmcp SDK client. The 
 ### Optional startup probe
 
 ```bash
-solascope mcp --root /abs/path/to/project --probe
+solascope mcp --probe
 ```
 
-`--probe` tests configured models with fixed sentences, without reading source code for probe input. Requests may incur model charges, and local models require their runtime to be available. A failed probe prevents normal startup. Reports go only to stderr. Without the flag, startup does not issue an inference probe.
+`--probe` tests the startup default project's configured models with fixed sentences, without reading source code for probe input. Requests may incur model charges, and local models require their runtime to be available. A failed probe prevents normal startup. Reports go only to stderr. Without the flag, startup does not issue an inference probe.
 
 ## Tools
 
 `tools/list` includes parameter descriptions, a typed `outputSchema` for successful structured results, and `readOnlyHint: true` / `destructiveHint: false` annotations for all four tools. `search_code` has `openWorldHint: true` because configured models may use a remote service; the other tools have `openWorldHint: false`. Read-only means tools do not modify source or index data; configured diagnostics can still write logs.
 
 Use `search_code` to locate code from a question, keyword, or error; `find_symbol` for definitions and spelling correction; `get_code_context` to inspect current source; and `index_status` to inspect index counts and generation. Inspect warnings and `stale` before relying on indexed locations.
+
+All tools accept the same optional project selector:
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `root` | string | Existing project directory; omitted/null uses the startup default. Relative to the server's working directory; default index is `<root>/.solascope/` |
+
+Source paths and `path_filter` are relative to the selected project. `root` may select another directory, while source reads still enforce that project's confinement, ignore rules, and sensitive-path exclusions.
 
 ### search_code
 
@@ -94,7 +116,7 @@ Returns `relative_path`, `start_line`, `end_line`, and `lines` (an array of `{ "
 
 ### index_status
 
-Takes no parameters; pass `{}`. Returns the project ID, fixed root and index directory, index generation, file/chunk/vector counts, cache entries, `relocated_vectors`, embedding fingerprint, latest update time, and unfinished-job count.
+Pass `{}` for the default project or `{ "root": "/abs/path/to/project" }` to select another. Returns the project ID, resolved root and index directory, index generation, file/chunk/vector counts, cache entries, `relocated_vectors`, embedding fingerprint, latest update time, and unfinished-job count.
 
 `relocated_vectors` counts vectors reused after moving or renaming files. An explicit `index --rebuild` recomputes these approximate entries using the current complete input. This tool checks schema and chunking compatibility, but does not probe models, check embedding fingerprint compatibility against the current configuration, or update the index.
 
@@ -163,4 +185,4 @@ Application errors return a tool result with `isError: true`; a failed query doe
 
 Invalid parameter types and unknown fields also return `isError: true`, with an explanation in textual `content`. API keys and full remote error bodies are excluded from tool errors.
 
-Use the CLI's `index`, `watch`, and `doctor` commands for maintenance and diagnostics. MCP serves a fixed project through the four tools above. See [support and limitations](implementation-status.md) for the tested scope.
+Use the CLI's `index`, `watch`, and `doctor` commands for maintenance and diagnostics. MCP selects projects per call through the four tools above. See [support and limitations](implementation-status.md) for the tested scope.

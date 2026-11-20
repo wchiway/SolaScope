@@ -35,6 +35,8 @@ fn command(root: &Path) -> Command {
 
 async fn fixture(index: bool) -> TempDir {
     let directory = tempfile::tempdir().unwrap();
+    // Stop configuration discovery before unrelated settings in the temp parent.
+    std::fs::create_dir(directory.path().join(".git")).unwrap();
     std::fs::write(
         directory.path().join("fixture.rs"),
         "pub fn mcp_fixture_symbol() -> usize {\n    7\n}\n",
@@ -71,7 +73,8 @@ impl NativeClient {
 
     async fn start_with_args(root: &Path, args: &[&str]) -> Self {
         let mut child = command(root)
-            .args(["mcp", "--root", root.to_str().unwrap()])
+            .arg("mcp")
+            .env_remove("SOLASCOPE__PROJECT__ROOT")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -188,6 +191,16 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
             "{tool}"
         );
         assert_eq!(tool["outputSchema"]["type"], "object", "{tool}");
+        assert!(
+            tool["inputSchema"]["properties"].get("root").is_some(),
+            "{tool}"
+        );
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("root"))),
+            "{tool}"
+        );
         for (name, property) in tool["inputSchema"]["properties"]
             .as_object()
             .into_iter()
@@ -211,7 +224,11 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
         .as_array()
         .unwrap()
         .contains(&json!("query")));
-    assert!(schema["properties"].get("root").is_none());
+    assert!(schema["properties"].get("root").is_some());
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("root")));
     let result = client.call("search_code", json!({ "query": "mcp_fixture_symbol", "mode": "lexical", "limit": 1, "rerank": false })).await;
     assert_eq!(result["result"]["isError"], false, "{result}");
     let structured = &result["result"]["structuredContent"];
@@ -275,7 +292,7 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
     for arguments in [
         json!({ "query": 42 }),
         json!({ "query": "x", "mode": "unknown" }),
-        json!({ "query": "x", "root": "/tmp" }),
+        json!({ "query": "x", "index_dir": "/tmp" }),
     ] {
         let result = client.call("search_code", arguments).await;
         // rmcp reports schema/deserialization failures as standard tool errors.
@@ -286,6 +303,364 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
         .call("search_code", json!({ "query": "x", "mode": "semantic" }))
         .await;
     assert_eq!(model_error["result"]["isError"], true, "{model_error}");
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn tool_roots_select_projects_without_changing_the_default_directory() {
+    let first = fixture(true).await;
+    let second = fixture(false).await;
+    std::fs::write(
+        second.path().join("fixture.rs"),
+        "pub fn mcp_fixture_symbol() -> usize { 42 }\n",
+    )
+    .unwrap();
+    let indexed = command(second.path())
+        .args(["index", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let mut client = NativeClient::start(first.path()).await;
+    for (root, project, source) in [
+        (Value::Null, first.path(), "7"),
+        (json!(second.path()), second.path(), "42"),
+        (json!("."), first.path(), "7"),
+        (json!(second.path()), second.path(), "42"),
+        (Value::Null, first.path(), "7"),
+    ] {
+        let status = client.call("index_status", json!({"root": root})).await;
+        assert_eq!(status["result"]["isError"], false, "{status}");
+        let resolved = std::fs::canonicalize(project).unwrap();
+        let status = &status["result"]["structuredContent"];
+        assert_eq!(status["root"], json!(resolved));
+        assert_eq!(status["index_dir"], json!(resolved.join(".solascope")));
+        for (tool, key) in [("search_code", "query"), ("find_symbol", "name")] {
+            let mut arguments = json!({"root": root, key: "mcp_fixture_symbol"});
+            if tool == "search_code" {
+                arguments["mode"] = json!("lexical");
+            }
+            let result = client.call(tool, arguments).await;
+            assert_eq!(result["result"]["isError"], false, "{result}");
+            let hit = &result["result"]["structuredContent"]["results"][0];
+            assert_eq!(hit["project_id"], status["project_id"]);
+            assert!(
+                hit["snippet"].as_str().unwrap().contains(source),
+                "{result}"
+            );
+        }
+        let context = client
+            .call(
+                "get_code_context",
+                json!({"root": root, "path": "fixture.rs", "line": 1}),
+            )
+            .await;
+        assert_eq!(context["result"]["isError"], false, "{context}");
+        assert!(
+            context["result"]["structuredContent"]["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line["text"].as_str().unwrap().contains(source)),
+            "{context}"
+        );
+    }
+    let default = client.call("index_status", json!({})).await;
+    assert_eq!(
+        default["result"]["structuredContent"]["root"],
+        json!(std::fs::canonicalize(first.path()).unwrap())
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn project_configuration_controls_index_location_search_defaults_and_privacy() {
+    let first = fixture(true).await;
+    let second = fixture(false).await;
+    std::fs::write(second.path().join(".solascope.toml"), "[project]\nindex_dir='custom-index'\nexclude=['private.rs']\n[search]\nmode='lexical'\nlimit=1\n[parser]\nmax_chunk_tokens=256\n").unwrap();
+    std::fs::write(
+        second.path().join("fixture.rs"),
+        "pub fn mcp_fixture_symbol() {}\npub fn mcp_fixture_symbol_extra() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        second.path().join("private.rs"),
+        "pub fn mcp_private_symbol() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        first.path().join("private.rs"),
+        "pub fn mcp_visible_symbol() {}\n",
+    )
+    .unwrap();
+    let indexed = command(second.path())
+        .args(["index", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let mut client = NativeClient::start(first.path()).await;
+    let status = client
+        .call("index_status", json!({"root": second.path()}))
+        .await;
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    assert_eq!(
+        status["result"]["structuredContent"]["index_dir"],
+        json!(std::fs::canonicalize(second.path())
+            .unwrap()
+            .join("custom-index"))
+    );
+    assert!(!second.path().join(".solascope/index.sqlite3").exists());
+    for (tool, key) in [("search_code", "query"), ("find_symbol", "name")] {
+        let result = client
+            .call(
+                tool,
+                json!({"root": second.path(), key: "mcp_fixture_symbol"}),
+            )
+            .await;
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(result["result"]["structuredContent"]["mode"], "lexical");
+        assert_eq!(
+            result["result"]["structuredContent"]["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let denied = client
+        .call(
+            "get_code_context",
+            json!({"root": second.path(), "path": "private.rs", "line": 1}),
+        )
+        .await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    let visible = client
+        .call("get_code_context", json!({"path": "private.rs", "line": 1}))
+        .await;
+    assert_eq!(visible["result"]["isError"], false, "{visible}");
+    let overridden = client.call("search_code", json!({"root": second.path(), "query": "mcp_fixture_symbol", "limit": 10, "mode": "hybrid", "rerank": false})).await;
+    assert_eq!(overridden["result"]["isError"], false, "{overridden}");
+    assert_eq!(overridden["result"]["structuredContent"]["mode"], "hybrid");
+    assert_eq!(
+        overridden["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    client.close().await;
+
+    let mut client = NativeClient::start_with_args(
+        first.path(),
+        &["--limit", "10", "--mode", "hybrid", "--no-rerank"],
+    )
+    .await;
+    let result = client
+        .call(
+            "search_code",
+            json!({"root": second.path(), "query": "mcp_fixture_symbol"}),
+        )
+        .await;
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(result["result"]["structuredContent"]["mode"], "hybrid");
+    assert_eq!(
+        result["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn startup_root_is_optional_and_relative_tool_roots_use_the_working_directory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let project = workspace.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join("fixture.rs"),
+        "pub fn mcp_fixture_symbol() {}\n",
+    )
+    .unwrap();
+    let indexed = command(&project)
+        .args(["index", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(indexed.status.success(), "{indexed:?}");
+    let mut client = NativeClient::start_with_args(workspace.path(), &["--root", "project"]).await;
+    for arguments in [json!({}), json!({"root": "project"})] {
+        let status = client.call("index_status", arguments).await;
+        assert_eq!(status["result"]["isError"], false, "{status}");
+        assert_eq!(
+            status["result"]["structuredContent"]["root"],
+            json!(std::fs::canonicalize(&project).unwrap())
+        );
+    }
+    let absent = client.call("index_status", json!({"root": "."})).await;
+    assert_eq!(
+        absent["result"]["structuredContent"]["error"]["exit_code"], 3,
+        "{absent}"
+    );
+    assert!(!workspace.path().join(".solascope/index.sqlite3").exists());
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn selected_projects_keep_their_own_dotenv_credentials() {
+    let first = fixture(true).await;
+    let second = fixture(true).await;
+    let server = MockServer::start().await;
+    for (project, key) in [
+        (first.path(), "first-project-key"),
+        (second.path(), "second-project-key"),
+    ] {
+        std::fs::write(project.join(".solascope.toml"), format!(
+            "[privacy]\nremote_opt_in=true\n[search]\nmode='lexical'\n[rerank]\nprovider='siliconflow'\nmodel='test-reranker'\nendpoint='{}'\napi_key_env='SOLASCOPE_MCP_PROJECT_KEY'\nfail_open=false\n",
+            server.uri()
+        )).unwrap();
+        std::fs::write(
+            project.join(".env"),
+            format!("SOLASCOPE_MCP_PROJECT_KEY={key}\n"),
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {key}"),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"results": [{"index": 0, "relevance_score": 0.9}]})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+    }
+    let mut client = NativeClient::start(first.path()).await;
+    for root in [
+        json!(second.path()),
+        Value::Null,
+        json!(second.path()),
+        Value::Null,
+    ] {
+        let result = client
+            .call(
+                "search_code",
+                json!({"root": root, "query": "mcp_fixture_symbol"}),
+            )
+            .await;
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        let text = result.to_string();
+        assert!(!text.contains("first-project-key") && !text.contains("second-project-key"));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn explicit_configuration_is_preserved_when_selecting_a_different_project() {
+    let first = fixture(true).await;
+    let second = fixture(true).await;
+    // An explicit configuration must bypass the selected project's local file.
+    std::fs::write(
+        second.path().join(".solascope.toml"),
+        "[unknown_section]\nvalue=true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        first.path().join("shared.toml"),
+        "[search]\nmode='lexical'\n[project]\nexclude=['fixture.rs']\n",
+    )
+    .unwrap();
+    let mut client =
+        NativeClient::start_with_args(first.path(), &["--config", "shared.toml"]).await;
+    let status = client
+        .call("index_status", json!({"root": second.path()}))
+        .await;
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    assert_eq!(
+        status["result"]["structuredContent"]["index_dir"],
+        json!(std::fs::canonicalize(second.path())
+            .unwrap()
+            .join(".solascope"))
+    );
+    let result = client
+        .call(
+            "search_code",
+            json!({"root": second.path(), "query": "mcp_fixture_symbol"}),
+        )
+        .await;
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(result["result"]["structuredContent"]["mode"], "lexical");
+    assert!(result["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn invalid_roots_and_unindexed_projects_do_not_stop_the_session_or_build_indexes() {
+    let indexed = fixture(true).await;
+    let unindexed = fixture(false).await;
+    let mut client = NativeClient::start(indexed.path()).await;
+    for root in [
+        json!(""),
+        json!("  "),
+        json!("bad\u{0000}root"),
+        json!("x".repeat(4097)),
+        json!("missing-directory"),
+        json!("fixture.rs"),
+    ] {
+        let result = client.call("index_status", json!({"root": root})).await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        assert_eq!(
+            result["result"]["structuredContent"]["error"]["exit_code"], 2,
+            "{result}"
+        );
+    }
+    for (tool, arguments) in [
+        ("index_status", json!({"root": unindexed.path()})),
+        (
+            "search_code",
+            json!({"root": unindexed.path(), "query": "mcp_fixture_symbol", "mode": "lexical"}),
+        ),
+        (
+            "find_symbol",
+            json!({"root": unindexed.path(), "name": "mcp_fixture_symbol"}),
+        ),
+    ] {
+        let result = client.call(tool, arguments).await;
+        assert_eq!(
+            result["result"]["structuredContent"]["error"]["exit_code"], 3,
+            "{result}"
+        );
+    }
+    let context = client
+        .call(
+            "get_code_context",
+            json!({"root": unindexed.path(), "path": "fixture.rs", "line": 1}),
+        )
+        .await;
+    assert_eq!(context["result"]["isError"], false, "{context}");
+    for path in ["../outside.rs", "/etc/passwd", "C:\\outside.rs", ".env"] {
+        let result = client
+            .call(
+                "get_code_context",
+                json!({"root": unindexed.path(), "path": path, "line": 1}),
+            )
+            .await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+    }
+    assert!(!unindexed.path().join(".solascope").exists());
     let status = client.call("index_status", json!({})).await;
     assert_eq!(status["result"]["isError"], false, "{status}");
     client.close().await;

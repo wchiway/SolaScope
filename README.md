@@ -136,11 +136,11 @@ Changing the reranker or rotating an API key does not require a rebuild. Parser 
 
 ## MCP integration
 
-Build an index before starting the server:
+From the project directory, build an index and start the server:
 
 ```bash
-solascope index --root /absolute/path/to/project
-solascope mcp --root /absolute/path/to/project
+solascope index
+solascope mcp
 ```
 
 A client configuration can use:
@@ -150,13 +150,13 @@ A client configuration can use:
   "mcpServers": {
     "solascope": {
       "command": "solascope",
-      "args": ["mcp", "--root", "/absolute/path/to/project"]
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-The server exposes `search_code`, `find_symbol`, `get_code_context`, and `index_status`, with read-only annotations and typed output schemas. Each instance serves one fixed project root and reads index updates from a separate `index` or `watch` process without restarting. Context reads current source even without an index. See [MCP integration](docs/mcp.md) for tool parameters, responses, and client setup.
+The server exposes `search_code`, `find_symbol`, `get_code_context`, and `index_status`, with read-only annotations and typed output schemas. No startup path is required: tools default to the server's working directory and accept an optional `root` so agents can select another project per call. Each project's index defaults to its `.solascope/` directory. The server reads updates from a separate `index` or `watch` process without restarting. Context reads current source even without an index. See [MCP integration](docs/mcp.md) for tool parameters, responses, and client setup.
 
 ## Privacy
 
