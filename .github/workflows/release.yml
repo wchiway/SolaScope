@@ -205,4 +205,4 @@ jobs:
           fi
           gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
               -F draft=false -f make_latest="$latest" >/dev/null
-          printf 'Published %s with three platform archives and Windows installers.\n' "$RELEASE_TAG"
+          printf 'Published %s with three platform archives and Unix/Windows installers.\n' "$RELEASE_TAG"

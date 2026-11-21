@@ -33,11 +33,11 @@ These are maintainer operations, not performed by the installer or local validat
 4. Watch the **Release** workflow. It performs the following:
    - Checks the tag is `v<SemVer>`, resolves annotated tags to their commit, matches the triggering checkout, and confirms the commit belongs to `origin/main` history.
    - Runs the reusable **Test and package** workflow on the tag's exact commit: three-platform validation, optional Linux local-reranker tests, and three platform builds.
-   - Downloads only the packages produced in this same run, verifies archive contents and hashes, and exports standalone Windows installers from the validated Windows ZIP.
+   - Downloads only the packages produced in this same run, verifies archive contents and hashes, and exports standalone installers from the validated archives. The Linux and macOS copies of `install.sh` must be byte-identical.
    - Builds an author-free bounded changelog; optionally sends it to DeepSeek for a labeled summary, then appends the factual commit list and distribution information.
    - Rechecks the remote tag immediately before release creation, rejects an existing release, creates a temporary draft, uploads every asset, verifies asset names/sizes/SHA-256 digests, and publishes only after all uploads succeed.
 
-There are six assets: three platform archives, `install.ps1`, `install.cmd`, and `SHA256SUMS`. The checksum file covers the other five assets. Upload verification fails closed if GitHub reports a missing/mismatched asset digest, an unexpected filename, an incorrect size, or an incomplete upload; the release remains a draft for inspection rather than being published. Windows x64 release builds use static CRT linkage and inspect ordinary and delay-loaded PE imports for non-system dependencies. The installer resources are also inside the Windows ZIP; public installation/release guides are packaged on all platforms.
+There are seven assets: three platform archives, `install.sh`, `install.ps1`, `install.cmd`, and `SHA256SUMS`. The checksum file covers the other six assets. Upload verification fails closed if GitHub reports a missing/mismatched asset digest, an unexpected filename, an incorrect size, or an incomplete upload; the release remains a draft for inspection rather than being published. Windows x64 release builds use static CRT linkage and inspect ordinary and delay-loaded PE imports for non-system dependencies. The Windows installer resources are also inside the Windows ZIP, and `install.sh` is inside each Unix archive; public installation/release guides are packaged on all platforms.
 
 SemVer prerelease versions, such as `v0.2.0-rc.1`, publish as prereleases and are not selected by the installer’s stable/latest lookup. Stable releases use GitHub's legacy date/version selection for latest, rather than forcibly marking an older maintenance release as latest.
 
@@ -73,4 +73,13 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
     -File .github/scripts/test_windows_install.ps1
 ```
 
-The packaging workflow also passes its real Windows ZIP and checksum to the same runner for repeated offline-install smoke checks. Tests isolate filesystem/configuration/environment state and do not write the real User PATH or call GitHub/DeepSeek. Python tests cover Responses parsing/fallback/errors, version-tag validation, author-free facts, ordinary/delay PE imports, and archive/installer checksum collection. See [support and limitations](implementation-status.md) for what has actually been executed versus only configured in CI.
+On Linux/macOS, check the script and optionally test an existing native package:
+
+```sh
+sh -n install.sh
+shellcheck install.sh
+shfmt -i 4 -d install.sh
+python -I -B .github/scripts/test_unix_install.py --real-archive /path/to/solascope-VERSION-TARGET.tar.gz /path/to/SHA256SUMS
+```
+
+ShellCheck and shfmt are developer checks, not installation prerequisites. The packaging workflow passes its real native archive and checksum to the Unix or Windows installer test runner for repeated offline-install smoke checks. Tests isolate filesystem/configuration/environment state and do not write the real User PATH or call GitHub/DeepSeek. Unix fixtures cover archive rejection, download fallback, architecture selection, upgrades/rollback, version-output checks/timeouts, and timer cleanup. Python tests also cover Responses parsing/fallback/errors, version-tag validation, author-free facts, ordinary/delay PE imports, identical Unix installer resources, and archive/installer checksum collection. See [support and limitations](implementation-status.md) for what has actually been executed versus only configured in CI.

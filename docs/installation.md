@@ -85,7 +85,45 @@ After verifying a ZIP's checksum, manually extract it to a new folder and run `s
 
 ## Linux and macOS
 
-Published archives contain both executables, the license, and public documentation. Verify the archive against the same release's `SHA256SUMS`, extract it, and place both executables in a directory on PATH. Linux packages currently target x86_64 GNU; macOS packages use the build runner's native architecture. Check the asset's target triple before downloading.
+The portable `install.sh` follows the user-local installation interface of [zoxide's installer](https://github.com/ajeetdsouza/zoxide/blob/2f4bcebaa62a44742280172c9b4c2753266716d0/install.sh). It installs both `solascope` and `sas` into `~/.local/bin` without Rust/Cargo, Git, Node.js, Python, jq, a package manager, or sudo. It uses `/bin/sh`, standard Unix utilities including tar/gzip, and `sha256sum` (Linux) or `shasum` (macOS). Online installation additionally needs curl or wget with HTTPS support.
+
+Download `install.sh` from a [published release](https://github.com/wchiway/SolaScope/releases) into a new directory, inspect it, and run:
+
+```sh
+sh ./install.sh
+# Select a published version and/or binary directory:
+sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
+```
+
+Replace the example version with an available release. Both `--option value` and `--option=value` syntax are supported. The default resolves latest stable once through `SHA256SUMS`, then freezes the archive name, version, and expected digest before downloading the versioned archive. No GitHub JSON parser or API token is needed. Explicit versions can select a published prerelease. Release checksums also cover the standalone `install.sh`; same-source checksums establish integrity, not independent publisher identity.
+
+The script detects Linux x86_64 with 64-bit glibc, macOS Intel, and macOS Apple Silicon. Under Rosetta it prefers the native Apple Silicon target. Only architectures actually included in that release's checksums can install: current Linux packages are x86_64 GNU and the macOS package follows the runner's native architecture. Both macOS architectures are not necessarily published. Missing assets, musl/Alpine, 32-bit Linux, Linux ARM, and unsupported systems produce explicit errors. GNU packages still require a compatible system glibc; staging/version checks do not establish support for every Linux distribution.
+
+Use `--arch TARGET` to explicitly select a supported release target when detection needs overriding. It does not create missing assets, provide emulation, or bypass executable compatibility checks. The script never compiles source or installs missing system tools.
+
+### Unix offline installation
+
+Obtain the installer, a correctly named `.tar.gz`, and its matching checksum file in advance:
+
+```sh
+sh ./install.sh \
+    --archive ./solascope-0.1.1-x86_64-unknown-linux-gnu.tar.gz \
+    --checksum ./SHA256SUMS
+```
+
+Use the appropriate version/target filename. Alternatively supply `--sha256 HASH` with `--archive`; when both checksum sources are supplied, they must agree. Offline mode never calls a downloader. Archives are copied into a fresh temporary directory, hashed, and checked for exact public names, duplicates, and non-regular entries before extracting only the two binary names to stdout. Each extracted binary is bounded by a file-size limit and must report the expected version within 30 seconds. Tar payloads are never broadly unpacked into the destination, and the bundled `install.sh` is never executed.
+
+### Unix upgrades and PATH
+
+Rerun the installer to upgrade/reinstall. A per-directory lock serializes updates; staged replacements preserve unrelated files. If either binary replacement fails, the installer attempts to restore both old files and reports a backup location if recovery fails. The two flat binary paths are replaced sequentially, so the pair is not a single atomic filesystem update. Symlink destinations and symlink path components are rejected. Existing manually installed regular binaries with those two names may be replaced; other names are preserved.
+
+Shell profiles, user configuration, project indexes, and model settings are untouched. If the destination is absent from PATH, the installer prints a reminder. For POSIX shells, add the directory to your own shell configuration, for example:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Use an absolute local `--bin-dir` without dot segments or PATH separators. macOS paths under `/var` commonly resolve through symlinks; use their canonical `/private/var/...` paths when choosing temporary custom destinations. A stale `.solascope-install.lock` after SIGKILL/power loss needs inspection before removal. Ordinary failures/signals are handled; power-loss recovery and hostile filesystem races are outside this contract. See [support and limitations](implementation-status.md) for actual platform and network verification.
 
 ## Build from source
 
@@ -95,4 +133,4 @@ From a local checkout with the repository's supported Rust toolchain:
 cargo install --path apps/solascope --locked
 ```
 
-Cargo normally installs both entry points into `~/.cargo/bin`. This method requires a build environment and is independent of the precompiled Windows installer. See the [README](../README.md#install) for source builds and [release operations](releases.md) for distribution automation.
+Cargo normally installs both entry points into `~/.cargo/bin`. This method requires a build environment and is independent of the precompiled installers. See the [README](../README.md#install) for source builds and [release operations](releases.md) for distribution automation.

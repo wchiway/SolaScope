@@ -18,6 +18,7 @@ _package = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_package)
 DOCUMENTATION = _package.DOCUMENTATION
 WINDOWS_INSTALLERS = _package.WINDOWS_INSTALLERS
+UNIX_INSTALLERS = _package.UNIX_INSTALLERS
 MAX_UNPACKED_SIZE = 512 * 1024 * 1024
 
 
@@ -44,8 +45,8 @@ def platform_for(target: str) -> str:
 def verify_archive(archive: Path, windows: bool) -> None:
     suffix = ".exe" if windows else ""
     expected = set(DOCUMENTATION) | {"solascope" + suffix, "sas" + suffix}
-    if windows:
-        expected.update(WINDOWS_INSTALLERS)
+    installers = WINDOWS_INSTALLERS if windows else UNIX_INSTALLERS
+    expected.update(installers)
     names = set()
     size = 0
     if windows:
@@ -72,6 +73,8 @@ def verify_archive(archive: Path, windows: bool) -> None:
                 if member.name not in expected or member.name in names:
                     raise ValueError("unexpected or duplicate package entry")
                 names.add(member.name)
+                if member.name in UNIX_INSTALLERS and member.size > 256 * 1024:
+                    raise ValueError("installer resource exceeds the size limit")
                 size += member.size
                 if size > MAX_UNPACKED_SIZE:
                     raise ValueError("package exceeds unpacked size limit")
@@ -117,10 +120,19 @@ def collect_releases(artifacts: Path, output: Path, version: str) -> list[Path]:
     if platforms != {"linux", "macos", "windows"}:
         raise ValueError("release requires all three native platform packages")
 
-    # Export only the two validated installer resources, never execute archives.
+    # Export validated resources without extracting or executing either archive.
     windows_archive = next(archive for archive, _ in packages if archive.suffix == ".zip")
     with zipfile.ZipFile(windows_archive) as package:
         installers = {name: package.read(name) for name in WINDOWS_INSTALLERS}
+    for archive, _ in packages:
+        if archive.suffix == ".zip":
+            continue
+        with tarfile.open(archive, "r:gz") as package:
+            for name in UNIX_INSTALLERS:
+                contents = package.extractfile(name).read()
+                if name in installers and installers[name] != contents:
+                    raise ValueError("Unix installer resources differ between platforms")
+                installers[name] = contents
     output.mkdir(parents=True, exist_ok=False)
     result = []
     checksums = []

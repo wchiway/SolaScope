@@ -57,6 +57,9 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Test release tooling
         run: python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Check POSIX installer syntax
+        if: runner.os != 'Windows'
+        run: sh -n install.sh
       - name: Test the Windows installer with built-in PowerShell 5.1
         if: runner.os == 'Windows'
         shell: powershell

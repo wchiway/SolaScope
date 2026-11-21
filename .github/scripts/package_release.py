@@ -25,6 +25,7 @@ DOCUMENTATION = (
     "docs/assets/solascope-search-flow.png",
 )
 WINDOWS_INSTALLERS = ("install.ps1", "install.cmd")
+UNIX_INSTALLERS = ("install.sh",)
 
 
 def build_package(root: Path, target: str) -> Path:
@@ -38,7 +39,8 @@ def build_package(root: Path, target: str) -> Path:
         for name in ("solascope", "sas")
     ]
     files = [(binary, binary.name) for binary in binaries]
-    public_files = DOCUMENTATION + (WINDOWS_INSTALLERS if windows else ())
+    installers = WINDOWS_INSTALLERS if windows else UNIX_INSTALLERS
+    public_files = DOCUMENTATION + installers
     files.extend((root / name, name) for name in public_files)
     for source, name in files:
         if (
@@ -47,7 +49,7 @@ def build_package(root: Path, target: str) -> Path:
             or source.resolve(strict=True) != source
         ):
             raise FileNotFoundError(f"package input must be a regular file: {source}")
-        if name in WINDOWS_INSTALLERS and source.stat().st_size > 256 * 1024:
+        if name in installers and source.stat().st_size > 256 * 1024:
             raise ValueError("installer resource exceeds the size limit")
 
     versions = [

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from package_release import DOCUMENTATION, WINDOWS_INSTALLERS, build_package
+from package_release import DOCUMENTATION, UNIX_INSTALLERS, WINDOWS_INSTALLERS, build_package
 
 
 class PackageReleaseTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class PackageReleaseTests(unittest.TestCase):
             binary.parent.mkdir(parents=True, exist_ok=True)
             binary.write_bytes(b"test executable\n")
             binary.chmod(0o755)
-        public_files = DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else ())
+        public_files = DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else UNIX_INSTALLERS)
         for name in public_files:
             source = root / name
             source.parent.mkdir(parents=True, exist_ok=True)

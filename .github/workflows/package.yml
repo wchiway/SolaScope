@@ -63,6 +63,16 @@ jobs:
         env:
           BUILD_TARGET: ${{ steps.target.outputs.triple }}
         run: python -I -B .github/scripts/package_release.py --target "$BUILD_TARGET"
+      - name: Smoke-test installation of the real Unix archive
+        if: runner.os != 'Windows'
+        run: |
+          sh -n install.sh
+          set -- dist/*.tar.gz
+          if [[ "$#" != 1 || ! -f "$1" ]]; then
+              printf '::error::Expected exactly one Unix archive.\n'
+              exit 1
+          fi
+          python -I -B .github/scripts/test_unix_install.py --real-archive "$1" dist/SHA256SUMS
       - name: Smoke-test installation of the real Windows archive
         if: runner.os == 'Windows'
         shell: powershell

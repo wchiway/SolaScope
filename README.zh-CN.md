@@ -32,6 +32,18 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 安装器面向 Windows 10/11 x64，使用系统自带 Windows PowerShell 5.1，无需 Rust、Git、Node.js、Python、包管理器或管理员权限。两个入口安装到 `%LOCALAPPDATA%\Programs\SolaScope\bin`，只更新用户 PATH，保留已有配置。在线模式需要访问 GitHub；离线 ZIP/校验文件安装、版本选择、升级及策略/验证边界见[安装指南](docs/installation.md)。安装后重新打开终端和 IDE。Windows 发行构建静态链接 CRT 并检查 DLL 导入，但干净机器上的实际运行仍需单独验证。
 
+### Linux 和 macOS：预编译安装
+
+从[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 下载 `install.sh`，检查脚本后运行：
+
+```sh
+sh ./install.sh
+# 可选：指定已发布版本和二进制目录。
+sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
+```
+
+默认将 `solascope` 和 `sas` 安装到 `~/.local/bin`。脚本需要 POSIX shell、常用 Unix 工具、tar/gzip、SHA-256 工具，以及在线下载使用的 curl 或 wget；无需开发环境或 sudo。它校验下载哈希和暂存程序版本，支持离线安装、升级及失败回滚，只提示添加 PATH，不修改 shell 配置或已有应用配置。Linux 发行包要求 x86_64 glibc；macOS 可识别 Intel/Apple Silicon，但只能安装该 Release 实际提供的架构。平台限制与选项见[安装指南](docs/installation.md#linux-and-macos)。
+
 ### 从源码安装
 
 在本地源码目录安装两个 CLI 入口：
@@ -197,7 +209,7 @@ cargo fmt --all -- --check
 
 GitHub Actions 已配置在 Linux、macOS、Windows 上执行工作区格式检查、Clippy、默认测试和打包测试，`local-rerank` 测试单独在 Linux 任务运行。所有检查通过后，可复用工作流构建两个 CLI 二进制，并连同公开文档及 `SHA256SUMS` 打包：Unix 使用 `.tar.gz`，Windows 使用 `.zip`，按版本和 Rust target 命名。工作流复用 Rust 依赖缓存，并取消被新提交替代的旧运行。
 
-推送 `v0.1.1` 这样的版本 tag 后，工作流自动校验它与工作区版本一致且提交属于 `main` 历史，对该提交运行可复用的 CI/打包流程，并在全部资产验证通过后正式发布 **GitHub Release**。Windows 安装脚本同时包含在 ZIP 内并作为独立资产发布，合并的 `SHA256SUMS` 覆盖五个下载文件。配置仓库 Secret `DEEPSEEK_API_KEY` 后，Description 通过 DeepSeek Responses 接口生成摘要，默认模型为 `deepseek-flash`；缺少密钥或接口失败时保留事实性提交记录，不阻断已验证的发行。已有 Release/tag 不会被覆盖。配置、按 tag 重试、隐私、预发布及验证边界见[发布操作说明](docs/releases.md)。未配置 crates.io 发布。
+推送 `v0.1.1` 这样的版本 tag 后，工作流自动校验它与工作区版本一致且提交属于 `main` 历史，对该提交运行可复用的 CI/打包流程，并在全部资产验证通过后正式发布 **GitHub Release**。Unix 归档内包含 `install.sh`，Windows ZIP 内包含 `install.ps1`/`install.cmd`；三份安装脚本也作为独立资产发布。合并的 `SHA256SUMS` 覆盖三个归档和三份安装脚本，加上校验文件共七个资产。配置仓库 Secret `DEEPSEEK_API_KEY` 后，Description 通过 DeepSeek Responses 接口生成摘要，默认模型为 `deepseek-flash`；缺少密钥或接口失败时保留事实性提交记录，不阻断已验证的发行。已有 Release/tag 不会被覆盖。配置、按 tag 重试、隐私、预发布及验证边界见[发布操作说明](docs/releases.md)。未配置 crates.io 发布。
 
 发行工具测试也可使用 Python 3.11 或更新版本在本地运行：
 
@@ -205,7 +217,7 @@ GitHub Actions 已配置在 Linux、macOS、Windows 上执行工作区格式检�
 python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 ```
 
-Linux CLI 构建、安装和自动化测试已验证。Windows 安装器离线测试已使用 Windows PowerShell 5.1 执行，未修改真实用户 PATH。模型协议和 DeepSeek Description 测试使用本地夹具/模拟接口。真实模型质量、本地 ONNX 推理、干净机器上的 macOS/Windows CLI 发行版运行、商业 MCP 客户端、远程 CI 发行包、真实 DeepSeek 生成以及 GitHub Release 正式发布仍待验证。
+Linux CLI 构建、自动化测试，以及本地构建的真实 Unix 发行包离线安装与重复安装已验证。Unix 下载流程和 macOS/Rosetta 架构检测使用 Linux 上的命令夹具测试；macOS 实际安装和公开 Release 下载仍待验证。Windows 安装器离线测试已使用 Windows PowerShell 5.1 执行，未修改真实用户 PATH。模型协议和 DeepSeek Description 测试使用本地夹具/模拟接口。真实模型质量、本地 ONNX 推理、干净机器上的 macOS/Windows CLI 发行版运行、商业 MCP 客户端、远程 CI 发行包、真实 DeepSeek 生成以及 GitHub Release 正式发布仍待验证。
 
 ## 许可证
 

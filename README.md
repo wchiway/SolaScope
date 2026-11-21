@@ -32,6 +32,18 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 The installer targets Windows 10/11 x64 and uses built-in Windows PowerShell 5.1. No Rust, Git, Node.js, Python, package manager, or administrator privileges are required. It installs both entry points into `%LOCALAPPDATA%\Programs\SolaScope\bin`, updates only User PATH, and preserves existing configuration. Online mode requires GitHub access; offline ZIP/checksum installation, version selection, upgrades, and policy/verification boundaries are described in the [installation guide](docs/installation.md). Reopen terminals and IDEs after installation. Windows release builds statically link the CRT and check DLL imports; clean-machine runtime validation remains separate.
 
+### Linux and macOS: precompiled installation
+
+Download `install.sh` from a [published release](https://github.com/wchiway/SolaScope/releases), inspect it, and run:
+
+```sh
+sh ./install.sh
+# Optional: select a published version and binary directory.
+sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
+```
+
+Both `solascope` and `sas` install into `~/.local/bin` by default. The script needs a POSIX shell, standard Unix utilities, tar/gzip, a SHA-256 tool, and curl or wget for online downloads. No development environment or sudo is needed. It verifies checksums and staged versions, supports offline installation and upgrade rollback, and prints a PATH reminder without editing shell profiles or configuration. Linux packages require x86_64 glibc; macOS Intel/Apple Silicon detection selects only targets actually published in that release. See the [installation guide](docs/installation.md#linux-and-macos) for platform limits and options.
+
 ### Build from source
 
 Install both CLI entry points from a local checkout:
@@ -195,7 +207,7 @@ cargo fmt --all -- --check
 
 GitHub Actions is configured to run workspace formatting, Clippy, default tests, and package tests on Linux, macOS, and Windows, with `local-rerank` tests in a separate Linux job. After all checks pass, a reusable workflow builds both CLI binaries and packages them with public documentation and `SHA256SUMS`: `.tar.gz` on Unix, `.zip` on Windows, named by version and Rust target. Runs reuse Rust dependency caches and cancel superseded runs.
 
-Pushing a version tag such as `v0.1.1` automatically validates that it matches the workspace version and belongs to `main` history, runs the reusable CI/package workflow on that exact commit, and publishes a **GitHub Release** after all assets are verified. Windows installers are included in the ZIP and exported as standalone assets; combined `SHA256SUMS` covers all five downloadable files. The description uses the DeepSeek Responses API (`deepseek-flash` by default) when the repository secret `DEEPSEEK_API_KEY` is configured; missing credentials or provider failures retain a factual changelog. Existing releases/tags are never overwritten. See [release operations](docs/releases.md) for configuration, tag-based retries, privacy, prereleases, and verification boundaries. Publishing to crates.io is not configured.
+Pushing a version tag such as `v0.1.1` automatically validates that it matches the workspace version and belongs to `main` history, runs the reusable CI/package workflow on that exact commit, and publishes a **GitHub Release** after all assets are verified. Unix archives include `install.sh` and the Windows ZIP includes `install.ps1`/`install.cmd`; all three installers are also exported as standalone assets. Combined `SHA256SUMS` covers the three archives and three installer files, giving seven assets including the checksum file. The description uses the DeepSeek Responses API (`deepseek-flash` by default) when the repository secret `DEEPSEEK_API_KEY` is configured; missing credentials or provider failures retain a factual changelog. Existing releases/tags are never overwritten. See [release operations](docs/releases.md) for configuration, tag-based retries, privacy, prereleases, and verification boundaries. Publishing to crates.io is not configured.
 
 Release-tooling tests can also run locally with Python 3.11 or newer:
 
@@ -203,7 +215,7 @@ Release-tooling tests can also run locally with Python 3.11 or newer:
 python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 ```
 
-Linux CLI builds, installation, and automated tests have been exercised. Windows installer offline fixtures have run with Windows PowerShell 5.1, without changing the real User PATH. Model protocol and DeepSeek description tests use local fixtures/mocks. Live model quality, local ONNX inference, macOS/Windows CLI release execution on clean machines, commercial MCP clients, remote CI packages, live DeepSeek generation, and GitHub Release publication still need validation.
+Linux CLI builds, automated tests, and repeated offline installation of a locally built real Unix release archive have been exercised. Unix installer transport and macOS/Rosetta detection use command fixtures on Linux; actual macOS installation and public-release downloads still need validation. Windows installer offline fixtures have run with Windows PowerShell 5.1, without changing the real User PATH. Model protocol and DeepSeek description tests use local fixtures/mocks. Live model quality, local ONNX inference, macOS/Windows CLI release execution on clean machines, commercial MCP clients, remote CI packages, live DeepSeek generation, and GitHub Release publication still need validation.
 
 ## License
 

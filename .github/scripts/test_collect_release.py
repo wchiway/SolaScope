@@ -11,7 +11,7 @@ from unittest.mock import patch
 import zipfile
 
 from collect_release import collect_releases, validate_version
-from package_release import DOCUMENTATION, WINDOWS_INSTALLERS, build_package
+from package_release import DOCUMENTATION, UNIX_INSTALLERS, WINDOWS_INSTALLERS, build_package
 
 
 TARGETS = (
@@ -37,7 +37,7 @@ class CollectReleaseTests(unittest.TestCase):
                     binary.parent.mkdir(parents=True, exist_ok=True)
                     binary.write_bytes(b"test executable\n")
                     binary.chmod(0o755)
-                for name in DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else ()):
+                for name in DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else UNIX_INSTALLERS):
                     source = project / name
                     source.parent.mkdir(parents=True, exist_ok=True)
                     source.write_text(name, encoding="utf-8")
@@ -61,13 +61,13 @@ class CollectReleaseTests(unittest.TestCase):
             output = root / "release"
             packages = collect_releases(artifacts, output, "0.1.0")
             self.assertEqual(len(packages), 3)
-            self.assertEqual(len(list(output.iterdir())), 6)
-            assets = packages + [output / name for name in WINDOWS_INSTALLERS]
+            self.assertEqual(len(list(output.iterdir())), 7)
+            assets = packages + [output / name for name in WINDOWS_INSTALLERS + UNIX_INSTALLERS]
             expected = "".join(
                 f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
                 for path in sorted(assets, key=lambda path: path.name)
             )
-            for name in WINDOWS_INSTALLERS:
+            for name in WINDOWS_INSTALLERS + UNIX_INSTALLERS:
                 self.assertEqual((output / name).read_text(), name)
             self.assertEqual((output / "SHA256SUMS").read_bytes(), expected.encode())
 
@@ -144,6 +144,25 @@ class CollectReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unexpected or duplicate"):
                     collect_releases(artifacts, root / "release", "0.1.0")
                 self.assertFalse((root / "release").exists())
+
+    def test_rejects_different_unix_installer_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = self.fixture(root)
+            archive = next((artifacts / ("solascope-" + TARGETS[1])).glob("*.tar.gz"))
+            with tarfile.open(archive, "r:gz") as source:
+                members = source.getmembers()
+                contents = {member.name: source.extractfile(member).read() for member in members}
+            contents["install.sh"] = b"different installer"
+            with tarfile.open(archive, "w:gz") as output:
+                import io
+                for member in members:
+                    member.size = len(contents[member.name])
+                    output.addfile(member, io.BytesIO(contents[member.name]))
+            self.replace_checksum(archive)
+            with self.assertRaisesRegex(ValueError, "differ between platforms"):
+                collect_releases(artifacts, root / "release", "0.1.0")
+            self.assertFalse((root / "release").exists())
 
     def test_rejects_zip_symlink_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

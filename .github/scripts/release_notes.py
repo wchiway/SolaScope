@@ -199,8 +199,9 @@ def render_notes(facts: dict, summary: str | None = None) -> str:
     lines.extend([
         "", "## Downloads", "",
         "- Windows x64: ZIP with `solascope.exe`, `sas.exe`, and the PowerShell/CMD installer.",
-        "- Linux x64 and native macOS: `.tar.gz` with both CLI entry points.",
-        "- `SHA256SUMS` covers the archives and standalone Windows installer files.",
+        "- Linux x64 and native macOS: `.tar.gz` with both CLI entry points and `install.sh`.",
+        "- `install.sh` is also available separately for Linux/macOS installation.",
+        "- `SHA256SUMS` covers the archives and all standalone installer files.",
         "", f"Source commit: `{facts['source_sha']}`.",
         "",
     ])
