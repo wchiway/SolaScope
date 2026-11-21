@@ -167,7 +167,7 @@ validate_archive() (
 version_output() (
     executable=$1
     output=$2
-    child=
+    worker=
     timer=
     # ShellCheck does not follow this nested function's EXIT trap.
     # shellcheck disable=SC2317
@@ -176,44 +176,61 @@ version_output() (
             kill -TERM "$timer" 2>/dev/null || :
             wait "$timer" 2>/dev/null || :
         fi
-        if [ -n "$child" ]; then
-            kill -KILL "$child" 2>/dev/null || :
-            wait "$child" 2>/dev/null || :
+        if [ -n "$worker" ]; then
+            kill -TERM "$worker" 2>/dev/null || :
+            wait "$worker" 2>/dev/null || :
         fi
     }
     trap version_cleanup 0
     trap 'exit 1' HUP INT TERM
-    (
-        # Bound stdout and stderr as well as the native process's running time.
-        ulimit -f 8
-        exec "$executable" --version
-    ) >"$output" 2>"$output.stderr" &
-    child=$!
-    mkfifo "$output.ready" || return 1
+    mkfifo "$output.events" || return 1
     (
         sleeper=
         trap 'if [ -n "$sleeper" ]; then kill -KILL "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi' 0
         trap 'exit 0' HUP INT TERM
         sleep 30 &
         sleeper=$!
-        # Cancellation is safe only after both traps and the sleep PID exist.
-        printf '%s\n' ready >"$output.ready"
+        printf '%s\n' ready
         wait "$sleeper" || exit 1
         sleeper=
-        : >"$output.timeout"
-        kill -KILL "$child" 2>/dev/null || :
-    ) >/dev/null 2>&1 &
+        # The timer only reports an event; it never signals a native PID.
+        printf '%s\n' timeout
+    ) >"$output.events" 2>/dev/null &
     timer=$!
-    IFS= read -r ready <"$output.ready" || return 1
-    [ "$ready" = ready ] || return 1
-    rm -f "$output.ready"
-    status=0
-    wait "$child" || status=$?
-    child=
+    # Open the event channel before starting any short-lived native process.
+    # Keep it open across both reads: macOS can interrupt a FIFO open on SIGCHLD.
+    exec 3<"$output.events"
+    IFS= read -r event <&3 || return 1
+    [ "$event" = ready ] || return 1
+    (
+        child=
+        trap 'if [ -n "$child" ]; then kill -KILL "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi' 0
+        trap 'exit 1' HUP INT TERM
+        (
+            # Bound stdout and stderr as well as the native running time.
+            ulimit -f 8
+            exec "$executable" --version
+        ) >"$output" 2>"$output.stderr" 3<&- &
+        child=$!
+        status=0
+        wait "$child" || status=$?
+        child=
+        printf 'done %s\n' "$status"
+    ) >"$output.events" 2>/dev/null 3<&- &
+    worker=$!
+    IFS= read -r event <&3 || return 1
+    case "$event" in
+    'done '*) status=${event#done } ;;
+    timeout) err 'binary --version timed out' ;;
+    *) return 1 ;;
+    esac
     kill -TERM "$timer" 2>/dev/null || :
     wait "$timer" 2>/dev/null || :
     timer=
-    [ ! -e "$output.timeout" ] || err 'binary --version timed out'
+    wait "$worker" || return 1
+    worker=
+    exec 3<&-
+    rm -f "$output.events"
     [ "$status" -eq 0 ] || return "$status"
     IFS= read -r text <"$output" || return 1
     printf '%s\n' "$text" >"$output.expected"

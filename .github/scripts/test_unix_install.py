@@ -271,14 +271,17 @@ cp "$MOCK_ASSETS/$file" "$out"
             '        "$REAL_SLEEP" 0.1\n        printf "%s\\n" initialized >>"$MOCK_TIMER_READY"\n' + timer_start,
             1,
         ))
-        archive = self.package()
+        archive = self.package(version_prefix='printf "%s\\n" native >>"$MOCK_TIMER_READY"\n')
         self.environment["REAL_SLEEP"] = shutil.which("sleep")
         ready_log = self.root / "timer-ready"
         self.environment["MOCK_TIMER_READY"] = str(ready_log)
-        for _ in range(5):
-            self.offline(archive, timeout=5, installer=delayed_script)
-        self.assertTrue(ready_log.is_file(), "timer was cancelled before initialization")
-        self.assertEqual(ready_log.read_text().splitlines(), ["initialized"] * 10)
+        for shell in ("sh", "bash"):
+            with self.subTest(shell=shell):
+                ready_log.unlink(missing_ok=True)
+                for _ in range(5):
+                    self.offline(archive, shell=shell, timeout=5, installer=delayed_script)
+                self.assertTrue(ready_log.is_file(), "timer was cancelled before initialization")
+                self.assertEqual(ready_log.read_text().splitlines(), ["initialized", "native"] * 10)
         self.assert_preserved()
 
     def test_successful_version_checks_reap_watchdog_sleepers(self):
