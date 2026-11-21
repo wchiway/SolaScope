@@ -189,18 +189,24 @@ version_output() (
         exec "$executable" --version
     ) >"$output" 2>"$output.stderr" &
     child=$!
+    mkfifo "$output.ready" || return 1
     (
         sleeper=
         trap 'if [ -n "$sleeper" ]; then kill -KILL "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi' 0
         trap 'exit 0' HUP INT TERM
         sleep 30 &
         sleeper=$!
+        # Cancellation is safe only after both traps and the sleep PID exist.
+        printf '%s\n' ready >"$output.ready"
         wait "$sleeper" || exit 1
         sleeper=
         : >"$output.timeout"
         kill -KILL "$child" 2>/dev/null || :
     ) >/dev/null 2>&1 &
     timer=$!
+    IFS= read -r ready <"$output.ready" || return 1
+    [ "$ready" = ready ] || return 1
+    rm -f "$output.ready"
     status=0
     wait "$child" || status=$?
     child=
@@ -310,7 +316,7 @@ main() (
     case "$archive" in '' | /*) ;; *) archive=$PWD/$archive ;; esac
     case "$checksum" in '' | /*) ;; *) checksum=$PWD/$checksum ;; esac
     case "${TMPDIR:-/tmp}" in /*) ;; *) err 'TMPDIR must be absolute' ;; esac
-    for utility in uname mktemp mkdir rmdir dirname cp mv rm chmod tar gzip sort cmp tr sleep; do
+    for utility in uname mktemp mkfifo mkdir rmdir dirname cp mv rm chmod tar gzip sort cmp tr sleep; do
         need_cmd "$utility"
     done
     if [ -n "$archive" ]; then

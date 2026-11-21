@@ -6,6 +6,7 @@ import io
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -97,11 +98,22 @@ class UnixInstallerTests(unittest.TestCase):
         path.write_text(f"{digest}  {archive.name}\n")
         return path
 
-    def run_installer(self, *arguments, success=True, shell="sh", environment=None):
-        result = subprocess.run(
-            [shell, str(INSTALLER), *map(str, arguments)], cwd=self.work,
-            env=environment or self.environment, capture_output=True, text=True, timeout=30,
-        )
+    def run_installer(self, *arguments, success=True, shell="sh", environment=None, timeout=30, installer=INSTALLER):
+        with subprocess.Popen(
+            [shell, str(installer), *map(str, arguments)], cwd=self.work,
+            env=environment or self.environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -247,6 +259,28 @@ cp "$MOCK_ASSETS/$file" "$out"
         self.assertEqual((destination / "solascope").read_bytes(), before)
         self.assert_preserved()
 
+    def test_fast_version_checks_wait_for_timer_initialization(self):
+        # Slow just the timer's first command: without the readiness handshake,
+        # fast binaries can finish before its cancellation traps are installed.
+        real_script = INSTALLER.read_text()
+        timer_start = "        sleeper=\n        trap "
+        self.assertEqual(real_script.count(timer_start), 1)
+        delayed_script = self.root / "delayed-installer.sh"
+        delayed_script.write_text(real_script.replace(
+            timer_start,
+            '        "$REAL_SLEEP" 0.1\n        printf "%s\\n" initialized >>"$MOCK_TIMER_READY"\n' + timer_start,
+            1,
+        ))
+        archive = self.package()
+        self.environment["REAL_SLEEP"] = shutil.which("sleep")
+        ready_log = self.root / "timer-ready"
+        self.environment["MOCK_TIMER_READY"] = str(ready_log)
+        for _ in range(5):
+            self.offline(archive, timeout=5, installer=delayed_script)
+        self.assertTrue(ready_log.is_file(), "timer was cancelled before initialization")
+        self.assertEqual(ready_log.read_text().splitlines(), ["initialized"] * 10)
+        self.assert_preserved()
+
     def test_successful_version_checks_reap_watchdog_sleepers(self):
         self.environment["REAL_SLEEP"] = shutil.which("sleep")
         self.environment["MOCK_TIMERS"] = str(self.root / "timers")
@@ -331,7 +365,7 @@ exec "$REAL_MV" "$@"
         self.mock_downloads(wget_only=True)
         # A minimal command PATH makes command -v observe a missing curl and
         # sha256sum without installing/uninstalling anything on the machine.
-        for name in ("mktemp", "mkdir", "rmdir", "dirname", "cp", "mv", "rm", "chmod", "tar", "gzip", "sort", "cmp", "tr", "sleep", "shasum", "perl"):
+        for name in ("mktemp", "mkfifo", "mkdir", "rmdir", "dirname", "cp", "mv", "rm", "chmod", "tar", "gzip", "sort", "cmp", "tr", "sleep", "shasum", "perl"):
             executable = shutil.which(name)
             if executable:
                 (self.mocks / name).symlink_to(executable)
