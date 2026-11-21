@@ -24,23 +24,30 @@ The CLI and MCP server share one engine and index. Indexing scans and parses sou
 
 ### Windows: no development environment required
 
-Download [install.ps1](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) and [install.cmd](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.cmd) via GitHub Raw (tracking `main`), or get both from the same [published release](https://github.com/wchiway/SolaScope/releases) for a fixed version. Inspect them, then double-click `install.cmd` or run:
+Run this in PowerShell to execute the [remote installer](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) directly:
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1').Content))
+}
 ```
+
+The script runs in a child PowerShell process without saving an installer file. It tracks remote `main` and installs binaries from a [published release](https://github.com/wchiway/SolaScope/releases).
 
 The installer targets Windows 10/11 x64 and uses built-in Windows PowerShell 5.1. No Rust, Git, Node.js, Python, package manager, or administrator privileges are required. It installs both entry points into `%LOCALAPPDATA%\Programs\SolaScope\bin`, updates only User PATH, and preserves existing configuration. Online mode requires GitHub access; offline ZIP/checksum installation, version selection, upgrades, and policy/verification boundaries are described in the [installation guide](docs/installation.md). Reopen terminals and IDEs after installation. Windows release builds statically link the CRT and check DLL imports; clean-machine runtime validation remains separate.
 
 ### Linux and macOS: precompiled installation
 
-Download [install.sh](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh) via GitHub Raw (tracking `main`), or get a fixed version from a [published release](https://github.com/wchiway/SolaScope/releases). Inspect it, then run:
+Execute the [remote installer](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh) directly without saving an installer file:
 
 ```sh
-sh ./install.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh | sh
 # Optional: select a published version and binary directory.
-sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh | sh -s -- --version 0.1.1 --bin-dir "$HOME/.local/bin"
 ```
+
+These commands execute the script from remote `main`; installation still downloads the binary archive from a published release.
 
 Both `solascope` and `sas` install into `~/.local/bin` by default. The script needs a POSIX shell, standard Unix utilities, tar/gzip, a SHA-256 tool, and curl or wget for online downloads. No development environment or sudo is needed. It verifies checksums and staged versions, supports offline installation and upgrade rollback, and prints a PATH reminder without editing shell profiles or configuration. Linux packages require x86_64 glibc; macOS Intel/Apple Silicon detection selects only targets actually published in that release. See the [installation guide](docs/installation.md#linux-and-macos) for platform limits and options.
 

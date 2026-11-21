@@ -24,23 +24,30 @@ CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模�
 
 ### Windows：无需开发环境
 
-通过 GitHub Raw 直链下载 [install.ps1](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) 和 [install.cmd](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.cmd)（跟随 `main` 更新），或从同一个[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 获取固定版本。检查脚本后双击 `install.cmd`，或运行：
+在 PowerShell 中运行以下命令，直接执行[远程安装脚本](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1)：
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1').Content))
+}
 ```
+
+脚本在 PowerShell 子进程中执行，无需保存安装脚本文件。脚本跟随远程 `main` 更新，程序从[已发布的 Release](https://github.com/wchiway/SolaScope/releases) 安装。
 
 安装器面向 Windows 10/11 x64，使用系统自带 Windows PowerShell 5.1，无需 Rust、Git、Node.js、Python、包管理器或管理员权限。两个入口安装到 `%LOCALAPPDATA%\Programs\SolaScope\bin`，只更新用户 PATH，保留已有配置。在线模式需要访问 GitHub；离线 ZIP/校验文件安装、版本选择、升级及策略/验证边界见[安装指南](docs/installation.md)。安装后重新打开终端和 IDE。Windows 发行构建静态链接 CRT 并检查 DLL 导入，但干净机器上的实际运行仍需单独验证。
 
 ### Linux 和 macOS：预编译安装
 
-通过 GitHub Raw 直链下载 [install.sh](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh)（跟随 `main` 更新），或从[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 获取固定版本。检查脚本后运行：
+直接执行[远程安装脚本](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh)，无需保存安装脚本文件：
 
 ```sh
-sh ./install.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh | sh
 # 可选：指定已发布版本和二进制目录。
-sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh | sh -s -- --version 0.1.1 --bin-dir "$HOME/.local/bin"
 ```
+
+上述命令执行远程 `main` 上的脚本；安装过程仍会下载已发布 Release 的二进制归档。
 
 默认将 `solascope` 和 `sas` 安装到 `~/.local/bin`。脚本需要 POSIX shell、常用 Unix 工具、tar/gzip、SHA-256 工具，以及在线下载使用的 curl 或 wget；无需开发环境或 sudo。它校验下载哈希和暂存程序版本，支持离线安装、升级及失败回滚，只提示添加 PATH，不修改 shell 配置或已有应用配置。Linux 发行包要求 x86_64 glibc；macOS 可识别 Intel/Apple Silicon，但只能安装该 Release 实际提供的架构。平台限制与选项见[安装指南](docs/installation.md#linux-and-macos)。
 
