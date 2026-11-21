@@ -31,6 +31,20 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern) {
     }
     throw "Expected failure matching $Pattern"
 }
+function Get-RegistryPathSnapshot([string]$Subkey = 'Environment') {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Subkey)
+    try {
+        $exists = $null -ne $key -and $key.GetValueNames() -contains 'Path'
+        $kind = $null
+        $value = $null
+        if ($exists) {
+            $kind = [string]$key.GetValueKind('Path')
+            $value = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        # Compare presence/type/content without expanding mutable process variables.
+        return ConvertTo-Json -InputObject ([ordered]@{ Exists = $exists; Kind = $kind; Value = $value }) -Compress -Depth 4
+    } finally { if ($key) { $key.Dispose() } }
+}
 function New-TestZip([string]$Name, [object[]]$Entries) {
     $path = Join-Path $script:FixtureRoot $Name
     $zip = [IO.Compression.ZipFile]::Open($path, [IO.Compression.ZipArchiveMode]::Create)
@@ -81,7 +95,7 @@ foreach ($item in (Get-ChildItem Env:)) {
         $originalEnvironment[$item.Name] = $item.Value
     }
 }
-$userPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
+$userPathBefore = Get-RegistryPathSnapshot
 $locationBefore = Get-Location
 $originalDownload = ${function:Invoke-SolaScopeDownload}
 $originalSmoke = ${function:Test-SolaScopeBinaries}
@@ -123,6 +137,30 @@ try {
     Assert-True ($path -ceq ('C:\Unrelated;C:\Unrelated;' + $bin)) 'only own PATH entries are deduplicated'
     Assert-True ((Get-SolaScopePathValue $null $bin) -ceq $bin) 'empty PATH'
     Assert-True ((Get-SolaScopePathValue ';C:\Other;;' $bin) -ceq (';C:\Other;;;' + $bin)) 'unrelated empty PATH entries preserved'
+
+    # REG_EXPAND_SZ reads change with the isolated process environment even when
+    # the persistent value is untouched, as on GitHub-hosted Windows runners.
+    $registryFixturePath = 'Software\SolaScopeInstallerTests-' + [Guid]::NewGuid().ToString('N')
+    $registryFixture = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($registryFixturePath)
+    $profileBeforeExpansionTest = $env:USERPROFILE
+    try {
+        $absentPath = Get-RegistryPathSnapshot $registryFixturePath
+        $registryFixture.SetValue('Path', '%USERPROFILE%\bin', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        $rawPath = Get-RegistryPathSnapshot $registryFixturePath
+        $expandedPath = $registryFixture.GetValue('Path')
+        $env:USERPROFILE = Join-Path $root 'another-profile'
+        Assert-True ($registryFixture.GetValue('Path') -cne $expandedPath) 'expanded PATH follows process USERPROFILE'
+        Assert-True ((Get-RegistryPathSnapshot $registryFixturePath) -ceq $rawPath) 'raw PATH ignores process expansion'
+        Assert-True ($rawPath -cne $absentPath) 'PATH snapshot detects value presence'
+        $registryFixture.SetValue('Path', '%USERPROFILE%\bin', [Microsoft.Win32.RegistryValueKind]::String)
+        Assert-True ((Get-RegistryPathSnapshot $registryFixturePath) -cne $rawPath) 'PATH snapshot detects value kind'
+        $registryFixture.SetValue('Path', '%USERPROFILE%\changed', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        Assert-True ((Get-RegistryPathSnapshot $registryFixturePath) -cne $rawPath) 'PATH snapshot detects raw value changes'
+    } finally {
+        $env:USERPROFILE = $profileBeforeExpansionTest
+        $registryFixture.Dispose()
+        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($registryFixturePath)
+    }
     Assert-Throws { Assert-SolaScopeLocalPath '\\server\share\archive.zip' } 'local drive'
     foreach ($bad in @('C:\', $env:USERPROFILE, $env:LOCALAPPDATA, $configDirectory,
             'relative\folder', 'C:\temp\..\bad', 'C:\temp\AUX', 'C:\temp\bad.')) {
@@ -297,7 +335,7 @@ try {
         Assert-True ((Get-FileHash -LiteralPath $config).Hash -ceq $configBefore) 'real package config preservation'
         Write-Host "Real Windows package smoke passed: $realVersion"
     }
-    Assert-True ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $userPathBefore) 'real User PATH unchanged'
+    Assert-True ((Get-RegistryPathSnapshot) -ceq $userPathBefore) 'real User PATH registry presence/type/raw value unchanged'
     Write-Host 'Windows installer offline fixtures passed.'
 } finally {
     Set-Location -LiteralPath $locationBefore.Path
