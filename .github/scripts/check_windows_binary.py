@@ -7,8 +7,12 @@ import struct
 
 # Keep this deliberately narrow. A new native dependency requires review, not
 # a blanket allowance just because the hosted runner happens to provide it.
+# BCryptPrimitives (ProcessPrng) and ComBase (Windows Runtime) are OS components:
+# https://learn.microsoft.com/en-us/windows/win32/seccng/processprng
+# https://learn.microsoft.com/en-us/windows/win32/api/roapi/nf-roapi-roinitialize
 SYSTEM_DLLS = {
-    "advapi32.dll", "bcrypt.dll", "cfgmgr32.dll", "crypt32.dll", "dbghelp.dll",
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll",
+    "combase.dll", "crypt32.dll", "dbghelp.dll",
     "gdi32.dll", "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ncrypt.dll",
     "netapi32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll", "powrprof.dll",
     "propsys.dll", "psapi.dll", "rpcrt4.dll", "secur32.dll", "setupapi.dll",

@@ -40,10 +40,19 @@ class WindowsBinaryTests(unittest.TestCase):
                 path.write_bytes(fixture(dll))
                 self.assertEqual(check_binary(path), {dll.lower()})
 
+    def test_accepts_windows_crypto_and_combase_normal_and_delay_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.exe"
+            for dll in ("BCryptPrimitives.dll", "ComBase.dll"):
+                for delay in (False, True):
+                    with self.subTest(dll=dll, delay=delay):
+                        path.write_bytes(fixture(dll, delay=delay))
+                        self.assertEqual(check_binary(path), {dll.lower()})
+
     def test_rejects_external_crt_and_onnx_normal_and_delay_imports(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.exe"
-            for dll in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "onnxruntime.dll"):
+            for dll in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "onnxruntime.dll", "unknown.dll"):
                 for delay in (False, True):
                     path.write_bytes(fixture(dll, delay))
                     with self.subTest(dll=dll, delay=delay), self.assertRaisesRegex(ValueError, "non-system"):
