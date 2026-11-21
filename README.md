@@ -24,7 +24,7 @@ The CLI and MCP server share one engine and index. Indexing scans and parses sou
 
 ### Windows: no development environment required
 
-Download `install.ps1` and `install.cmd` from the same [published release](https://github.com/wchiway/SolaScope/releases), inspect them, and double-click `install.cmd` or run:
+Download [install.ps1](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) and [install.cmd](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.cmd) via GitHub Raw (tracking `main`), or get both from the same [published release](https://github.com/wchiway/SolaScope/releases) for a fixed version. Inspect them, then double-click `install.cmd` or run:
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -34,7 +34,7 @@ The installer targets Windows 10/11 x64 and uses built-in Windows PowerShell 5.1
 
 ### Linux and macOS: precompiled installation
 
-Download `install.sh` from a [published release](https://github.com/wchiway/SolaScope/releases), inspect it, and run:
+Download [install.sh](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh) via GitHub Raw (tracking `main`), or get a fixed version from a [published release](https://github.com/wchiway/SolaScope/releases). Inspect it, then run:
 
 ```sh
 sh ./install.sh

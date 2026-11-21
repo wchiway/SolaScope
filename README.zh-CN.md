@@ -24,7 +24,7 @@ CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模�
 
 ### Windows：无需开发环境
 
-从同一个[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 下载 `install.ps1` 和 `install.cmd`，检查脚本后双击 `install.cmd`，或运行：
+通过 GitHub Raw 直链下载 [install.ps1](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) 和 [install.cmd](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.cmd)（跟随 `main` 更新），或从同一个[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 获取固定版本。检查脚本后双击 `install.cmd`，或运行：
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -34,7 +34,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 ### Linux 和 macOS：预编译安装
 
-从[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 下载 `install.sh`，检查脚本后运行：
+通过 GitHub Raw 直链下载 [install.sh](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.sh)（跟随 `main` 更新），或从[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 获取固定版本。检查脚本后运行：
 
 ```sh
 sh ./install.sh
