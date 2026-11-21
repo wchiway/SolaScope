@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit selected by the release caller
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # A release caller and its reusable CI must not share a cancellation group.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -32,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,8 +55,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test default features
         run: cargo test --workspace --all-targets --locked
-      - name: Test package creation
+      - name: Test release tooling
         run: python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Test the Windows installer with built-in PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .github/scripts/test_windows_install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   local-rerank:
     name: Test optional local reranker
@@ -57,6 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -70,3 +85,5 @@ jobs:
   package:
     needs: [validate, local-rerank]
     uses: ./.github/workflows/package.yml
+    with:
+      source_sha: ${{ inputs.source_sha || github.sha }}

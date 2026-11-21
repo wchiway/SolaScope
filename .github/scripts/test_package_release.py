@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from package_release import DOCUMENTATION, build_package
+from package_release import DOCUMENTATION, WINDOWS_INSTALLERS, build_package
 
 
 class PackageReleaseTests(unittest.TestCase):
@@ -18,14 +18,15 @@ class PackageReleaseTests(unittest.TestCase):
             binary.parent.mkdir(parents=True, exist_ok=True)
             binary.write_bytes(b"test executable\n")
             binary.chmod(0o755)
-        for name in DOCUMENTATION:
+        public_files = DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else ())
+        for name in public_files:
             source = root / name
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(name, encoding="utf-8")
         (root / ".env").write_text("private fixture", encoding="utf-8")
         (root / ".solascope").mkdir()
         (root / ".solascope" / "index.db").write_bytes(b"private index")
-        return set(DOCUMENTATION) | {"solascope" + suffix, "sas" + suffix}
+        return set(public_files) | {"solascope" + suffix, "sas" + suffix}
 
     def assert_checksum(self, archive: Path) -> None:
         expected = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -96,6 +97,22 @@ class PackageReleaseTests(unittest.TestCase):
             (root / "README.zh-CN.md").unlink()
             with self.assertRaises(FileNotFoundError):
                 build_package(root, "x86_64-unknown-linux-gnu")
+            self.assertFalse((root / "dist").exists())
+            version.assert_not_called()
+
+    @patch("package_release.subprocess.check_output", return_value="solascope 0.1.0\n")
+    def test_windows_installer_resources_are_required_and_bounded(self, version) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = "x86_64-pc-windows-msvc"
+            self.fixture(root, target)
+            installer = root / "install.ps1"
+            installer.unlink()
+            with self.assertRaises(FileNotFoundError):
+                build_package(root, target)
+            installer.write_bytes(b"x" * (256 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, "installer resource"):
+                build_package(root, target)
             self.assertFalse((root / "dist").exists())
             version.assert_not_called()
 

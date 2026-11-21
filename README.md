@@ -22,6 +22,18 @@ The CLI and MCP server share one engine and index. Indexing scans and parses sou
 
 ## Install
 
+### Windows: no development environment required
+
+Download `install.ps1` and `install.cmd` from the same [published release](https://github.com/wchiway/SolaScope/releases), inspect them, and double-click `install.cmd` or run:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The installer targets Windows 10/11 x64 and uses built-in Windows PowerShell 5.1. No Rust, Git, Node.js, Python, package manager, or administrator privileges are required. It installs both entry points into `%LOCALAPPDATA%\Programs\SolaScope\bin`, updates only User PATH, and preserves existing configuration. Online mode requires GitHub access; offline ZIP/checksum installation, version selection, upgrades, and policy/verification boundaries are described in the [installation guide](docs/installation.md). Reopen terminals and IDEs after installation. Windows release builds statically link the CRT and check DLL imports; clean-machine runtime validation remains separate.
+
+### Build from source
+
 Install both CLI entry points from a local checkout:
 
 ```bash
@@ -183,15 +195,15 @@ cargo fmt --all -- --check
 
 GitHub Actions is configured to run workspace formatting, Clippy, default tests, and package tests on Linux, macOS, and Windows, with `local-rerank` tests in a separate Linux job. After all checks pass, a reusable workflow builds both CLI binaries and packages them with public documentation and `SHA256SUMS`: `.tar.gz` on Unix, `.zip` on Windows, named by version and Rust target. Runs reuse Rust dependency caches and cancel superseded runs.
 
-Following zoxide's release convention, a `main` push whose commit message starts with `chore(release)` creates a **draft GitHub Release** after CI succeeds. The release workflow reuses the three platform packages, verifies their contents and checksums, and combines their checksum entries into one `SHA256SUMS`. Maintainers can also run `release.yml` manually on `main`, supplying the ID of a successful `ci.yml` run from `main`. The tag is `v<workspace version>` and targets that run's source commit; existing releases are rejected, and existing tags must match the source commit. Drafts require manual review and publication. Publishing to crates.io is not configured. See [release operations](docs/implementation-status.md#release-operations) for the procedure and validation limits.
+Pushing a version tag such as `v0.1.1` automatically validates that it matches the workspace version and belongs to `main` history, runs the reusable CI/package workflow on that exact commit, and publishes a **GitHub Release** after all assets are verified. Windows installers are included in the ZIP and exported as standalone assets; combined `SHA256SUMS` covers all five downloadable files. The description uses the DeepSeek Responses API (`deepseek-flash` by default) when the repository secret `DEEPSEEK_API_KEY` is configured; missing credentials or provider failures retain a factual changelog. Existing releases/tags are never overwritten. See [release operations](docs/releases.md) for configuration, tag-based retries, privacy, prereleases, and verification boundaries. Publishing to crates.io is not configured.
 
-Package and release-collection tests can also run locally with Python 3.9 or newer:
+Release-tooling tests can also run locally with Python 3.11 or newer:
 
 ```bash
 python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 ```
 
-Linux CLI builds, installation, and automated tests have been exercised. Model protocol tests use local mock servers. Live model quality, local ONNX inference, macOS/Windows execution, commercial MCP clients, remote CI packages, and GitHub draft-release creation still need validation.
+Linux CLI builds, installation, and automated tests have been exercised. Windows installer offline fixtures have run with Windows PowerShell 5.1, without changing the real User PATH. Model protocol and DeepSeek description tests use local fixtures/mocks. Live model quality, local ONNX inference, macOS/Windows CLI release execution on clean machines, commercial MCP clients, remote CI packages, live DeepSeek generation, and GitHub Release publication still need validation.
 
 ## License
 

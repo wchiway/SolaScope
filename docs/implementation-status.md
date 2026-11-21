@@ -28,17 +28,15 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Live model services, local ONNX inference, macOS/Windows execution, and commercial MCP clients have not been tested. Three-platform CI, packaging, and draft-release workflows are configured; remote runners, distribution packages, and GitHub Release creation still need validation.
+Windows installer offline fixtures have run on Windows 11 with the OS-provided Windows PowerShell 5.1. They cover ZIP/checksum rejection, Unicode/space paths, repeated installation, upgrade/rollback, locked executables, serialization, configuration preservation, and PATH value generation, without writing the real User PATH. Fixture executables are .NET test programs, not release CLI binaries. Live model services, local ONNX inference, clean-machine macOS/Windows CLI execution, online installer downloading, persistent User PATH changes, and commercial MCP clients have not been tested. Three-platform CI, packaging, and tag-triggered publication are configured; remote runners, real distribution packages, live DeepSeek summaries, and GitHub Release publication still need validation.
 
 ### CI and packages
 
-The workflow layout and draft-release convention are inspired by [zoxide's workflows](https://github.com/ajeetdsouza/zoxide/tree/2f4bcebaa62a44742280172c9b4c2753266716d0/.github/workflows), adapted to this workspace's stable Cargo toolchain. Releases reuse packages from successful CI runs.
-
-- `ci.yml` runs formatting, Clippy, default workspace tests, and Python package tests on all three platforms. Optional `local-rerank` tests run independently on Linux.
-- After all validation jobs pass, `ci.yml` calls the reusable `package.yml` workflow. It reads the native Rust target from the runner's compiler, builds both `solascope` and `sas`, verifies that their version output matches, and includes the public documentation and `SHA256SUMS`.
-- Rust caches are separated by job/platform or build target and saved only for `main`; superseded CI runs are cancelled.
-- Archive and release-collection tests cover contents, executable permissions on Unix, combined checksums, missing platforms, source-version mismatches, alias-version mismatches, invalid inputs, and symlink rejection. Both scripts use Python's standard library.
-- `release.yml` verifies and collects the three CI artifacts before creating a draft GitHub Release. Only the draft-creation job has `contents: write`; preparation uses read-only permissions and never executes downloaded packages.
+- `ci.yml` runs formatting, Clippy, default workspace tests, and Python release-tooling tests on all three platforms, plus Windows PowerShell 5.1 installer fixtures on Windows. Optional `local-rerank` tests run independently on Linux. It can also be called by a release workflow.
+- After validation passes, the reusable `package.yml` builds both CLI entry points for the native runner target, verifies matching versions, and packages the license and public documentation. Windows packages include `install.ps1`/`install.cmd`; Windows release builds enable static CRT, inspect ordinary/delay-loaded DLL imports, and smoke-test offline installation of the actual ZIP.
+- Rust caches are separated by job/platform/build policy and saved only for `main`; superseded ordinary CI runs are cancelled. Release publication is serialized and is not cancelled during uploads.
+- Archive and collection tests cover exact public content, executable permissions on Unix, combined archive/installer checksums, missing platforms, version mismatches, invalid inputs, and symlink rejection. Additional Python tests cover tag validation and bounded author-free changelog facts, PE dependencies, and DeepSeek Responses success/fallback/malformed/incomplete/error contracts. All Python release tooling uses the standard library.
+- `release.yml` validates an existing version tag, runs CI on that commit, and collects only same-run assets. It optionally generates a description with DeepSeek, creates a temporary draft, verifies uploaded assets, and publishes automatically. Only publishing has `contents: write`; only description generation receives `DEEPSEEK_API_KEY`. Validation never executes downloaded package binaries.
 - Publishing to crates.io is not configured.
 
 | Native platform | Runner | Archive |
@@ -49,21 +47,13 @@ The workflow layout and draft-release convention are inspired by [zoxide's workf
 
 ### Release operations
 
-1. Update the workspace version and relevant documentation, then push the release commit to `main` with a message starting with `chore(release)`, such as `chore(release): v0.1.0`.
-2. Wait for **Test and package** to succeed. The `workflow_run` trigger then starts `release.yml` for that push. Both workflows must already exist on the default branch for this trigger to work.
-3. Review the draft's tag, source commit, three platform archives, and combined `SHA256SUMS`, then publish it manually on GitHub. A version with a prerelease suffix also marks the draft as a prerelease.
+Update the workspace version and public documentation, commit the changes into `main` history, and push a matching `v<workspace version>` tag. `release.yml` checks the tag/commit/version, invokes the reusable CI and package workflow, verifies the three archives, exports standalone Windows installers, and publishes only after the full asset set is uploaded and verified. An existing release (including a partial draft) is never overwritten, and tags are never moved.
 
-To retry after a workflow failure, or select another successful `main` CI run, dispatch `release.yml` on `main` and supply its run ID. The source run must belong to this repository, use `.github/workflows/ci.yml`, come from a push or manual dispatch on `main`, and have completed successfully. Its source commit must still be in `main` history. For example, replacing the example ID with the chosen run's ID:
+Configure the optional repository secret `DEEPSEEK_API_KEY` and optional variable `DEEPSEEK_MODEL` (default `deepseek-flash`) to generate the description through `https://api.deepseek.com/responses`. Only bounded version/commit-subject metadata is sent; no source diffs or author identities. Missing credentials and provider failures produce a warning and retain factual notes. AI summaries are labeled and are not independent verification of behavior.
 
-```bash
-gh workflow run release.yml --ref main -f run_id=1234567890
-```
+To retry, rerun the failed workflow or dispatch `release.yml` on its existing version tag, for example `gh workflow run release.yml --ref v0.1.1`. Branch dispatch is rejected. SemVer prerelease tags publish as prereleases and do not become latest. See the [release guide](releases.md) for configuration, failure recovery, privacy, and exact operations, and the [installation guide](installation.md) for Windows online/offline installation.
 
-The workflow reads the workspace version from that run's source commit, checks that all three native packages match it, and verifies each package's checksum and exact public-file allowlist. It copies the archives without extracting or executing them and combines all checksum entries. CI artifacts must still be available; expired artifacts require a new successful CI run. Linux uses GNU binaries, and the macOS archive follows the runner's native architecture; no additional cross-compiled targets are provided.
-
-The draft uses tag `v<workspace version>` and targets the verified CI commit. An existing release with that tag causes a failure, including an existing draft; review that release directly instead of rerunning to overwrite it. An existing tag must resolve to the same commit and is never moved. The workflow does not automatically publish drafts.
-
-Local validation covers workflow linting, ShellCheck and shell formatting, archive inspection, combined checksums, and isolated Python CLI execution with fixture packages. These checks do not establish successful remote artifact downloads, token permissions, draft creation, or macOS/Windows binary execution.
+Local validation covers workflow/ShellCheck linting and shell formatting, package content and checksum inspection, isolated Python tag/release-note tests, and Windows PowerShell 5.1 installer fixtures. These checks do not establish successful remote artifact downloads, GitHub token permissions, live DeepSeek requests, publication, or clean-machine release binary execution.
 
 ## Current limitations
 

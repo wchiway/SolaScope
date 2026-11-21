@@ -11,7 +11,7 @@ from unittest.mock import patch
 import zipfile
 
 from collect_release import collect_releases, validate_version
-from package_release import DOCUMENTATION, build_package
+from package_release import DOCUMENTATION, WINDOWS_INSTALLERS, build_package
 
 
 TARGETS = (
@@ -37,7 +37,7 @@ class CollectReleaseTests(unittest.TestCase):
                     binary.parent.mkdir(parents=True, exist_ok=True)
                     binary.write_bytes(b"test executable\n")
                     binary.chmod(0o755)
-                for name in DOCUMENTATION:
+                for name in DOCUMENTATION + (WINDOWS_INSTALLERS if suffix else ()):
                     source = project / name
                     source.parent.mkdir(parents=True, exist_ok=True)
                     source.write_text(name, encoding="utf-8")
@@ -61,11 +61,14 @@ class CollectReleaseTests(unittest.TestCase):
             output = root / "release"
             packages = collect_releases(artifacts, output, "0.1.0")
             self.assertEqual(len(packages), 3)
-            self.assertEqual(len(list(output.iterdir())), 4)
+            self.assertEqual(len(list(output.iterdir())), 6)
+            assets = packages + [output / name for name in WINDOWS_INSTALLERS]
             expected = "".join(
                 f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-                for path in sorted(packages, key=lambda path: path.name)
+                for path in sorted(assets, key=lambda path: path.name)
             )
+            for name in WINDOWS_INSTALLERS:
+                self.assertEqual((output / name).read_text(), name)
             self.assertEqual((output / "SHA256SUMS").read_bytes(), expected.encode())
 
     def test_standalone_cli_works_with_isolated_python(self) -> None:

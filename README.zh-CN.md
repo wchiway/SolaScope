@@ -22,6 +22,18 @@ CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模�
 
 ## 安装
 
+### Windows：无需开发环境
+
+从同一个[正式发布的 Release](https://github.com/wchiway/SolaScope/releases) 下载 `install.ps1` 和 `install.cmd`，检查脚本后双击 `install.cmd`，或运行：
+
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+安装器面向 Windows 10/11 x64，使用系统自带 Windows PowerShell 5.1，无需 Rust、Git、Node.js、Python、包管理器或管理员权限。两个入口安装到 `%LOCALAPPDATA%\Programs\SolaScope\bin`，只更新用户 PATH，保留已有配置。在线模式需要访问 GitHub；离线 ZIP/校验文件安装、版本选择、升级及策略/验证边界见[安装指南](docs/installation.md)。安装后重新打开终端和 IDE。Windows 发行构建静态链接 CRT 并检查 DLL 导入，但干净机器上的实际运行仍需单独验证。
+
+### 从源码安装
+
 在本地源码目录安装两个 CLI 入口：
 
 ```bash
@@ -185,15 +197,15 @@ cargo fmt --all -- --check
 
 GitHub Actions 已配置在 Linux、macOS、Windows 上执行工作区格式检查、Clippy、默认测试和打包测试，`local-rerank` 测试单独在 Linux 任务运行。所有检查通过后，可复用工作流构建两个 CLI 二进制，并连同公开文档及 `SHA256SUMS` 打包：Unix 使用 `.tar.gz`，Windows 使用 `.zip`，按版本和 Rust target 命名。工作流复用 Rust 依赖缓存，并取消被新提交替代的旧运行。
 
-遵循 zoxide 的发布约定，`main` 上提交信息以 `chore(release)` 开头的推送，会在 CI 成功后创建 **GitHub Release 草稿**。发布工作流复用三个平台的发行包，验证内容和校验和，并合并生成一份 `SHA256SUMS`。维护者也可在 `main` 上手动运行 `release.yml`，提供一次来自 `main` 且成功完成的 `ci.yml` 运行 ID。标签使用 `v<工作区版本>`，指向该次 CI 的源码提交；已有 Release 会被拒绝，已有标签必须指向相同提交。草稿需人工审阅并正式发布。未配置 crates.io 发布。操作步骤和验证边界见[发布操作说明](docs/implementation-status.md#release-operations)。
+推送 `v0.1.1` 这样的版本 tag 后，工作流自动校验它与工作区版本一致且提交属于 `main` 历史，对该提交运行可复用的 CI/打包流程，并在全部资产验证通过后正式发布 **GitHub Release**。Windows 安装脚本同时包含在 ZIP 内并作为独立资产发布，合并的 `SHA256SUMS` 覆盖五个下载文件。配置仓库 Secret `DEEPSEEK_API_KEY` 后，Description 通过 DeepSeek Responses 接口生成摘要，默认模型为 `deepseek-flash`；缺少密钥或接口失败时保留事实性提交记录，不阻断已验证的发行。已有 Release/tag 不会被覆盖。配置、按 tag 重试、隐私、预发布及验证边界见[发布操作说明](docs/releases.md)。未配置 crates.io 发布。
 
-打包与发行包收集测试也可使用 Python 3.9 或更新版本在本地运行：
+发行工具测试也可使用 Python 3.11 或更新版本在本地运行：
 
 ```bash
 python -I -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
 ```
 
-Linux CLI 构建、安装和自动化测试已验证。模型协议测试使用本地模拟服务。真实模型质量、本地 ONNX 推理、macOS/Windows 运行、商业 MCP 客户端、远程 CI 发行包以及 GitHub Release 草稿创建仍待验证。
+Linux CLI 构建、安装和自动化测试已验证。Windows 安装器离线测试已使用 Windows PowerShell 5.1 执行，未修改真实用户 PATH。模型协议和 DeepSeek Description 测试使用本地夹具/模拟接口。真实模型质量、本地 ONNX 推理、干净机器上的 macOS/Windows CLI 发行版运行、商业 MCP 客户端、远程 CI 发行包、真实 DeepSeek 生成以及 GitHub Release 正式发布仍待验证。
 
 ## 许可证
 

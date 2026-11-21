@@ -17,6 +17,7 @@ _spec = importlib.util.spec_from_file_location(
 _package = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_package)
 DOCUMENTATION = _package.DOCUMENTATION
+WINDOWS_INSTALLERS = _package.WINDOWS_INSTALLERS
 MAX_UNPACKED_SIZE = 512 * 1024 * 1024
 
 
@@ -43,6 +44,8 @@ def platform_for(target: str) -> str:
 def verify_archive(archive: Path, windows: bool) -> None:
     suffix = ".exe" if windows else ""
     expected = set(DOCUMENTATION) | {"solascope" + suffix, "sas" + suffix}
+    if windows:
+        expected.update(WINDOWS_INSTALLERS)
     names = set()
     size = 0
     if windows:
@@ -54,6 +57,8 @@ def verify_archive(archive: Path, windows: bool) -> None:
                 if member.filename not in expected or member.filename in names:
                     raise ValueError("unexpected or duplicate package entry")
                 names.add(member.filename)
+                if member.filename in WINDOWS_INSTALLERS and member.file_size > 256 * 1024:
+                    raise ValueError("installer resource exceeds the size limit")
                 size += member.file_size
                 if size > MAX_UNPACKED_SIZE:
                     raise ValueError("package exceeds unpacked size limit")
@@ -112,15 +117,24 @@ def collect_releases(artifacts: Path, output: Path, version: str) -> list[Path]:
     if platforms != {"linux", "macos", "windows"}:
         raise ValueError("release requires all three native platform packages")
 
+    # Export only the two validated installer resources, never execute archives.
+    windows_archive = next(archive for archive, _ in packages if archive.suffix == ".zip")
+    with zipfile.ZipFile(windows_archive) as package:
+        installers = {name: package.read(name) for name in WINDOWS_INSTALLERS}
     output.mkdir(parents=True, exist_ok=False)
     result = []
-    for archive, _ in packages:
+    checksums = []
+    for archive, digest in packages:
         destination = output / archive.name
         shutil.copy2(archive, destination)
         result.append(destination)
+        checksums.append((destination.name, digest))
+    for name, contents in installers.items():
+        (output / name).write_bytes(contents)
+        checksums.append((name, hashlib.sha256(contents).hexdigest()))
     with (output / "SHA256SUMS").open("w", encoding="utf-8", newline="\n") as checksum:
-        for archive, digest in sorted(packages, key=lambda item: item[0].name):
-            checksum.write(f"{digest}  {archive.name}\n")
+        for name, digest in sorted(checksums):
+            checksum.write(f"{digest}  {name}\n")
     return result
 
 

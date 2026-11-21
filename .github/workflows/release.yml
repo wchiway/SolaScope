@@ -1,127 +1,144 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: [Test and package]
-    branches: [main]
-    types: [completed]
+  push:
+    tags: ["v[0-9]*"]
   workflow_dispatch:
-    inputs:
-      run_id:
-        description: Successful main CI run ID whose packages will be released
-        required: true
-        type: string
 
+# Serialize publication without cancelling a release that is already uploading.
 concurrency:
   group: release
   cancel-in-progress: false
 
 permissions:
   contents: read
-  actions: read
 
 env:
   GH_REPO: ${{ github.repository }}
 
 jobs:
   prepare:
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        startsWith(github.event.workflow_run.head_commit.message, 'chore(release)')))
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: bash
-    env:
-      GH_TOKEN: ${{ github.token }}
-      CI_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+    timeout-minutes: 10
     outputs:
-      source_sha: ${{ steps.ci.outputs.source_sha }}
-      version: ${{ steps.assets.outputs.version }}
-      tag: ${{ steps.assets.outputs.tag }}
-      prerelease: ${{ steps.assets.outputs.prerelease }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      version: ${{ steps.source.outputs.version }}
+      tag: ${{ steps.source.outputs.tag }}
+      prerelease: ${{ steps.source.outputs.prerelease }}
     steps:
-      - name: Check out trusted release tooling
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Validate the source CI run
-        id: ci
+      - name: Validate the version tag and its source
+        id: source
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
-          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-              printf '::error::A numeric CI run ID is required.\n'
+          if [[ "$REF_TYPE" != tag ]]; then
+              printf '::error::Run this workflow on an existing version tag, not a branch.\n'
               exit 1
           fi
-          metadata=$(mktemp -d "$RUNNER_TEMP/release-metadata.XXXXXX")
-          gh api "repos/$GH_REPO/actions/runs/$CI_RUN_ID" >"$metadata/run.json"
-          jq -e --arg repo "$GH_REPO" '
-            .status == "completed" and .conclusion == "success" and
-            (.event == "push" or .event == "workflow_dispatch") and
-            .head_branch == "main" and .head_repository.full_name == $repo and
-            .path == ".github/workflows/ci.yml"
-          ' "$metadata/run.json" >/dev/null
-          source_sha=$(jq -er '.head_sha | select(test("^[0-9a-f]{40}$"))' "$metadata/run.json")
-          main_sha=$(gh api "repos/$GH_REPO/branches/main" --jq '.commit.sha')
-          if [[ "$source_sha" != "$main_sha" ]]; then
-              relation=$(gh api "repos/$GH_REPO/compare/$source_sha...$main_sha" --jq '.status')
-              if [[ "$relation" != ahead && "$relation" != identical ]]; then
-                  printf '::error::The CI commit is no longer in main history.\n'
-                  exit 1
-              fi
-          fi
-          printf 'run_id=%s\nsource_sha=%s\n' "$CI_RUN_ID" "$source_sha" >>"$GITHUB_OUTPUT"
-      - name: Check out the verified source manifest
-        uses: actions/checkout@v7
+          mkdir -p dist/facts
+          python -I -B .github/scripts/prepare_release.py \
+              --tag "$RELEASE_TAG" --expected-sha "$EXPECTED_SHA" \
+              --output dist/facts/release-facts.json
+          jq -r '"source_sha=\(.source_sha)\nversion=\(.version)\ntag=\(.tag)\nprerelease=\(.prerelease)"' \
+              dist/facts/release-facts.json >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
         with:
-          ref: ${{ steps.ci.outputs.source_sha }}
-          path: version-source
+          name: release-facts
+          path: dist/facts/release-facts.json
+          if-no-files-found: error
+
+  test-and-package:
+    needs: prepare
+    # No secrets are inherited by build or test jobs. The called workflow checks
+    # out this exact tag's commit and uploads the three platform packages here.
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ needs.prepare.outputs.source_sha }}
+    permissions:
+      contents: read
+
+  collect:
+    needs: [prepare, test-and-package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
-      - name: Download the verified CI packages
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Download this run's tested packages
         uses: actions/download-artifact@v7
         with:
           pattern: solascope-*
           path: dist/ci-artifacts
           merge-multiple: false
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.ci.outputs.run_id }}
-          github-token: ${{ github.token }}
-      - name: Verify packages and combine checksums
-        id: assets
+      - name: Verify all packages and combine asset checksums
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          version=$(python -I -c 'from pathlib import Path; import tomllib; sys_version = tomllib.loads(Path("version-source/Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"]; print(sys_version)')
           python -I -B .github/scripts/collect_release.py \
-              --artifacts dist/ci-artifacts --output dist/release --version "$version"
-          prerelease=false
-          if [[ "${version%%+*}" == *-* ]]; then
-              prerelease=true
-          fi
-          printf 'version=%s\ntag=v%s\nprerelease=%s\n' "$version" "$version" "$prerelease" >>"$GITHUB_OUTPUT"
-      - name: Upload validated release assets
-        uses: actions/upload-artifact@v7
+              --artifacts dist/ci-artifacts --output dist/release --version "$RELEASE_VERSION"
+      - uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: dist/release/*
           if-no-files-found: error
           compression-level: 0
 
+  notes:
+    needs: [prepare, test-and-package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-facts
+          path: dist/facts
+      - name: Generate the release description with DeepSeek Responses
+        shell: bash
+        env:
+          # Optional: absence or provider failure retains the factual changelog.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: |
+          mkdir -p dist/notes
+          python -I -B .github/scripts/release_notes.py \
+              --facts dist/facts/release-facts.json --output dist/notes/release-notes.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: dist/notes/release-notes.md
+          if-no-files-found: error
+
   publish:
-    name: Create draft release
-    needs: prepare
+    needs: [prepare, collect, notes]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
-      actions: read
     defaults:
       run:
         shell: bash
@@ -131,41 +148,61 @@ jobs:
       SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
     steps:
-      - name: Download validated release assets
-        uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v7
         with:
           name: release-assets
           path: dist/release
-      - name: Preserve existing releases and tags
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-notes
+          path: dist/notes
+      - name: Preserve existing releases and verify the remote tag
         run: |
           existing=$(gh api --paginate "repos/$GH_REPO/releases" |
               jq -r --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag) | .html_url')
           if [[ -n "$existing" ]]; then
-              printf '::error::Release %s already exists; review it instead of overwriting it.\n' "$RELEASE_TAG"
+              printf '::error::Release %s already exists; it will not be overwritten.\n' "$RELEASE_TAG"
               exit 1
           fi
           object=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" |
-              jq -c --arg ref "refs/tags/$RELEASE_TAG" '.[] | select(.ref == $ref) | .object')
-          if [[ -n "$object" ]]; then
+              jq -ec --arg ref "refs/tags/$RELEASE_TAG" '.[] | select(.ref == $ref) | .object')
+          type=$(jq -er '.type' <<<"$object")
+          sha=$(jq -er '.sha' <<<"$object")
+          for _ in {1..10}; do
+              if [[ "$type" != tag ]]; then
+                  break
+              fi
+              object=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object')
               type=$(jq -er '.type' <<<"$object")
               sha=$(jq -er '.sha' <<<"$object")
-              for _ in {1..10}; do
-                  if [[ "$type" != tag ]]; then
-                      break
-                  fi
-                  object=$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object')
-                  type=$(jq -er '.type' <<<"$object")
-                  sha=$(jq -er '.sha' <<<"$object")
-              done
-              if [[ "$type" != commit || "$sha" != "$SOURCE_SHA" ]]; then
-                  printf '::error::The release tag does not point to the verified CI commit.\n'
-                  exit 1
-              fi
+          done
+          if [[ "$type" != commit || "$sha" != "$SOURCE_SHA" ]]; then
+              printf '::error::The remote tag no longer points to the tested commit.\n'
+              exit 1
           fi
-      - name: Create draft and upload assets
+      - name: Upload all assets before publishing
         run: |
-          args=(--repo "$GH_REPO" --target "$SOURCE_SHA" --title "$RELEASE_TAG" --notes "" --draft)
+          args=(--repo "$GH_REPO" --verify-tag --target "$SOURCE_SHA" --title "$RELEASE_TAG"
+              --notes-file dist/notes/release-notes.md --draft)
           if [[ "$PRERELEASE" == true ]]; then
               args+=(--prerelease)
           fi
           gh release create "$RELEASE_TAG" dist/release/* "${args[@]}"
+          gh api --paginate "repos/$GH_REPO/releases" |
+              jq -ec --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag and .draft)' \
+                  >dist/release-state.json
+          jq -r '.assets[].name' dist/release-state.json | sort >dist/remote-assets.txt
+          for asset in dist/release/*; do
+              printf '%s\n' "${asset##*/}"
+          done | sort >dist/local-assets.txt
+          diff -u dist/local-assets.txt dist/remote-assets.txt
+          jq -e 'all(.assets[]; .state == "uploaded")' dist/release-state.json >/dev/null
+          python -I -c 'import hashlib, json; from pathlib import Path; state = json.loads(Path("dist/release-state.json").read_text()); root = Path("dist/release"); assert all(asset["size"] == (root / asset["name"]).stat().st_size and asset.get("digest") == "sha256:" + hashlib.sha256((root / asset["name"]).read_bytes()).hexdigest() for asset in state["assets"]), "Uploaded release assets do not match validated files"'
+          release_id=$(jq -er '.id' dist/release-state.json)
+          latest=legacy
+          if [[ "$PRERELEASE" == true ]]; then
+              latest=false
+          fi
+          gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F draft=false -f make_latest="$latest" >/dev/null
+          printf 'Published %s with three platform archives and Windows installers.\n' "$RELEASE_TAG"

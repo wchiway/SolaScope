@@ -18,10 +18,13 @@ DOCUMENTATION = (
     "docs/architecture.md",
     "docs/benchmarks.md",
     "docs/implementation-status.md",
+    "docs/installation.md",
+    "docs/releases.md",
     "benchmarks/README.md",
     "docs/assets/solascope-overview.png",
     "docs/assets/solascope-search-flow.png",
 )
+WINDOWS_INSTALLERS = ("install.ps1", "install.cmd")
 
 
 def build_package(root: Path, target: str) -> Path:
@@ -35,14 +38,17 @@ def build_package(root: Path, target: str) -> Path:
         for name in ("solascope", "sas")
     ]
     files = [(binary, binary.name) for binary in binaries]
-    files.extend((root / name, name) for name in DOCUMENTATION)
-    for source, _ in files:
+    public_files = DOCUMENTATION + (WINDOWS_INSTALLERS if windows else ())
+    files.extend((root / name, name) for name in public_files)
+    for source, name in files:
         if (
             source.is_symlink()
             or not source.is_file()
             or source.resolve(strict=True) != source
         ):
             raise FileNotFoundError(f"package input must be a regular file: {source}")
+        if name in WINDOWS_INSTALLERS and source.stat().st_size > 256 * 1024:
+            raise ValueError("installer resource exceeds the size limit")
 
     versions = [
         subprocess.check_output(

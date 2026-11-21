@@ -2,6 +2,11 @@ name: Package release binaries
 
 on:
   workflow_call:
+    inputs:
+      source_sha:
+        description: Exact tested source commit
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Get native Rust target
@@ -36,15 +42,35 @@ jobs:
                   python -I -c 'import sys; sys.stdout.write(next(line.split()[1] for line in sys.stdin if line.startswith("host: ")))'
           )
           printf 'triple=%s\n' "$target" >>"$GITHUB_OUTPUT"
+      - name: Statically link the Windows C runtime
+        if: runner.os == 'Windows'
+        run: printf 'RUSTFLAGS=-C target-feature=+crt-static\n' >>"$GITHUB_ENV"
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2.9.3
         with:
-          key: package-${{ steps.target.outputs.triple }}
+          key: package-${{ steps.target.outputs.triple }}-static-crt
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build CLI release binaries
-        run: cargo build --release --locked -p solascope-cli --bins --target "${{ steps.target.outputs.triple }}"
+        env:
+          BUILD_TARGET: ${{ steps.target.outputs.triple }}
+        run: cargo build --release --locked -p solascope-cli --bins --target "$BUILD_TARGET"
+      - name: Reject non-system Windows DLL dependencies
+        if: runner.os == 'Windows'
+        env:
+          BUILD_TARGET: ${{ steps.target.outputs.triple }}
+        run: python -I -B .github/scripts/check_windows_binary.py "target/$BUILD_TARGET/release/solascope.exe" "target/$BUILD_TARGET/release/sas.exe"
       - name: Verify both entry points and package
-        run: python -I .github/scripts/package_release.py --target "${{ steps.target.outputs.triple }}"
+        env:
+          BUILD_TARGET: ${{ steps.target.outputs.triple }}
+        run: python -I -B .github/scripts/package_release.py --target "$BUILD_TARGET"
+      - name: Smoke-test installation of the real Windows archive
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath dist -Filter '*.zip')
+          if ($archives.Count -ne 1) { throw 'Expected exactly one Windows archive.' }
+          & .github/scripts/test_windows_install.ps1 -ArchivePath $archives[0].FullName -ChecksumPath (Join-Path $PWD 'dist/SHA256SUMS')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload platform package
         uses: actions/upload-artifact@v7
         with:
