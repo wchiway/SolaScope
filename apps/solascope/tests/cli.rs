@@ -129,9 +129,20 @@ fn init_existing_config_reports_native_paths_for_both_entry_points() {
             assert_eq!(output.status.code(), Some(2));
             assert!(output.stdout.is_empty());
             let stderr = String::from_utf8(output.stderr).unwrap();
-            assert!(stderr.contains(&expected), "stderr: {stderr}");
+            let message = if json {
+                let error: Value = serde_json::from_str(&stderr)
+                    .expect("stderr must contain exactly one JSON error");
+                assert_eq!(error["error"]["exit_code"], 2);
+                error["error"]["message"]
+                    .as_str()
+                    .expect("JSON error must contain a message")
+                    .to_owned()
+            } else {
+                stderr
+            };
+            assert!(message.contains(&expected), "message: {message}");
             #[cfg(windows)]
-            assert!(!stderr.contains('/'), "stderr: {stderr}");
+            assert!(!message.contains('/'), "message: {message}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
     }
