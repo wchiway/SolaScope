@@ -177,6 +177,39 @@ cp "$MOCK_ASSETS/$file" "$out"
         self.assertFalse(any(path.name.startswith(".solascope-install") for path in destination.iterdir()))
         self.assert_preserved()
 
+    def test_legacy_release_layout_install_reinstall_and_upgrade(self):
+        legacy_missing = ("install.sh", "docs/installation.md", "docs/releases.md")
+        archive = self.package("0.1.0", missing=legacy_missing)
+        self.offline(archive)
+        self.offline(archive)
+        destination = self.home / ".local/bin"
+        self.assertEqual(subprocess.check_output([str(destination / "sas"), "--version"], text=True).strip(), "solascope 0.1.0")
+        archive = self.package()
+        self.offline(archive)
+        self.assertEqual(subprocess.check_output([str(destination / "solascope"), "--version"], text=True).strip(), "solascope 1.2.3")
+        self.assert_preserved()
+
+    def test_legacy_layout_is_version_gated_and_complete(self):
+        legacy_missing = ("install.sh", "docs/installation.md", "docs/releases.md")
+        for version, missing in (("0.1.0", legacy_missing + ("LICENSE",)),
+                                 ("0.1.0", ()), ("1.2.3", legacy_missing)):
+            with self.subTest(version=version, missing=missing):
+                self.offline(self.package(version, missing=missing), success=False)
+        self.offline(self.package("0.1.0", missing=legacy_missing), "--version", "1.2.3", success=False)
+        archive = self.package("0.1.0", missing=legacy_missing)
+        with tarfile.open(archive, "r:gz") as source:
+            entries = [(member, source.extractfile(member).read()) for member in source]
+        with tarfile.open(archive, "w:gz", format=tarfile.USTAR_FORMAT) as output:
+            for member, data in entries:
+                if member.name == "sas":
+                    data = data.replace(b"solascope 0.1.0", b"solascope 1.2.3")
+                    member.size = len(data)
+                output.addfile(member, io.BytesIO(data))
+        self.checksum(archive)
+        self.offline(archive, success=False)
+        self.assertFalse((self.home / ".local/bin/sas").exists())
+        self.assert_preserved()
+
     def test_explicit_hash_prerelease_and_bash_compatibility(self):
         archive = self.package("1.2.3-rc.1+build.2")
         result = self.run_installer("--archive", archive, "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest().upper(),

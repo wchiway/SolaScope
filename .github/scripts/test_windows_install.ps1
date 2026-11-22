@@ -62,9 +62,9 @@ function New-TestZip([string]$Name, [object[]]$Entries) {
     } finally { $zip.Dispose() }
     return $path
 }
-function New-TestPackage([string]$ArchiveName, [string]$Exe) {
+function New-TestPackage([string]$ArchiveName, [string]$Exe, [string]$ReleaseVersion) {
     $entries = @()
-    foreach ($entryName in $script:SolaScopePublicFiles) {
+    foreach ($entryName in (Get-SolaScopeArchiveFiles $ReleaseVersion)) {
         if ($entryName -match '\.exe$') { $entries += @{ Name = $entryName; Source = $Exe } }
         else { $entries += @{ Name = $entryName } }
     }
@@ -78,11 +78,11 @@ function New-VersionExe([string]$Name, [string]$Version, [int]$ExitCode = 0) {
     Add-Type -TypeDefinition $source -OutputAssembly $path -OutputType ConsoleApplication
     return $path
 }
-function Assert-BadZip([string]$Name, [object[]]$Entries, [string]$Pattern) {
+function Assert-BadZip([string]$Name, [object[]]$Entries, [string]$Pattern, [string]$ReleaseVersion) {
     $zip = New-TestZip $Name $Entries
     $stage = Join-Path $script:FixtureRoot ([Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($stage)
-    Assert-Throws { Expand-SolaScopeArchive $zip $stage } $Pattern
+    Assert-Throws { Expand-SolaScopeArchive $zip $stage $ReleaseVersion } $Pattern
     Assert-True (@(Get-ChildItem -LiteralPath $stage -Force).Count -eq 0) 'invalid archive extracted no files'
 }
 
@@ -230,6 +230,45 @@ try {
         else { $partialEntries += @{ Name = $entryName } }
     }
     Assert-BadZip 'missing-guide.zip' $partialEntries 'missing docs/releases.md'
+    Assert-BadZip 'missing-guide-versioned.zip' $partialEntries 'missing docs/releases.md' '1.2.3'
+
+    # Only the exact v0.1.0 layout may omit newer public resources.
+    $legacyNames = @(
+        'solascope.exe', 'sas.exe', 'LICENSE', 'README.md', 'README.zh-CN.md',
+        'docs/configuration.md', 'docs/mcp.md', 'docs/architecture.md',
+        'docs/benchmarks.md', 'docs/implementation-status.md', 'benchmarks/README.md',
+        'docs/assets/solascope-overview.png', 'docs/assets/solascope-search-flow.png'
+    )
+    Assert-True ((@(Get-SolaScopeArchiveFiles '0.1.0') -join '|') -ceq ($legacyNames -join '|')) 'exact published legacy layout'
+    $legacyEntries = @()
+    foreach ($entryName in $legacyNames) {
+        if ($entryName -ceq 'LICENSE') { continue }
+        $legacyEntries += @{ Name = $entryName }
+    }
+    Assert-BadZip 'legacy-missing-license.zip' $legacyEntries 'missing LICENSE' '0.1.0'
+    $legacyFullEntries = @($legacyNames | ForEach-Object { @{ Name = $_ } })
+    Assert-BadZip 'legacy-extra-guide.zip' ($legacyFullEntries + @(@{ Name = 'docs/installation.md' })) 'Unexpected private or unknown' '0.1.0'
+    Assert-BadZip 'legacy-as-modern.zip' $legacyFullEntries 'missing docs/installation.md' '1.2.3'
+    $legacyExe = New-VersionExe 'legacy-version.exe' '0.1.0'
+    $legacyPackage = New-TestPackage 'solascope-0.1.0-x86_64-pc-windows-msvc.zip' $legacyExe '0.1.0'
+    $legacyHash = (Get-FileHash -LiteralPath $legacyPackage).Hash
+    $legacySum = Join-Path $root 'legacy-SHA256SUMS'
+    [IO.File]::WriteAllText($legacySum, "$legacyHash  solascope-0.1.0-x86_64-pc-windows-msvc.zip`n")
+    $legacyDestination = Join-Path (Join-Path $root 'legacy-area') 'install'
+    Invoke-SolaScopeInstall -ArchivePath $legacyPackage -ChecksumPath $legacySum -InstallDir $legacyDestination -NoPath
+    Invoke-SolaScopeInstall -ArchivePath $legacyPackage -ExpectedSha256 $legacyHash -InstallDir $legacyDestination -NoPath
+    Assert-True ((Test-SolaScopeBinaries $legacyDestination '0.1.0') -ceq '0.1.0') 'legacy install and reinstall'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $legacyDestination 'install.ps1'))) 'legacy install needs no bundled script'
+    $wrongLegacy = New-TestPackage 'legacy-wrong-version.zip' $exe1 '0.1.0'
+    Assert-Throws {
+        Invoke-SolaScopeInstall -ArchivePath $wrongLegacy -ExpectedSha256 (Get-FileHash -LiteralPath $wrongLegacy).Hash -Version '0.1.0' -InstallDir $legacyDestination -NoPath
+    } 'versions do not match'
+    Assert-True ((Test-SolaScopeBinaries $legacyDestination '0.1.0') -ceq '0.1.0') 'wrong legacy executable version preserves installation'
+    Assert-Throws {
+        Invoke-SolaScopeInstall -ArchivePath $legacyPackage -ExpectedSha256 $legacyHash -Version '1.2.3' -InstallDir $legacyDestination -NoPath
+    } 'archive version does not match'
+    Invoke-SolaScopeInstall -ArchivePath $package1 -ExpectedSha256 (Get-FileHash -LiteralPath $package1).Hash -InstallDir $legacyDestination -NoPath
+    Assert-True ((Test-SolaScopeBinaries $legacyDestination '1.2.3') -ceq '1.2.3') 'legacy install upgrades to modern layout'
 
     # Exercise frozen online metadata resolution with entirely local mocked data.
     # Build metadata assets with encoded and literal SemVer plus signs.

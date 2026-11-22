@@ -44,6 +44,8 @@ The default layout is:
   docs\...
 ```
 
+The installer also accepts the exact published `v0.1.0` layout, which has both binaries and the original public documentation but no bundled installers, `docs/installation.md`, or `docs/releases.md`. It does not download replacements for these missing resources. Later releases still require their complete layout. The `v0.1.0` binaries predate static-CRT and DLL-import verification; compatibility with their archive does not establish clean-machine runtime independence.
+
 Only the **User** PATH is updated; unrelated entries and the Machine PATH are preserved. Open a new terminal and restart existing IDEs to pick up the change. The invoking PowerShell process can be refreshed independently, but an installer child process cannot change an existing parent CMD/terminal's environment. If another SolaScope installation has higher PATH precedence, use the new executables' absolute paths or adjust PATH explicitly.
 
 Supported options:
@@ -69,7 +71,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
     -ChecksumPath .\SHA256SUMS
 ```
 
-Replace the filename with the downloaded version. This mode makes no HTTP requests. It checks the entire archive's SHA-256 before extraction, validates its exact public-file set and Windows-safe paths, stages both executables, and verifies their version output before replacing an existing installation. Extracted content is limited to 512 MiB. Offline checksum integrity depends on obtaining the expected hash through a trusted channel.
+Replace the filename with the downloaded version. The standard `solascope-VERSION-x86_64-pc-windows-msvc.zip` filename supplies the expected version in offline mode; a conflicting `-Version` is rejected. For a renamed legacy archive, pass `-Version 0.1.0` explicitly. The executables must report that expected version. This mode makes no HTTP requests. It checks the entire archive's SHA-256 before extraction, validates its exact public-file set and Windows-safe paths, stages both executables, and verifies their version output before replacing an existing installation. Extracted content is limited to 512 MiB. Offline checksum integrity depends on obtaining the expected hash through a trusted channel.
 
 ### Upgrade and failure recovery
 
@@ -98,6 +100,8 @@ sh ./install.sh --version 0.1.1 --bin-dir "$HOME/.local/bin"
 Replace the example version with an available release. Both `--option value` and `--option=value` syntax are supported. The default resolves latest stable once through `SHA256SUMS`, then freezes the archive name, version, and expected digest before downloading the versioned archive. No GitHub JSON parser or API token is needed. Explicit versions can select a published prerelease. Release checksums also cover the standalone `install.sh`; same-source checksums establish integrity, not independent publisher identity.
 
 The script detects Linux x86_64 with 64-bit glibc, macOS Intel, and macOS Apple Silicon. Under Rosetta it prefers the native Apple Silicon target. Only architectures actually included in that release's checksums can install: current Linux packages are x86_64 GNU and the macOS package follows the runner's native architecture. Both macOS architectures are not necessarily published. Missing assets, musl/Alpine, 32-bit Linux, Linux ARM, and unsupported systems produce explicit errors. GNU packages still require a compatible system glibc; staging/version checks do not establish support for every Linux distribution.
+
+The exact `v0.1.0` Unix layout is also supported; it predates `install.sh`, `docs/installation.md`, and `docs/releases.md` inside the archive. Version selection comes from the frozen release checksums or the verified offline archive filename and is checked against both executables. Missing files in other versions are still rejected.
 
 Use `--arch TARGET` to explicitly select a supported release target when detection needs overriding. It does not create missing assets, provide emulation, or bypass executable compatibility checks. The script never compiles source or installs missing system tools.
 

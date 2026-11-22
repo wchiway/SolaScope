@@ -21,6 +21,17 @@ $script:SolaScopePublicFiles = @(
 $script:SolaScopeMarker = '.solascope-install.json'
 $script:SolaScopeSemVer = '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
 
+function Get-SolaScopeArchiveFiles([string]$ReleaseVersion) {
+    # v0.1.0 predates bundled installers and these two guides. Keep its exact
+    # published layout separate; incomplete newer packages must still fail.
+    if ($ReleaseVersion -ceq '0.1.0') {
+        return @($script:SolaScopePublicFiles | Where-Object {
+            $_ -cnotin @('docs/installation.md', 'docs/releases.md', 'install.ps1', 'install.cmd')
+        })
+    }
+    return $script:SolaScopePublicFiles
+}
+
 function Get-SolaScopeVersion([string]$Value) {
     if ($Value -cnotmatch ('^v?' + $script:SolaScopeSemVer + '$')) {
         throw "Invalid version '$Value'; use a SemVer version, optionally prefixed with v."
@@ -227,7 +238,8 @@ function Assert-SolaScopeChecksum([string]$Archive, [string]$ArchiveName, [strin
     }
 }
 
-function Expand-SolaScopeArchive([string]$Archive, [string]$Stage) {
+function Expand-SolaScopeArchive([string]$Archive, [string]$Stage, [string]$ReleaseVersion) {
+    $publicFiles = @(Get-SolaScopeArchiveFiles $ReleaseVersion)
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
@@ -252,13 +264,13 @@ function Expand-SolaScopeArchive([string]$Archive, [string]$Stage) {
             if (($kind -ne 0 -and $kind -ne 0x8000) -or ($attributes -band 0x458) -ne 0) {
                 throw "Nonregular or reparse ZIP entry: $name"
             }
-            if ($script:SolaScopePublicFiles -cnotcontains $name) { throw "Unexpected private or unknown ZIP payload: $name" }
+            if ($publicFiles -cnotcontains $name) { throw "Unexpected private or unknown ZIP payload: $name" }
             if ($entry.Length -lt 0 -or $entry.Length -gt 512MB -or $total -gt (512MB - $entry.Length)) {
                 throw 'Archive exceeds the 512 MiB unpacked limit.'
             }
             $total += $entry.Length
         }
-        foreach ($required in $script:SolaScopePublicFiles) {
+        foreach ($required in $publicFiles) {
             if (-not $seen.Contains($required)) { throw "Archive is missing $required." }
         }
         # Validate every entry before opening any output. Copy bounded by declared and total size.
@@ -451,6 +463,11 @@ function Invoke-SolaScopeInstall {
             $source = (Get-Item -LiteralPath $ArchivePath -Force).FullName
             if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw 'ArchivePath must be a local ZIP file.' }
             $archiveName = [IO.Path]::GetFileName($source)
+            if ($archiveName -cmatch ('^solascope-(' + $script:SolaScopeSemVer + ')-x86_64-pc-windows-msvc\.zip$')) {
+                $archiveVersion = $Matches[1]
+                if ($Version -and $Version -cne $archiveVersion) { throw 'Offline archive version does not match Version.' }
+                $Version = $archiveVersion
+            }
             $archive = Join-Path $work 'input.zip'
             Copy-Item -LiteralPath $source -Destination $archive
             $checksum = $null
@@ -470,7 +487,7 @@ function Invoke-SolaScopeInstall {
         Assert-SolaScopeChecksum $archive $archiveName $checksum $ExpectedSha256
         $stage = Join-Path $parent ('.solascope-stage-' + [Guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($stage)
-        Expand-SolaScopeArchive $archive $stage
+        Expand-SolaScopeArchive $archive $stage $Version
         $resolved = Test-SolaScopeBinaries $stage $Version
         @{ format = 'SolaScope installer 1'; directory = $destination; version = $resolved } |
             ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage $script:SolaScopeMarker) -Encoding UTF8

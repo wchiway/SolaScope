@@ -150,11 +150,15 @@ validate_archive() (
     # entries with exact names are accepted; links, duplicates and PAX renames
     # cannot redirect the two explicit stdout extractions below.
     tar -tzf "$1" >"$2/members" || err 'could not list the archive'
-    printf '%s\n' solascope sas install.sh LICENSE README.md README.zh-CN.md \
+    printf '%s\n' solascope sas LICENSE README.md README.zh-CN.md \
         docs/configuration.md docs/mcp.md docs/architecture.md docs/benchmarks.md \
-        docs/implementation-status.md docs/installation.md docs/releases.md \
-        benchmarks/README.md docs/assets/solascope-overview.png docs/assets/solascope-search-flow.png \
+        docs/implementation-status.md benchmarks/README.md \
+        docs/assets/solascope-overview.png docs/assets/solascope-search-flow.png \
         >"$2/expected"
+    # v0.1.0 predates bundled installers and installation/release guides.
+    if [ "$3" != 0.1.0 ]; then
+        printf '%s\n' install.sh docs/installation.md docs/releases.md >>"$2/expected"
+    fi
     sort "$2/members" >"$2/members-sorted" || exit 1
     sort "$2/expected" >"$2/expected-sorted" || exit 1
     cmp -s "$2/members-sorted" "$2/expected-sorted" || err 'archive has missing, duplicate, unsafe, or unexpected entries'
@@ -393,7 +397,7 @@ main() (
     actual=$(hash_file "$work/package.tar.gz") || err 'could not compute archive SHA-256'
     expected_hash=$(printf '%s' "$expected_hash" | tr 'A-F' 'a-f')
     [ "$actual" = "$expected_hash" ] || err 'archive SHA-256 mismatch; nothing was installed'
-    validate_archive "$work/package.tar.gz" "$work" || exit 1
+    validate_archive "$work/package.tar.gz" "$work" "$version" || exit 1
     # Extract only the two fixed names into a fresh directory, never unpack
     # arbitrary archive paths or run tools with the archive as their cwd.
     for name in solascope sas; do
