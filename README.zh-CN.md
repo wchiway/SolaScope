@@ -24,13 +24,10 @@ CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模�
 
 ### Windows：无需开发环境
 
-在 PowerShell 中运行以下命令，直接执行[远程安装脚本](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1)：
+在 PowerShell 或命令提示符中运行以下命令，直接执行[远程安装脚本](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1)：
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1').Content))
-}
+powershell -c "irm https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1|iex"
 ```
 
 脚本在 PowerShell 子进程中执行，无需保存安装脚本文件。脚本跟随远程 `main` 更新，程序从[已发布的 Release](https://github.com/wchiway/SolaScope/releases) 安装。

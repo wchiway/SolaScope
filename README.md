@@ -24,13 +24,10 @@ The CLI and MCP server share one engine and index. Indexing scans and parses sou
 
 ### Windows: no development environment required
 
-Run this in PowerShell to execute the [remote installer](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) directly:
+Run this in PowerShell or Command Prompt to execute the [remote installer](https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1) directly:
 
 ```powershell
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1').Content))
-}
+powershell -c "irm https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1|iex"
 ```
 
 The script runs in a child PowerShell process without saving an installer file. It tracks remote `main` and installs binaries from a [published release](https://github.com/wchiway/SolaScope/releases).

@@ -10,6 +10,16 @@ Windows release builds enable static CRT linking, bundle SQLite, and check both 
 
 ### Online installation
 
+Run directly from PowerShell or Command Prompt:
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/wchiway/SolaScope/main/install.ps1|iex"
+```
+
+`irm` (`Invoke-RestMethod`) fetches the script from remote `main`, and `iex` (`Invoke-Expression`) executes it in the child PowerShell process without saving an installer file. The script follows `main` updates; binaries come from the latest published stable release. Initial script retrieval requires HTTPS/TLS support in that PowerShell environment.
+
+For a saved installer or a fixed release's scripts:
+
 1. Open the repository's [published releases](https://github.com/wchiway/SolaScope/releases). Download `install.ps1` and `install.cmd` from **the same release** into a new folder.
 2. Inspect the scripts before executing them. Release `SHA256SUMS` includes hashes for both standalone scripts as well as the archives; it detects corruption but is not independent publisher authentication.
 3. Double-click `install.cmd`, or run the downloaded PowerShell script:
@@ -24,7 +34,7 @@ This downloads the latest published stable release. To select a particular publi
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version 0.1.1
 ```
 
-Replace the example version with an available release. Drafts are not installable; an explicitly selected version may be a prerelease. Resolution is performed once, and the archive and checksum are downloaded from that same frozen release. GitHub access, HTTPS, and applicable proxy configuration are required for online installation. There is no download-and-execute pipeline.
+Replace the example version with an available release. Drafts are not installable; an explicitly selected version may be a prerelease. Resolution is performed once, and the archive and checksum are downloaded from that same frozen release. GitHub access, HTTPS, and applicable proxy configuration are required for online installation.
 
 `-ExecutionPolicy Bypass` applies only to this PowerShell process. It does not permanently change machine/user policy and does not override Group Policy, AppLocker, or Windows Defender Application Control. If organizational policy disallows the installer, use an approved deployment method rather than disabling the policy.
 
