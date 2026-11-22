@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Local-first code search that turns a question, symbol name, keyword, or error message into a file, symbol, and line range. Use it from the terminal with `solascope` or `sas`, or connect an assistant through the read-only MCP server.
+Local-first code search that turns a question, symbol name, keyword, or error message into a file, symbol, and line range. Use it from the terminal with `solascope` or `sas`, or connect an assistant through the MCP server.
 
 SolaScope works without a model. SQLite FTS5 and symbol lookup provide the default search; optional embeddings and reranking add model-based retrieval.
 
@@ -18,7 +18,7 @@ Current version: **0.1.1**. See [support and limitations](docs/implementation-st
 
 ![Hand-drawn overview: CLI and read-only MCP share an Engine that scans repository source, reads and writes a local SQLite index, and optionally calls embedding and reranking models.](docs/assets/solascope-overview.png)
 
-The CLI and MCP server share one engine and index. Indexing scans and parses source locally; model adapters are optional. See the [architecture](docs/architecture.md) for publication, caching, and consistency details.
+The illustration shows the earlier read-only MCP surface and omits the current `index` and `reindex` maintenance tools. The CLI and MCP server share one engine and index. Indexing scans and parses source locally; model adapters are optional. See the [architecture](docs/architecture.md) for publication, caching, and consistency details.
 
 ## Install
 
@@ -128,7 +128,7 @@ Results identify a relative path, a 1-based line range, a symbol when available,
 | `context <path>[:line]` | Read current source, up to 200 lines or 64 KiB |
 | `status` | Show the index generation, counts, relocated vectors, and model fingerprint |
 | `watch [path] [--probe]` | Watch and incrementally update an index |
-| `mcp [--probe]` | Start the read-only stdio MCP server |
+| `mcp [--probe]` | Start the stdio MCP server; lookup tools are read-only, with explicit index maintenance tools |
 | `doctor [--models] [--prune-cache]` | Check configuration and index consistency, probe models, or prune unused cache entries |
 
 Common options include `--root`, `--config`, `--json`, `--limit` (1–100), `--mode lexical|semantic|hybrid`, `--path`, `--no-rerank`, and `--verbose`.
@@ -181,6 +181,8 @@ solascope index
 solascope mcp
 ```
 
+Alternatively, start `solascope mcp` without pre-indexing and authorize an MCP `index` call when requested.
+
 A client configuration can use:
 
 ```json
@@ -194,7 +196,7 @@ A client configuration can use:
 }
 ```
 
-The server exposes `search_code`, `find_symbol`, `get_code_context`, and `index_status`, with read-only annotations and typed output schemas. No startup path is required: tools default to the server's working directory and accept an optional `root` so agents can select another project per call. Each project's index defaults to its `.solascope/` directory. The server reads updates from a separate `index` or `watch` process without restarting. Context reads current source even without an index. See [MCP integration](docs/mcp.md) for tool parameters, responses, and client setup.
+The server exposes four read-only lookup tools (`search_code`, `find_symbol`, `get_code_context`, and `index_status`) plus `index` and `reindex` for explicitly authorized, one-shot index maintenance. Every tool accepts an optional `root` to select a project directory; omitted or `null` uses the server's startup default, and each project's index defaults to its `.solascope/` directory. MCP indexing applies the project's privacy settings, writer lock, and atomic publication; configured remote embeddings may send source and incur charges. Startup does not create or update an index, and MCP tools do not provide watch mode. Context reads current source without an index. See [MCP integration](docs/mcp.md) for authorization, parameters, reports, and recovery.
 
 ## Privacy
 

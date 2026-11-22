@@ -133,6 +133,18 @@ impl CodeServer {
         blocking(move || server.project_engine(&root)).await
     }
 
+    async fn run_index(
+        &self,
+        root: Option<String>,
+        rebuild: bool,
+        cancel: CancellationToken,
+    ) -> Result<solascope_core::IndexReport> {
+        let engine = interruptible(cancel.clone(), self.select_engine(root)).await?;
+        // Let the engine record cancellation and release its writer lock before returning.
+        // Dropping this future through interruptible would skip failed-job cleanup.
+        engine.index_with_cancel(rebuild, cancel).await
+    }
+
     fn project_engine(&self, root: &str) -> Result<Engine> {
         parse_query(root).map_err(Error::InvalidInput)?;
         let root = self.cwd.join(root).canonicalize().map_err(|_| {
@@ -169,7 +181,7 @@ impl CodeServer {
 #[tool_router]
 impl CodeServer {
     #[tool(
-        description = "Search indexed code by question, symbol, keyword, or error message. Lexical uses FTS5 without embeddings; hybrid combines lexical, symbols, and optional embeddings; semantic requires embeddings. Returns ranked paths, symbols, line ranges, snippets, match_sources, stale flags, warnings, and timings from one index generation. For spelling correction use find_symbol; for current source use get_code_context. Requires an existing index; run solascope index separately.",
+        description = "Search indexed code by question, symbol, keyword, or error message. Lexical uses FTS5 without embeddings; hybrid combines lexical, symbols, and optional embeddings; semantic requires embeddings. Returns ranked paths, symbols, line ranges, snippets, match_sources, stale flags, warnings, and timings from one index generation. For spelling correction use find_symbol; for current source use get_code_context. Requires an existing index; use index with authorization to create or update it, or run solascope index separately.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::SearchResponse>(),
         annotations(read_only_hint = true, destructive_hint = false, open_world_hint = true)
     )]
@@ -291,7 +303,7 @@ impl CodeServer {
     }
 
     #[tool(
-        description = "Inspect the selected project's index generation, file/chunk/vector/cache counts, relocated_vectors, embedding fingerprint, last update, and unfinished jobs. Relocated vectors are approximate reuse after file moves; solascope index --rebuild refreshes them. Missing indexes and outdated schema or chunking rules return an error. Does not probe models, check embedding compatibility, create, migrate, or update an index.",
+        description = "Inspect the selected project's index generation, file/chunk/vector/cache counts, relocated_vectors, embedding fingerprint, last update, and unfinished jobs. Relocated vectors are approximate reuse after file moves; reindex or solascope index --rebuild refreshes them. Missing indexes and outdated schema or chunking rules return an error. Does not probe models, check embedding compatibility, create, migrate, or update an index.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::IndexStatus>(),
         annotations(read_only_hint = true, destructive_hint = false, open_world_hint = false)
     )]
@@ -311,6 +323,32 @@ impl CodeServer {
         };
         tool_result(interruptible(context.ct, blocking(move || engine.status())).await)
     }
+
+    #[tool(
+        description = "Create or incrementally update the selected project's index in one run, including schema migration when needed. Adds changed source and removes deleted or excluded files using the shared CLI engine. Returns index generation, file/chunk/embedding counts, cache reuse, warnings, elapsed time, and rebuilt status. Writes index data, not project source. Requires authorization for index changes; configured embeddings may send source to a model service and incur charges. Uses existing privacy and remote-opt-in settings. Does not watch or change configuration. For an explicit rebuild use reindex.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::IndexReport>(),
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true)
+    )]
+    async fn index(
+        &self,
+        Parameters(params): Parameters<ProjectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        tool_result(self.run_index(params.root, false, context.ct).await)
+    }
+
+    #[tool(
+        description = "Explicitly rebuild the selected project's index in one run, including schema migration when needed. Reparses all current source, removes deleted or excluded files, and recomputes approximate relocated embeddings while reusing eligible exact cached vectors. Returns the shared index report with rebuilt=true on success. Writes index data, not project source, and can replace incompatible vector spaces. Requires authorization for index changes; configured embeddings may send source to a model service and incur charges. Uses existing privacy and remote-opt-in settings. Does not watch, change configuration, or delete the index first; failed publication preserves the previous committed generation.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<solascope_core::IndexReport>(),
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true)
+    )]
+    async fn reindex(
+        &self,
+        Parameters(params): Parameters<ProjectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        tool_result(self.run_index(params.root, true, context.ct).await)
+    }
 }
 
 #[tool_handler]
@@ -318,7 +356,7 @@ impl ServerHandler for CodeServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("solascope", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Read-only code search. No startup path is required: omit root to use the startup directory (normally the current working directory), or pass root on any tool call to select a project. Relative roots resolve from the server's working directory. Each project's default index is its .solascope directory; selecting a project does not change subsequent calls' default. Use index_status to inspect the resolved root and index directory. Use search_code for questions, keywords, or error messages; find_symbol for definitions and spelling correction; get_code_context for current source, even without an index; and index_status for generation and counts. Search and symbol tools read the latest committed index generation on each call. Check warnings and stale flags before relying on indexed locations. Optional models follow server configuration and privacy settings. Run solascope index or watch separately to build or refresh the index, and doctor for diagnostics; tools never create, migrate, or update it. Tool errors do not end the session.")
+            .with_instructions("Code search with explicit index maintenance. No startup path is required: omit root to use the startup directory (normally the current working directory), or pass root on any tool call to select a project. Relative roots resolve from the server's working directory. Each project's default index is its .solascope directory; selecting a project does not change subsequent calls' default. Use index_status to inspect the resolved root, index directory, generation, and counts; search_code for questions, keywords, or error messages; find_symbol for definitions and spelling correction; and get_code_context for current source, even without an index. These four tools are read-only and never create, migrate, or update an index. With authorization for index changes, use index for one-shot creation or incremental updates and reindex for an explicit rebuild. The maintenance tools write index data and configured embeddings may send source to a model service and incur charges; query-only authorization does not authorize index writes. All tools follow the selected project's configuration and privacy settings, including remote opt-in. Indexing uses the shared engine's writer lock and atomic publication; cancellation before publication preserves the previous committed generation. Search and symbol tools read the latest committed index generation on each call. Check warnings and stale flags before relying on indexed locations. The server does not index automatically on startup. Use solascope watch separately for continuous updates and doctor for diagnostics. Tool errors do not end the session.")
     }
 }
 

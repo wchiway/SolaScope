@@ -86,7 +86,7 @@ pub(crate) enum Command {
     },
     /// Show index generation and model status.
     Status,
-    /// Serve four read-only MCP tools over stdio.
+    /// Serve code search and explicit index/reindex MCP tools over stdio.
     Mcp {
         #[arg(long)]
         probe: bool,

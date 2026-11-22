@@ -421,7 +421,7 @@ pub struct IndexStatus {
     pub pending_jobs: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IndexReport {
     pub project_id: String,
     pub index_version: u64,

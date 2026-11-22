@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-本地优先的代码搜索工具，将自然语言问题、符号名、关键词或报错信息定位到文件、符号和代码行。可以通过 `solascope` / `sas` 命令行使用，也可以通过只读 MCP 服务接入助手。
+本地优先的代码搜索工具，将自然语言问题、符号名、关键词或报错信息定位到文件、符号和代码行。可以通过 `solascope` / `sas` 命令行使用，也可以通过 MCP 服务接入助手。
 
 SolaScope 无需模型即可运行。默认使用 SQLite FTS5 和符号检索，也可独立启用 Embedding 与重排。
 
@@ -18,7 +18,7 @@ SolaScope 无需模型即可运行。默认使用 SQLite FTS5 和符号检索，
 
 ![Hand-drawn overview: CLI and read-only MCP share an Engine that scans repository source, reads and writes a local SQLite index, and optionally calls embedding and reranking models.](docs/assets/solascope-overview.png)
 
-CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模型适配器按需启用。图中标注为英文，索引发布、缓存和一致性细节见[架构文档](docs/architecture.md)。
+图示反映了早期只读 MCP 工具，不包含当前的 `index` 和 `reindex` 维护工具。CLI 与 MCP 共用同一引擎和索引。扫描与解析在本地完成，模型适配器按需启用。索引发布、缓存和一致性细节见[架构文档](docs/architecture.md)。
 
 ## 安装
 
@@ -128,7 +128,7 @@ solascope index --watch
 | `context <path>[:line]` | 读取当前源码，最多 200 行或 64 KiB |
 | `status` | 显示索引代际、数量、路径复用向量及模型指纹 |
 | `watch [path] [--probe]` | 监听文件变化并增量索引 |
-| `mcp [--probe]` | 启动只读 stdio MCP 服务 |
+| `mcp [--probe]` | 启动 stdio MCP 服务；检索工具只读，并提供显式索引维护工具 |
 | `doctor [--models] [--prune-cache]` | 检查配置和索引一致性，探测模型或清理未引用缓存 |
 
 通用参数包括 `--root`、`--config`、`--json`、`--limit`（1–100）、`--mode lexical|semantic|hybrid`、`--path`、`--no-rerank` 和 `--verbose`。
@@ -181,6 +181,8 @@ solascope index
 solascope mcp
 ```
 
+也可以不预先建立索引，直接运行 `solascope mcp`，并在客户端请求时授权调用 MCP `index` 工具。
+
 客户端配置示例：
 
 ```json
@@ -194,7 +196,7 @@ solascope mcp
 }
 ```
 
-服务提供 `search_code`、`find_symbol`、`get_code_context` 和 `index_status`，并声明只读属性和输出 schema。启动时无需配置路径：工具默认使用服务进程的当前目录，agent 也可以在每次调用时通过可选 `root` 选择其他项目。索引默认位于各项目的 `.solascope/` 目录，无需重启即可读取独立 `index` 或 `watch` 进程发布的索引更新。上下文工具直接读取当前源码，无需预先建立索引。工具参数、返回结构和客户端接入见 [MCP 文档](docs/mcp.md)。
+服务提供四个只读检索工具（`search_code`、`find_symbol`、`get_code_context` 和 `index_status`），以及用于显式授权、单次索引维护的 `index` 和 `reindex`。每个工具都可通过可选 `root` 选择项目目录；省略或传入 `null` 时使用服务启动默认项目，各项目索引默认位于 `.solascope/`。MCP 索引操作遵循项目隐私设置、写入锁和原子发布；配置的远程 Embedding 可能发送源码并产生费用。服务启动时不会写入索引，也不提供监听模式。上下文工具无需索引即可读取当前源码。授权、参数、报告和恢复方式见 [MCP 文档](docs/mcp.md)。
 
 ## 隐私
 

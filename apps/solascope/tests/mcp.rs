@@ -178,18 +178,38 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
         [
             "find_symbol",
             "get_code_context",
+            "index",
             "index_status",
+            "reindex",
             "search_code"
         ]
     );
     for tool in tools {
-        assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
-        assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
+        let writes_index = matches!(tool["name"].as_str(), Some("index" | "reindex"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], !writes_index, "{tool}");
         assert_eq!(
-            tool["annotations"]["openWorldHint"],
-            tool["name"] == "search_code",
+            tool["annotations"]["destructiveHint"], writes_index,
             "{tool}"
         );
+        assert_eq!(
+            tool["annotations"]["openWorldHint"],
+            writes_index || tool["name"] == "search_code",
+            "{tool}"
+        );
+        if writes_index {
+            assert_ne!(tool["annotations"]["idempotentHint"], true, "{tool}");
+            assert!(tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("authorization"));
+            assert!(tool["description"].as_str().unwrap().contains("charges"));
+            assert!(tool["outputSchema"]["properties"].get("rebuilt").is_some());
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                tool["inputSchema"]["properties"].as_object().unwrap().len(),
+                1
+            );
+        }
         assert_eq!(tool["outputSchema"]["type"], "object", "{tool}");
         assert!(
             tool["inputSchema"]["properties"].get("root").is_some(),
@@ -305,6 +325,587 @@ async fn native_json_rpc_initialization_schema_calls_errors_and_eof() {
     assert_eq!(model_error["result"]["isError"], true, "{model_error}");
     let status = client.call("index_status", json!({})).await;
     assert_eq!(status["result"]["isError"], false, "{status}");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn index_creates_updates_and_reindex_rebuilds_without_a_restart() {
+    let root = fixture(false).await;
+    let mut client = NativeClient::start(root.path()).await;
+    assert!(!root.path().join(".solascope").exists());
+
+    let list = client.request("tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    for tool_name in ["index", "reindex"] {
+        let created = client.call(tool_name, json!({})).await;
+        assert_eq!(created["result"]["isError"], false, "{created}");
+        let report = &created["result"]["structuredContent"];
+        assert_eq!(report["rebuilt"], tool_name == "reindex");
+        assert_eq!(report["files_total"], 1);
+        assert_eq!(report["files_updated"], 1);
+        assert!(report["chunks"].as_u64().unwrap() > 0);
+        let tool = tools.iter().find(|tool| tool["name"] == tool_name).unwrap();
+        for field in tool["outputSchema"]["required"].as_array().unwrap() {
+            assert!(report.get(field.as_str().unwrap()).is_some(), "{report}");
+        }
+        let text: Value =
+            serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(&text, report);
+    }
+    assert!(root.path().join(".solascope/index.sqlite3").exists());
+    let before = client.call("index_status", json!({})).await;
+    let generation = before["result"]["structuredContent"]["index_version"]
+        .as_u64()
+        .unwrap();
+    let unchanged = client.call("index", json!({})).await;
+    assert_eq!(unchanged["result"]["isError"], false, "{unchanged}");
+    assert_eq!(unchanged["result"]["structuredContent"]["files_updated"], 0);
+    assert_eq!(
+        unchanged["result"]["structuredContent"]["files_unchanged"],
+        1
+    );
+    assert_eq!(
+        unchanged["result"]["structuredContent"]["index_version"],
+        generation
+    );
+
+    std::fs::write(
+        root.path().join("fixture.rs"),
+        "pub fn updated_symbol() {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("added.rs"), "pub fn added_symbol() {}\n").unwrap();
+    let updated = client.call("index", json!({"root": null})).await;
+    assert_eq!(updated["result"]["isError"], false, "{updated}");
+    assert_eq!(updated["result"]["structuredContent"]["files_updated"], 2);
+    assert_eq!(updated["result"]["structuredContent"]["files_total"], 2);
+    assert!(
+        updated["result"]["structuredContent"]["index_version"]
+            .as_u64()
+            .unwrap()
+            > generation
+    );
+    let result = client
+        .call("find_symbol", json!({"name": "updated_symbol"}))
+        .await;
+    assert_eq!(
+        result["result"]["structuredContent"]["results"][0]["relative_path"],
+        "fixture.rs"
+    );
+    let removed = client
+        .call("find_symbol", json!({"name": "mcp_fixture_symbol"}))
+        .await;
+    assert!(removed["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    std::fs::remove_file(root.path().join("added.rs")).unwrap();
+    let deleted = client.call("index", json!({})).await;
+    assert_eq!(deleted["result"]["isError"], false, "{deleted}");
+    assert_eq!(deleted["result"]["structuredContent"]["files_deleted"], 1);
+    assert_eq!(deleted["result"]["structuredContent"]["files_unchanged"], 1);
+    let generation = deleted["result"]["structuredContent"]["index_version"]
+        .as_u64()
+        .unwrap();
+    let rebuilt = client.call("reindex", json!({})).await;
+    assert_eq!(rebuilt["result"]["isError"], false, "{rebuilt}");
+    assert_eq!(rebuilt["result"]["structuredContent"]["rebuilt"], true);
+    assert_eq!(rebuilt["result"]["structuredContent"]["files_updated"], 1);
+    assert_eq!(rebuilt["result"]["structuredContent"]["files_unchanged"], 0);
+    assert!(
+        rebuilt["result"]["structuredContent"]["index_version"]
+            .as_u64()
+            .unwrap()
+            > generation
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("fixture.rs")).unwrap(),
+        "pub fn updated_symbol() {}\n"
+    );
+    let missing = client
+        .call("find_symbol", json!({"name": "added_symbol"}))
+        .await;
+    assert!(missing["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn maintenance_roots_use_project_settings_without_changing_the_default() {
+    let first = fixture(false).await;
+    let second = fixture(false).await;
+    std::fs::write(
+        second.path().join(".solascope.toml"),
+        "[project]\nindex_dir='custom-index'\nexclude=['private.rs']\n[index]\nwatch=true\n[parser]\nmax_chunk_tokens=256\n",
+    )
+    .unwrap();
+    std::fs::write(
+        second.path().join("private.rs"),
+        "pub fn secret_symbol() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        second.path().join(".env"),
+        "MCP_PRIVATE_FIXTURE=private-value\n",
+    )
+    .unwrap();
+    let nested = first.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::create_dir(nested.join(".git")).unwrap();
+    std::fs::write(nested.join("nested.rs"), "pub fn nested_symbol() {}\n").unwrap();
+    let mut client = NativeClient::start(first.path()).await;
+    let created = client.call("reindex", json!({"root": second.path()})).await;
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    assert_eq!(created["result"]["structuredContent"]["rebuilt"], true);
+    assert_eq!(created["result"]["structuredContent"]["files_total"], 1);
+    assert!(second.path().join("custom-index/index.sqlite3").exists());
+    assert!(!second.path().join(".solascope").exists());
+    assert!(!first.path().join(".solascope").exists());
+    let denied = client
+        .call(
+            "find_symbol",
+            json!({"root": second.path(), "name": "secret_symbol"}),
+        )
+        .await;
+    assert!(denied["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let default = client.call("index_status", json!({})).await;
+    assert_eq!(
+        default["result"]["structuredContent"]["error"]["exit_code"],
+        3
+    );
+
+    let relative = client.call("index", json!({"root": "nested"})).await;
+    assert_eq!(relative["result"]["isError"], false, "{relative}");
+    assert_eq!(relative["result"]["structuredContent"]["files_total"], 1);
+    assert!(nested.join(".solascope/index.sqlite3").exists());
+    assert!(!first.path().join(".solascope").exists());
+    let created = client.call("index", json!({})).await;
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    let default = client.call("index_status", json!({})).await;
+    assert_eq!(
+        default["result"]["structuredContent"]["root"],
+        json!(first.path().canonicalize().unwrap())
+    );
+    let second_status = client
+        .call("index_status", json!({"root": second.path()}))
+        .await;
+    assert_eq!(
+        second_status["result"]["structuredContent"]["root"],
+        json!(second.path().canonicalize().unwrap())
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn maintenance_rejects_invalid_arguments_and_writer_conflicts() {
+    let root = fixture(true).await;
+    let mut client = NativeClient::start(root.path()).await;
+    for tool in ["index", "reindex"] {
+        for root in [
+            json!(""),
+            json!(" "),
+            json!("bad\u{0000}root"),
+            json!("x".repeat(4097)),
+            json!("missing"),
+            json!("fixture.rs"),
+        ] {
+            let result = client.call(tool, json!({"root": root})).await;
+            assert_eq!(result["result"]["isError"], true, "{result}");
+            assert_eq!(
+                result["result"]["structuredContent"]["error"]["exit_code"], 2,
+                "{result}"
+            );
+        }
+        for arguments in [
+            json!({"root": 42}),
+            json!({"watch": true}),
+            json!({"rebuild": true}),
+            json!({"index_dir": "elsewhere"}),
+        ] {
+            let result = client.call(tool, arguments).await;
+            assert_eq!(result["result"]["isError"], true, "{result}");
+        }
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join(".solascope/writer.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let before = client.call("index_status", json!({})).await;
+    for tool in ["index", "reindex"] {
+        let result = client.call(tool, json!({})).await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        assert_eq!(
+            result["result"]["structuredContent"]["error"]["exit_code"], 5,
+            "{result}"
+        );
+    }
+    let during = client.call("index_status", json!({})).await;
+    assert_eq!(
+        during["result"]["structuredContent"]["index_version"],
+        before["result"]["structuredContent"]["index_version"]
+    );
+    drop(lock);
+    let result = client.call("reindex", json!({})).await;
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert!(!root.path().join("elsewhere").exists());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn index_repairs_outdated_chunking_without_implicit_query_writes() {
+    let root = fixture(true).await;
+    let settings = tempfile::tempdir().unwrap();
+    let config = settings.path().join("parser.toml");
+    std::fs::write(&config, "[parser]\nmax_chunk_tokens=256\n").unwrap();
+    let mut client =
+        NativeClient::start_with_args(root.path(), &["--config", config.to_str().unwrap()]).await;
+    let outdated = client.call("index_status", json!({})).await;
+    assert_eq!(
+        outdated["result"]["structuredContent"]["error"]["exit_code"],
+        3
+    );
+    let repaired = client.call("index", json!({})).await;
+    assert_eq!(repaired["result"]["isError"], false, "{repaired}");
+    assert_eq!(repaired["result"]["structuredContent"]["files_updated"], 1);
+    assert!(!repaired["result"]["structuredContent"]["warnings"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(status["result"]["isError"], false, "{status}");
+    let source = client
+        .call("find_symbol", json!({"name": "mcp_fixture_symbol"}))
+        .await;
+    assert_eq!(
+        source["result"]["structuredContent"]["results"][0]["relative_path"],
+        "fixture.rs"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn reindex_recovers_a_fingerprint_change_without_deleting_the_previous_index() {
+    let root = fixture(true).await;
+    let server = MockServer::start().await;
+    std::fs::write(root.path().join(".solascope.toml"), format!(
+        "[embedding]\nprovider='ollama'\nmodel='test-model'\nendpoint='{}'\ndimensions=2\nretries=0\n", server.uri(),
+    )).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let embeddings: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| vec![1.0, 0.25])
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"embeddings": embeddings}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut client = NativeClient::start(root.path()).await;
+    let before = client.call("index_status", json!({})).await;
+    let incompatible = client.call("index", json!({})).await;
+    assert_eq!(incompatible["result"]["isError"], true, "{incompatible}");
+    assert_eq!(
+        incompatible["result"]["structuredContent"]["error"]["exit_code"],
+        4
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let preserved = client.call("index_status", json!({})).await;
+    assert_eq!(
+        preserved["result"]["structuredContent"]["index_version"],
+        before["result"]["structuredContent"]["index_version"]
+    );
+    let old = client
+        .call(
+            "search_code",
+            json!({"query": "mcp_fixture_symbol", "mode": "lexical", "rerank": false}),
+        )
+        .await;
+    assert_eq!(old["result"]["isError"], false, "{old}");
+    let rebuilt = client.call("reindex", json!({})).await;
+    assert_eq!(rebuilt["result"]["isError"], false, "{rebuilt}");
+    assert_eq!(rebuilt["result"]["structuredContent"]["rebuilt"], true);
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(
+        status["result"]["structuredContent"]["embedding_fingerprint"]["model"],
+        "test-model"
+    );
+    assert!(
+        status["result"]["structuredContent"]["vectors"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn reindex_recomputes_relocated_vectors_and_reuses_exact_cached_vectors() {
+    let root = fixture(false).await;
+    let server = MockServer::start().await;
+    std::fs::write(
+        root.path().join(".solascope.toml"),
+        format!("[embedding]\nprovider='ollama'\nmodel='test-model'\nendpoint='{}'\ndimensions=2\nretries=0\n", server.uri()),
+    )
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let embeddings: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| vec![1.0, 0.25])
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"embeddings": embeddings}))
+        })
+        .mount(&server)
+        .await;
+    let mut client = NativeClient::start(root.path()).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let created = client.call("index", json!({})).await;
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    let embeddings = created["result"]["structuredContent"]["embedded_chunks"]
+        .as_u64()
+        .unwrap();
+    assert!(embeddings > 0);
+    let requests = server.received_requests().await.unwrap().len();
+    std::fs::rename(
+        root.path().join("fixture.rs"),
+        root.path().join("renamed.rs"),
+    )
+    .unwrap();
+    let moved = client.call("index", json!({})).await;
+    assert_eq!(moved["result"]["isError"], false, "{moved}");
+    assert_eq!(moved["result"]["structuredContent"]["files_deleted"], 1);
+    assert_eq!(moved["result"]["structuredContent"]["embedded_chunks"], 0);
+    assert_eq!(
+        moved["result"]["structuredContent"]["relocated_embeddings"],
+        embeddings
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(
+        status["result"]["structuredContent"]["relocated_vectors"],
+        embeddings
+    );
+
+    let rebuilt = client.call("reindex", json!({})).await;
+    assert_eq!(rebuilt["result"]["isError"], false, "{rebuilt}");
+    assert_eq!(rebuilt["result"]["structuredContent"]["rebuilt"], true);
+    assert_eq!(
+        rebuilt["result"]["structuredContent"]["embedded_chunks"],
+        embeddings
+    );
+    assert_eq!(
+        rebuilt["result"]["structuredContent"]["relocated_embeddings"],
+        0
+    );
+    let status = client.call("index_status", json!({})).await;
+    assert_eq!(
+        status["result"]["structuredContent"]["relocated_vectors"],
+        0
+    );
+    let requests = server.received_requests().await.unwrap().len();
+    let cached = client.call("reindex", json!({})).await;
+    assert_eq!(cached["result"]["isError"], false, "{cached}");
+    assert_eq!(cached["result"]["structuredContent"]["embedded_chunks"], 0);
+    assert_eq!(
+        cached["result"]["structuredContent"]["cache_hits"],
+        embeddings
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn maintenance_preserves_remote_opt_in_and_project_dotenv_isolation() {
+    let first = fixture(false).await;
+    let second = fixture(false).await;
+    let denied = fixture(false).await;
+    let server = MockServer::start().await;
+    for (project, key, opted_in) in [
+        (first.path(), "first-index-key", true),
+        (second.path(), "second-index-key", true),
+        (denied.path(), "denied-index-key", false),
+    ] {
+        std::fs::write(project.join(".solascope.toml"), format!(
+            "[privacy]\nremote_opt_in={opted_in}\n[project]\nexclude=['private.rs']\n[embedding]\nprovider='remote'\nmodel='test-model'\nendpoint='{}'\ndimensions=2\napi_key_env='SOLASCOPE_MCP_INDEX_KEY'\nretries=0\n",
+            server.uri(),
+        )).unwrap();
+        std::fs::write(
+            project.join(".env"),
+            format!("SOLASCOPE_MCP_INDEX_KEY={key}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("private.rs"),
+            "pub fn private_index_secret() {}\n",
+        )
+        .unwrap();
+        if opted_in {
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .and(wiremock::matchers::header(
+                    "authorization",
+                    format!("Bearer {key}"),
+                ))
+                .respond_with(|request: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert!(!body.to_string().contains("private_index_secret"));
+                    assert!(!body.to_string().contains("index-key"));
+                    let data: Vec<_> = body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| json!({"index": index, "embedding": [1.0, 0.25]}))
+                        .collect();
+                    ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+    }
+    let mut client = NativeClient::start(first.path()).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+    for tool in ["index", "reindex"] {
+        let result = client.call(tool, json!({"root": denied.path()})).await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        assert_eq!(
+            result["result"]["structuredContent"]["error"]["exit_code"], 2,
+            "{result}"
+        );
+    }
+    assert!(!denied.path().join(".solascope").exists());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    for (tool, root) in [("index", Value::Null), ("reindex", json!(second.path()))] {
+        let result = client.call(tool, json!({"root": root})).await;
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(result["result"]["structuredContent"]["files_total"], 1);
+        assert!(!result.to_string().contains("index-key"));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn cancelled_maintenance_preserves_generation_cleans_jobs_and_releases_the_writer() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let root = fixture(false).await;
+    let server = MockServer::start().await;
+    let delay = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    std::fs::write(
+        root.path().join(".solascope.toml"),
+        format!("[embedding]\nprovider='ollama'\nmodel='test-model'\nendpoint='{}'\ndimensions=2\nretries=0\ntimeout_secs=60\n", server.uri()),
+    )
+    .unwrap();
+    let flag = delay.clone();
+    let notified = started.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/embed"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let embeddings: Vec<_> = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|_| vec![1.0, 0.25])
+                .collect();
+            let response =
+                ResponseTemplate::new(200).set_body_json(json!({"embeddings": embeddings}));
+            if flag.load(Ordering::SeqCst) {
+                notified.notify_one();
+                response.set_delay(Duration::from_secs(60))
+            } else {
+                response
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut client = NativeClient::start(root.path()).await;
+    let created = client.call("index", json!({})).await;
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    for tool in ["index", "reindex"] {
+        let before = client.call("index_status", json!({})).await;
+        let generation = before["result"]["structuredContent"]["index_version"].clone();
+        let symbol = format!("cancelled_{tool}_symbol");
+        std::fs::write(
+            root.path().join("fixture.rs"),
+            format!("pub fn {symbol}() {{}}\n"),
+        )
+        .unwrap();
+        delay.store(true, Ordering::SeqCst);
+        let id = client.next_id;
+        client.next_id += 1;
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": tool, "arguments": {}}})).await;
+        timeout(WAIT, started.notified())
+            .await
+            .expect("index must reach the delayed model request");
+        client.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "cancel indexing"}})).await;
+        // rmcp suppresses responses for cancelled request IDs. Wait through read-only
+        // status calls until the engine has recorded the failed job and dropped its lock.
+        timeout(WAIT, async {
+            loop {
+                let status = client.call("index_status", json!({})).await;
+                assert_eq!(status["result"]["isError"], false, "{status}");
+                assert_eq!(
+                    status["result"]["structuredContent"]["index_version"],
+                    generation
+                );
+                if status["result"]["structuredContent"]["pending_jobs"] == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled indexing must clean up its job");
+        let unpublished = client.call("find_symbol", json!({"name": &symbol})).await;
+        // Spelling correction can return a previously published, similarly named symbol.
+        assert!(unpublished["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["symbol"] != symbol));
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join(".solascope/writer.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .expect("cancelled indexing must release its writer lock");
+        drop(lock);
+        delay.store(false, Ordering::SeqCst);
+        let retried = client.call(tool, json!({})).await;
+        assert_eq!(retried["result"]["isError"], false, "{retried}");
+        assert!(
+            retried["result"]["structuredContent"]["index_version"]
+                .as_u64()
+                .unwrap()
+                > generation.as_u64().unwrap()
+        );
+    }
     client.close().await;
 }
 
@@ -977,7 +1578,7 @@ async fn database_error_is_a_tool_result_and_does_not_stop_server() {
         .contains("mcp_fixture_symbol"));
     assert!(!root.path().join(".solascope/index.sqlite3").exists());
     let list = client.request("tools/list", json!({})).await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 6);
     client.close().await;
 }
 
@@ -1024,7 +1625,19 @@ async fn rmcp_client_interoperates_with_stdio_server_and_closes() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(tools.tools.len(), 4);
+    assert_eq!(tools.tools.len(), 6);
+    for tool in ["index", "reindex"] {
+        let request = CallToolRequestParams::new(tool).with_arguments(Default::default());
+        let result = timeout(WAIT, client.call_tool(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["rebuilt"],
+            tool == "reindex"
+        );
+    }
     let request = CallToolRequestParams::new("search_code").with_arguments(
         json!({
             "query": "mcp_fixture_symbol", "mode": "lexical", "rerank": false

@@ -1,6 +1,6 @@
 # Installing SolaScope
 
-SolaScope's default build provides indexing, lexical search, symbol lookup, and the read-only MCP server without a model. Optional model providers require separate configuration; the installer does not enable them or install Ollama, model files, or ONNX Runtime.
+SolaScope's default build provides indexing, lexical search, symbol lookup, and the MCP server with read-only lookup and explicit index-maintenance tools without a model. Optional model providers require separate configuration; the installer does not enable them or install Ollama, model files, or ONNX Runtime.
 
 ## Windows: precompiled installation
 
