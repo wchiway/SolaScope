@@ -51,7 +51,7 @@ Calling `index_status` with `{}` inspects the default project; `{ "root": "/abs/
 
 The server retains engines for up to eight additional projects to reuse model adapters and query caches. Project settings and `.env` are loaded on first access and again if an evicted project is revisited. Restart after configuration edits for consistent refresh; index generations and ignore files are checked on each call.
 
-Remote-model keys can be stored in a `.env` beside the user configuration: `~/.solascope/.env` on Linux/macOS or `$USERPROFILE/.solascope/.env` on Windows. Client-provided `env` values become process variables and take precedence. `--config FILE` also loads a `.env` beside FILE. Restart the server after editing the file. Keep keys out of arguments, URLs, and TOML values.
+Remote-model keys can be stored in a `.env` beside the user configuration: `~/.solascope/.env` on Linux/macOS or `$env:USERPROFILE\.solascope\.env` on Windows (PowerShell syntax). Client-provided `env` values become process variables and take precedence. `--config FILE` also loads a `.env` beside FILE. Restart the server after editing the file. Keep keys out of arguments, URLs, and TOML values.
 
 Remote models require `privacy.remote_opt_in = true`. Embedding and reranking are configured independently; see the [configuration reference](configuration.md).
 

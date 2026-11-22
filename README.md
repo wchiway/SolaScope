@@ -91,7 +91,7 @@ sas status
 | Platform | User configuration |
 | --- | --- |
 | Linux / macOS | `~/.solascope/.solascope.toml` |
-| Windows | `$USERPROFILE/.solascope/.solascope.toml` |
+| Windows (PowerShell) | `$env:USERPROFILE\.solascope\.solascope.toml` |
 
 It does not create a project configuration or bind the user defaults to the current repository. You can run `index` directly with the built-in defaults: it recursively scans the **current working directory and all levels of subdirectories**, subject to ignore rules and privacy filters. An explicit positional path takes precedence over `--root`, followed by the process environment variable `SOLASCOPE__PROJECT__ROOT`; otherwise the current directory is used without expanding to a parent Git root.
 
@@ -160,7 +160,7 @@ HTTP model providers require `privacy.remote_opt_in = true`, except for Ollama o
 
 Store API keys in a `.env` beside the configuration file, using variable names such as `DASHSCOPE_API_KEY` and `SILICONFLOW_API_KEY`. The TOML configuration references those names through `api_key_env`. Existing process variables take precedence. Restart a watcher or MCP server after changing `.env`.
 
-CLI diagnostics are also appended to `logs/solascope.log` beside the active configuration, normally `~/.solascope/logs/solascope.log` on Linux/macOS or `$USERPROFILE/.solascope/logs/solascope.log` on Windows. Retry status and final failures are recorded with credentials redacted. Set `log.persist = false` to keep stderr only.
+CLI diagnostics are also appended to `logs/solascope.log` beside the active configuration, normally `~/.solascope/logs/solascope.log` on Linux/macOS or `$env:USERPROFILE\.solascope\logs\solascope.log` on Windows. Retry status and final failures are recorded with credentials redacted. Set `log.persist = false` to keep stderr only.
 
 The [configuration reference](docs/configuration.md) covers every field, precedence rule, provider protocol, and setup example.
 

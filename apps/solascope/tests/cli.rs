@@ -106,6 +106,38 @@ fn init_json_reports_path_and_does_not_overwrite() {
 }
 
 #[test]
+fn init_existing_config_reports_native_paths_for_both_entry_points() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root
+        .path()
+        .join("user-home")
+        .join(".solascope")
+        .join(".solascope.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# Existing user configuration must remain untouched.\n[log]\npersist = false\n";
+    std::fs::write(&path, original).unwrap();
+    let expected = format!("{} already exists and was left unchanged", path.display());
+
+    for binary in [SOLASCOPE, SAS] {
+        for json in [false, true] {
+            let mut cmd = command(binary, root.path());
+            cmd.arg("init");
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(&expected), "stderr: {stderr}");
+            #[cfg(windows)]
+            assert!(!stderr.contains('/'), "stderr: {stderr}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+}
+
+#[test]
 fn ignore_json_creates_project_rules_without_overwriting() {
     for binary in [SOLASCOPE, SAS] {
         let root = tempfile::tempdir().unwrap();

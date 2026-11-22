@@ -9,10 +9,12 @@ Configuration sources apply in this order, from highest to lowest priority:
 3. The `.env` file beside the project configuration, or beside the file selected by `--config`.
 4. Project configuration: `.solascope.toml` in an explicitly selected source directory; otherwise the nearest configuration found from the current directory upward, stopping at a Git root. `--config` selects a specific file.
 5. The `.env` file beside the user configuration.
-6. User configuration: `~/.solascope/.solascope.toml` on Linux/macOS, or `$USERPROFILE/.solascope/.solascope.toml` on Windows.
+6. User configuration: `~/.solascope/.solascope.toml` on Linux/macOS, or `$env:USERPROFILE\.solascope\.solascope.toml` on Windows (PowerShell syntax).
 7. Built-in defaults.
 
 `solascope init` / `sas init` creates only the user configuration described above. It does not write files to the project directory or overwrite an existing configuration. The generated file omits `project.root` and `project.index_dir`, so indexing and search continue to use the current project or `--root`. Project configuration is an optional override for advanced use; `init` no longer accepts a positional project path.
+
+If `init` reports `already exists and was left unchanged`, it refused to overwrite the user configuration and returned exit code 2. This message does not mean the existing configuration is invalid. Skip `init` and run `index` with the existing settings.
 
 If the new user configuration does not exist, SolaScope reads the legacy `<system-config-directory>/solascope/config.toml` for compatibility. It does not move or rewrite that file, or merge the new and legacy user configurations.
 
@@ -48,7 +50,7 @@ The user configuration can use this layout:
 └── .env
 ```
 
-On Windows, the base directory is `$USERPROFILE/.solascope/`. For example, `.env` can contain just credentials:
+On Windows, the base directory is `$env:USERPROFILE\.solascope\`. For example, `.env` can contain just credentials:
 
 ```dotenv
 DASHSCOPE_API_KEY=replace-with-your-bailian-key
@@ -260,7 +262,7 @@ HTTP errors and error envelopes within HTTP 200 responses are classified by prov
 | `persist` | `true` | With `output = "stderr"`, append a file copy beside the active configuration; `false` keeps stderr only |
 | `redact_secrets` | `true` | Additionally redact generic Bearer tokens; configured API key values are always redacted |
 
-By default, CLI diagnostics go to stderr and `<configuration-directory>/logs/solascope.log`. A project configuration or `--config FILE` selects that file's directory; otherwise the user configuration directory is used, even before its TOML file has been created. For the standard user configuration this is `~/.solascope/logs/solascope.log` on Linux/macOS, or `$USERPROFILE/.solascope/logs/solascope.log` on Windows. Configuration selection does not change the source directory.
+By default, CLI diagnostics go to stderr and `<configuration-directory>/logs/solascope.log`. A project configuration or `--config FILE` selects that file's directory; otherwise the user configuration directory is used, even before its TOML file has been created. For the standard user configuration this is `~/.solascope/logs/solascope.log` on Linux/macOS, or `$env:USERPROFILE\.solascope\logs\solascope.log` on Windows. Configuration selection does not change the source directory.
 
 The file is appended across commands. Set `log.persist = false` to disable the automatic copy. An explicit `log.output` file preserves the existing project-confined behavior and is used regardless of `persist`; it replaces the normal trace destinations. Logs cannot escape the selected configuration directory or project root through symlinks, and cannot be written into `.git`.
 

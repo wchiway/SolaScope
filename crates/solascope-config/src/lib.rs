@@ -187,7 +187,8 @@ impl Config {
                 .directory
                 .as_deref()
                 .unwrap_or(&self.project.root)
-                .join("logs/solascope.log")
+                .join("logs")
+                .join("solascope.log")
         }
     }
 
@@ -681,14 +682,14 @@ pub fn user_config_path() -> Result<PathBuf> {
     #[cfg(not(windows))]
     let home = dirs::home_dir();
     let home = home.ok_or_else(|| invalid("cannot determine the user home directory"))?;
-    Ok(home.join(".solascope/.solascope.toml"))
+    Ok(home.join(".solascope").join(".solascope.toml"))
 }
 
 fn global_config_path() -> Result<PathBuf> {
     let path = user_config_path()?;
     if !path.try_exists()? {
         if let Some(legacy) =
-            dirs::config_dir().map(|directory| directory.join("solascope/config.toml"))
+            dirs::config_dir().map(|directory| directory.join("solascope").join("config.toml"))
         {
             if legacy.try_exists()? {
                 return Ok(legacy);
@@ -744,7 +745,7 @@ mod tests {
     fn diagnostic_logs_follow_the_selected_configuration_directory() {
         let source = tempfile::tempdir().unwrap();
         let settings = tempfile::tempdir().unwrap();
-        let global = settings.path().join("user/.solascope.toml");
+        let global = settings.path().join("user").join(".solascope.toml");
         let config = load_with_sources(
             Some(source.path()),
             None,
@@ -754,8 +755,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.diagnostic_log_path(),
-            settings.path().join("user/logs/solascope.log")
+            config.diagnostic_log_path().as_os_str(),
+            settings
+                .path()
+                .join("user")
+                .join("logs")
+                .join("solascope.log")
+                .as_os_str()
         );
         fs::create_dir_all(global.parent().unwrap()).unwrap();
         fs::write(&global, "[log]\nlevel='debug'\n").unwrap();
@@ -768,8 +774,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.diagnostic_log_path(),
-            settings.path().join("user/logs/solascope.log")
+            config.diagnostic_log_path().as_os_str(),
+            settings
+                .path()
+                .join("user")
+                .join("logs")
+                .join("solascope.log")
+                .as_os_str()
         );
         fs::write(source.path().join(".solascope.toml"), "[search]\nlimit=3\n").unwrap();
         let config = load_with_sources(
@@ -781,8 +792,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.diagnostic_log_path(),
-            source.path().join("logs/solascope.log")
+            config.diagnostic_log_path().as_os_str(),
+            source.path().join("logs").join("solascope.log").as_os_str()
         );
         let explicit = settings.path().join("explicit.toml");
         fs::write(&explicit, "[log]\nlevel='info'\n").unwrap();
@@ -795,8 +806,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.diagnostic_log_path(),
-            settings.path().join("logs/solascope.log")
+            config.diagnostic_log_path().as_os_str(),
+            settings
+                .path()
+                .join("logs")
+                .join("solascope.log")
+                .as_os_str()
         );
         assert_eq!(config.project.root, source.path().canonicalize().unwrap());
         let serialized = toml::Value::try_from(&config).unwrap();

@@ -91,7 +91,7 @@ sas status
 | 平台 | 用户配置 |
 | --- | --- |
 | Linux / macOS | `~/.solascope/.solascope.toml` |
-| Windows | `$USERPROFILE/.solascope/.solascope.toml` |
+| Windows（PowerShell） | `$env:USERPROFILE\.solascope\.solascope.toml` |
 
 它不会创建项目配置，也不会将用户默认值绑定到当前项目。可以直接执行 `index` 使用内置默认值：默认递归扫描**执行命令时的当前目录及所有层级的子目录**，仍遵循忽略规则和隐私过滤。显式目录的优先级为命令位置参数、`--root`、进程环境变量 `SOLASCOPE__PROJECT__ROOT`；均未指定时使用当前目录，不自动扩大到上级 Git 根。
 
@@ -160,7 +160,7 @@ Embedding 和重排默认禁用，可通过用户配置或项目覆盖启用：
 
 API Key 可放在配置文件同目录的 `.env` 中，例如 `DASHSCOPE_API_KEY` 和 `SILICONFLOW_API_KEY`。TOML 通过 `api_key_env` 引用变量名，已有进程环境变量优先。修改 `.env` 后应重启监听进程或 MCP 服务。
 
-CLI 诊断日志同时追加到实际配置目录下的 `logs/solascope.log`。使用默认用户配置时，Linux/macOS 为 `~/.solascope/logs/solascope.log`，Windows 为 `$USERPROFILE/.solascope/logs/solascope.log`。日志记录脱敏后的重试状态和最终错误；设置 `log.persist = false` 可仅保留 stderr 输出。
+CLI 诊断日志同时追加到实际配置目录下的 `logs/solascope.log`。使用默认用户配置时，Linux/macOS 为 `~/.solascope/logs/solascope.log`，Windows 为 `$env:USERPROFILE\.solascope\logs\solascope.log`。日志记录脱敏后的重试状态和最终错误；设置 `log.persist = false` 可仅保留 stderr 输出。
 
 全部字段、优先级、服务协议和示例见[配置文档](docs/configuration.md)。
 
