@@ -35,8 +35,16 @@ rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+fs2.workspace = true
+tempfile.workspace = true
+semver = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 wiremock.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }

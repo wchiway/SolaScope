@@ -48,6 +48,15 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/wchiway/
 
 默认将 `solascope` 和 `sas` 安装到 `~/.local/bin`。脚本需要 POSIX shell、常用 Unix 工具、tar/gzip、SHA-256 工具，以及在线下载使用的 curl 或 wget；无需开发环境或 sudo。它校验下载哈希和暂存程序版本，支持离线安装、升级及失败回滚，只提示添加 PATH，不修改 shell 配置或已有应用配置。Linux 发行包要求 x86_64 glibc；macOS 可识别 Intel/Apple Silicon，但只能安装该 Release 实际提供的架构。平台限制与选项见[安装指南](docs/installation.md#linux-and-macos)。
 
+### 自更新
+
+```sh
+solascope update
+sas update --check
+```
+
+两个命令都会在当前可执行文件所在目录同时更新 `solascope` 和 `sas`。更新器获取 GitHub 最新正式 Release，验证 SHA-256 和暂存程序版本，保留配置及索引。不会降级到旧版本；`--force` 可重新安装同一版本。不调用 sudo 或远程安装脚本。Windows 更新前请关闭已有 MCP/watch 会话；旧程序仍在运行时，可能留下需要退出后清理的备份目录，命令会报告路径。详见[自更新说明](docs/installation.md#self-update)。
+
 ### 从源码安装
 
 在本地源码目录安装两个 CLI 入口：
@@ -109,6 +118,7 @@ solascope index --watch
 
 | 命令 | 用途 |
 | --- | --- |
+| `update [--check] [--force]` | 检查或安装 GitHub 最新正式版，同时更新两个入口 |
 | `init [--probe]` | 创建用户配置；可选探测已配置的模型 |
 | `ignore [path]` | 在项目根目录创建 `.solascopeignore`，不覆盖已有规则 |
 | `index [path] [--rebuild] [--probe]` | 递归索引当前目录或显式路径；可选全量重建 |

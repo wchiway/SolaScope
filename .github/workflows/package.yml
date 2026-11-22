@@ -72,14 +72,14 @@ jobs:
               printf '::error::Expected exactly one Unix archive.\n'
               exit 1
           fi
-          python -I -B .github/scripts/test_unix_install.py --real-archive "$1" dist/SHA256SUMS
+          python -I -B .github/scripts/test_unix_install.py --real-archive "$1" dist/SHA256SUMS --self-update
       - name: Smoke-test installation of the real Windows archive
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $archives = @(Get-ChildItem -LiteralPath dist -Filter '*.zip')
           if ($archives.Count -ne 1) { throw 'Expected exactly one Windows archive.' }
-          & .github/scripts/test_windows_install.ps1 -ArchivePath $archives[0].FullName -ChecksumPath (Join-Path $PWD 'dist/SHA256SUMS')
+          & .github/scripts/test_windows_install.ps1 -ArchivePath $archives[0].FullName -ChecksumPath (Join-Path $PWD 'dist/SHA256SUMS') -SelfUpdate
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload platform package
         uses: actions/upload-artifact@v7

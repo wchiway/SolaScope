@@ -44,6 +44,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Update both CLI entry points from the latest stable GitHub Release.
+    Update(crate::update::Options),
     /// Create the user configuration under ~/.solascope without overwriting it.
     Init {
         /// Probe models from the supplied configuration using a fixed sentence.

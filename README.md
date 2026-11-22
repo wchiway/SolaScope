@@ -48,6 +48,15 @@ These commands execute the script from remote `main`; installation still downloa
 
 Both `solascope` and `sas` install into `~/.local/bin` by default. The script needs a POSIX shell, standard Unix utilities, tar/gzip, a SHA-256 tool, and curl or wget for online downloads. No development environment or sudo is needed. It verifies checksums and staged versions, supports offline installation and upgrade rollback, and prints a PATH reminder without editing shell profiles or configuration. Linux packages require x86_64 glibc; macOS Intel/Apple Silicon detection selects only targets actually published in that release. See the [installation guide](docs/installation.md#linux-and-macos) for platform limits and options.
 
+### Self-update
+
+```sh
+solascope update
+sas update --check
+```
+
+Both names update `solascope` and `sas` together in the running executable's directory. The updater resolves the latest stable GitHub Release, verifies SHA-256 and staged versions, and preserves configuration and indexes. It never downgrades a newer version; `--force` reinstalls the same version. No sudo or remote installer script is invoked. Stop existing MCP/watch sessions before updating on Windows; old running binaries may leave a reported backup directory to remove after those processes exit. See [self-update details](docs/installation.md#self-update).
+
 ### Build from source
 
 Install both CLI entry points from a local checkout:
@@ -109,6 +118,7 @@ Results identify a relative path, a 1-based line range, a symbol when available,
 
 | Command | Purpose |
 | --- | --- |
+| `update [--check] [--force]` | Check or install the latest stable GitHub Release for both entry points |
 | `init [--probe]` | Create user defaults; optionally probe the configured models |
 | `ignore [path]` | Create `.solascopeignore` in the project root without overwriting existing rules |
 | `index [path] [--rebuild] [--probe]` | Recursively index the current directory or an explicit path; rebuild all chunks when requested |

@@ -56,6 +56,7 @@ fn both_names_have_identical_help_and_version_without_config_or_database() {
         vec!["search", "--help"],
         vec!["context", "--help"],
         vec!["mcp", "--help"],
+        vec!["update", "--help"],
     ] {
         let long = command(SOLASCOPE, root.path())
             .args(&args)

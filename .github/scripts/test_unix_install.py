@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -467,6 +468,17 @@ if __name__ == "__main__":
                     raise AssertionError("installation changed existing configuration")
                 if unrelated.read_text() != "preserve unrelated file\n":
                     raise AssertionError("installation changed an unrelated binary-directory file")
+            if "--self-update" in sys.argv:
+                for name in ("solascope", "sas"):
+                    output = subprocess.check_output(
+                        [str(destination / name), "update", "--force", "--archive", str(archive), "--checksum", str(checksum), "--json"],
+                        env=environment, cwd=INSTALLER.parent, text=True, timeout=90,
+                    )
+                    if json.loads(output)["status"] != "updated":
+                        raise AssertionError("self-update did not replace both entry points")
+                if config.read_text() != "# preserve configuration\n" or unrelated.read_text() != "preserve unrelated file\n":
+                    raise AssertionError("self-update changed unrelated state")
+                print("Both native entry points self-updated successfully.")
             print("Real Unix release archive installed and reinstalled; both CLI versions and existing configuration verified.")
     else:
         unittest.main()

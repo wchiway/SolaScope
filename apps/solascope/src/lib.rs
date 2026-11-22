@@ -3,6 +3,7 @@
 mod cli;
 mod logging;
 mod mcp;
+mod update;
 
 use std::{
     fs::OpenOptions,
@@ -37,6 +38,15 @@ pub fn run() -> i32 {
             return code;
         }
     };
+    if let Command::Update(options) = &cli.command {
+        return match update::run(options) {
+            Ok(report) => match update::print_report(&report, cli.json) {
+                Ok(()) => 0,
+                Err(error) => report_error(error, cli.json),
+            },
+            Err(error) => report_error(error, cli.json),
+        };
+    }
     let config = match configuration(&cli) {
         Ok(config) => config,
         Err(error) => return report_error(error, cli.json),
@@ -164,7 +174,7 @@ async fn execute(cli: Cli, config: Config) -> Result<()> {
         rerank: !cli.no_rerank,
     };
     match cli.command {
-        Command::Init { .. } | Command::Ignore { .. } => {
+        Command::Update(_) | Command::Init { .. } | Command::Ignore { .. } => {
             unreachable!("file creation commands handled above")
         }
         Command::Index {

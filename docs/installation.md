@@ -139,6 +139,32 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Use an absolute local `--bin-dir` without dot segments or PATH separators. macOS paths under `/var` commonly resolve through symlinks; use their canonical `/private/var/...` paths when choosing temporary custom destinations. A stale `.solascope-install.lock` after SIGKILL/power loss needs inspection before removal. Ordinary failures/signals are handled; power-loss recovery and hostile filesystem races are outside this contract. See [support and limitations](implementation-status.md) for actual platform and network verification.
 
+## Self-update
+
+From an installed binary:
+
+```sh
+solascope update
+sas update --check
+solascope update --json
+```
+
+`update` resolves GitHub's latest published stable release once and selects the exact native target archive plus `SHA256SUMS`. Drafts/prereleases and downgrades are rejected or skipped; `--check` reports availability without changing the installation. `--force` reinstalls an equal version, and never permits downgrades. Build metadata does not change version precedence. This command contacts GitHub explicitly and does not load project/user model configuration, open an index, or call a model provider. GitHub HTTPS downloads and proxies follow the HTTP client's configuration, with restricted release redirects and bounded responses.
+
+The updater replaces both `solascope` and `sas` next to the executable being run, regardless of PATH order. Both regular files must already exist in that directory. It refuses Cargo `target` directories and symlink/reparse paths; package-manager symlink installations should use their package manager instead. There is no automatic privilege elevation. The SHA-256 check detects corruption using the release's checksum file; it is not an independent publisher signature.
+
+Archive checks permit only known public regular files, reject duplicate/unsafe paths and links, and extract only the two executables. The old `v0.1.0` archive layout remains recognized. New binaries are staged on the destination filesystem and must return the expected version within 30 seconds before any replacement. Installation locks coordinate with the shell/PowerShell installers. Replacements are sequential, not atomic as a pair; ordinary publication failures attempt rollback, while power loss, SIGKILL, and hostile filesystem races are outside that recovery contract. Failure reports retain recovery files when necessary.
+
+On Windows, the running old executable is moved into the staging backup and may remain locked until the updater exits. For PowerShell-installer installations, backups are placed beside the owned installation tree so a later reinstall does not treat them as unrelated files. If cleanup cannot complete, a warning (or the JSON `warnings` array) reports the backup directory; remove it after the command and old MCP/watch sessions exit. Existing services are never killed. Only the two binaries are updated; bundled guides/scripts, configuration, indexes, PATH, and Cargo installation records are unchanged. Updates use the default release feature set; optional local-reranker builds should be rebuilt with their original features.
+
+For an offline update, use an archive and checksum obtained beforehand:
+
+```sh
+solascope update --archive /path/to/solascope-VERSION-TARGET.tar.gz --checksum /path/to/SHA256SUMS
+```
+
+Windows uses the matching `.zip`. The standard filename supplies the expected version and target. Add `--force` for a same-version reinstall. Offline mode makes no release/download requests; native executable probes still run locally. The installed version must already provide the `update` command; older versions need the installer for their first upgrade.
+
 ## Build from source
 
 From a local checkout with the repository's supported Rust toolchain:

@@ -1,6 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([string]$ArchivePath, [string]$ChecksumPath)
+param([string]$ArchivePath, [string]$ChecksumPath, [switch]$SelfUpdate)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
@@ -372,6 +372,18 @@ try {
         Invoke-SolaScopeInstall -ArchivePath $ArchivePath -ChecksumPath $ChecksumPath -InstallDir $realDestination -NoPath
         Assert-True ((Test-SolaScopeBinaries $realDestination $realVersion) -ceq $realVersion) 'real package repeated install'
         Assert-True ((Get-FileHash -LiteralPath $config).Hash -ceq $configBefore) 'real package config preservation'
+        if ($SelfUpdate) {
+            foreach ($entryPoint in @('solascope.exe', 'sas.exe')) {
+                $exe = Join-Path (Join-Path $realDestination 'bin') $entryPoint
+                $output = & $exe update --force --archive $ArchivePath --checksum $ChecksumPath --json
+                if ($LASTEXITCODE -ne 0) { throw 'Native self-update failed.' }
+                if (($output | ConvertFrom-Json).status -ne 'updated') { throw 'Native self-update did not publish.' }
+            }
+            Assert-True ((Test-SolaScopeBinaries $realDestination $realVersion) -ceq $realVersion) 'native self-update entry points'
+            Assert-True ((Get-FileHash -LiteralPath $config).Hash -ceq $configBefore) 'native self-update config preservation'
+            Invoke-SolaScopeInstall -ArchivePath $ArchivePath -ChecksumPath $ChecksumPath -InstallDir $realDestination -NoPath
+            Write-Host 'Both native Windows entry points self-updated and the installer accepted the updated installation.'
+        }
         Write-Host "Real Windows package smoke passed: $realVersion"
     }
     Assert-True ((Get-RegistryPathSnapshot) -ceq $userPathBefore) 'real User PATH registry presence/type/raw value unchanged'
